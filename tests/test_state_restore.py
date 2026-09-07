@@ -1,5 +1,4 @@
-"""v0.5.1 状态恢复安全性的回归测试。"""
-from __future__ import annotations
+from __future__ import annotations  # v0.5.1 状态恢复安全性的回归测试。
 
 import unittest
 from datetime import datetime, timedelta
@@ -32,13 +31,7 @@ class StateRestoreV051Test(unittest.TestCase):
         evaluator = Mock()
         evaluator.rearm_host.return_value = 1
 
-        restored, reset_count = _restore_recent_evaluator_state(
-            evaluator,
-            persisted,
-            "fp",
-            now,
-            "gpu-203",
-        )
+        restored, reset_count = _restore_recent_evaluator_state( evaluator, persisted, "fp", now, "gpu-203", )
 
         self.assertTrue(restored)
         self.assertEqual(reset_count, 1)
@@ -47,11 +40,7 @@ class StateRestoreV051Test(unittest.TestCase):
 
     def test_fingerprint_mismatch_does_not_import_or_rearm(self) -> None:
         now = datetime(2026, 8, 9, 14, 0, 0)
-        persisted = {
-            "saved_at": now.isoformat(),
-            "capacity_fingerprint": "old",
-            "evaluator": {},
-        }
+        persisted = { "saved_at": now.isoformat(), "capacity_fingerprint": "old", "evaluator": {}, }
         evaluator = Mock()
 
         restored, reset_count = _restore_recent_evaluator_state(

@@ -5,3 +5,4 @@ runtime/logs/*.log
 __pycache__/
 *.pyc
 .venv/
+.ui/

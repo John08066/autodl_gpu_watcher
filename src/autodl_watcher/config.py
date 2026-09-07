@@ -1,13 +1,4 @@
-"""
-配置加载模块 — 解析 config.yaml，提供所有类型安全的配置 dataclass。
-
-设计原则：
-    - 所有配置类均为 frozen=True（不可变），确保运行时无意外篡改
-    - 使用 slots=True 减少内存开销
-    - 路径字段自动相对 config.yaml 所在目录解析，支持 ~ 扩展
-    - 提供详细的校验（free_count 范围、aggregation 选项等）
-"""
-from __future__ import annotations
+from __future__ import annotations  # 配置加载模块 — 解析 config.yaml，提供所有类型安全的配置 dataclass。
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,14 +7,11 @@ from typing import Any
 import yaml
 
 
-# ═══════════════════════════════════════════════════════════════
 # 各子配置 dataclass
-# ═══════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True, slots=True)
-class MonitorConfig:
-    """监控循环参数。"""
-    poll_seconds: int           # 每轮循环间隔（秒）
+class MonitorConfig:  # 监控循环参数。
+    poll_seconds: float         # 每轮循环间隔（秒），支持小数。
     confirmation_seconds: int   # GPU 需连续达标多少秒后才触发
     min_idle_samples: int       # 最少需要多少条连续空闲采样
     max_sample_gap_seconds: int # 连续采样之间允许的最大时间间隔（超出则重置）
@@ -32,12 +20,7 @@ class MonitorConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class IdleThresholds:
-    """GPU 空闲判定阈值。
-
-    历史命名（IdleThresholds）保持兼容，但 v0.3.1 起仅以显存为硬条件。
-    GPU Util 可关闭，关闭后仅记录、不参与拦截。
-    """
+class IdleThresholds:  # GPU 空闲判定阈值。
 
     gpu_util_check_enabled: bool  # 是否启用 GPU Util 硬门控
     gpu_util_max_pct: float       # GPU Util 上限（启用时生效）
@@ -46,8 +29,7 @@ class IdleThresholds:
 
 
 @dataclass(frozen=True, slots=True)
-class PlatformConfig:
-    """AutoDL 平台采集器配置（Playwright 浏览器自动化）。"""
+class PlatformConfig:  # AutoDL 平台采集器配置（Playwright 浏览器自动化）。
     page_url: str                 # AutoDL 控制台页面 URL
     api_path_contains: str        # 匹配 API 请求路径中的特征字符串
     api_base_url: str             # API 基础地址
@@ -63,8 +45,7 @@ class PlatformConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class TelemetryConfig:
-    """Telemetry API 采集器配置（HTTP GET 拉取 GPU 快照）。"""
+class TelemetryConfig:  # Telemetry API 采集器配置（HTTP GET 拉取 GPU 快照）。
     endpoint: str              # API 地址
     timeout_seconds: int       # 每次 HTTP 请求超时秒数
     max_attempts: int          # 单轮最多请求次数（含第一次）
@@ -73,16 +54,14 @@ class TelemetryConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class NotificationConfig:
-    """通知配置。"""
+class NotificationConfig:  # 通知配置。
     console_enabled: bool   # 是否启用控制台通知
     email_enabled: bool     # 是否启用邮件通知
     subject_prefix: str     # 邮件主题前缀
 
 
 @dataclass(frozen=True, slots=True)
-class AutoStartTarget:
-    """一个 AutoDL 固定实例（对应一个 machine_name/入口）。"""
+class AutoStartTarget:  # 一个 AutoDL 固定实例（对应一个 machine_name/入口）。
     host: str               # 所属物理主机（如 gpu-203）
     machine_name: str       # 入口名（如 autodl-203-1）
     instance_uuid: str      # 实例 UUID（power_on 时发送）
@@ -92,8 +71,7 @@ class AutoStartTarget:
 
 
 @dataclass(frozen=True, slots=True)
-class AutoStartConfig:
-    """自动开机配置。"""
+class AutoStartConfig:  # 自动开机配置。
     enabled: bool                   # 是否启用自动开机
     default_host: str               # 默认目标主机
     dry_run: bool                   # 默认是否 dry-run（只判定不开机）
@@ -105,10 +83,9 @@ class AutoStartConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class UsageTrackingConfig:
-    """GPU 占用追踪配置。"""
+class UsageTrackingConfig:  # GPU 占用追踪配置。
     enabled: bool             # 是否启用
-    interval_seconds: int     # 采集间隔（秒）
+    interval_seconds: float   # 采集间隔（秒），支持小数。
     database_path: Path       # SQLite 数据库路径
     export_dir: Path          # CSV 导出目录
     self_user: str            # 当前账号在“查看占用”页面显示的用户标识
@@ -117,15 +94,13 @@ class UsageTrackingConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class RuntimeConfig:
-    """运行时文件路径。"""
+class RuntimeConfig:  # 运行时文件路径。
     state_file: Path  # evaluator 状态持久化文件（JSON）
     log_file: Path    # 监控日志文件
 
 
 @dataclass(frozen=True, slots=True)
-class AppConfig:
-    """顶层应用配置，包含所有子配置。"""
+class AppConfig:  # 顶层应用配置，包含所有子配置。
     monitor: MonitorConfig
     idle_thresholds: IdleThresholds
     platform: PlatformConfig
@@ -136,49 +111,20 @@ class AppConfig:
     runtime: RuntimeConfig
 
 
-def _required(mapping: dict[str, Any], key: str) -> Any:
-    """功能：
-        从配置字典读取必填字段；字段缺失时立即给出明确错误。
-
-    参数：
-        mapping (dict[str, Any])：待读取的配置字典。
-        key (str)：需要读取的配置字段名。
-
-    返回：
-        Any：指定键对应的配置值。
-    """
+def _required(mapping: dict[str, Any], key: str) -> Any:  # 从配置字典读取必填字段；字段缺失时立即给出明确错误。
     if key not in mapping:
         raise KeyError(f"Missing config key: {key}")
     return mapping[key]
 
 
-def _resolve_path(base_dir: Path, value: str | Path) -> Path:
-    """功能：
-        将配置中的相对路径解析为相对于配置文件目录的绝对路径。
-
-    参数：
-        base_dir (Path)：相对路径解析所依据的配置文件目录。
-        value (str | Path)：待规范化、解析或转换的输入值。
-
-    返回：
-        Path：规范化后的绝对 Path。
-    """
+def _resolve_path(base_dir: Path, value: str | Path) -> Path:  # 将配置中的相对路径解析为相对于配置文件目录的绝对路径。
     path = Path(value).expanduser()
     if path.is_absolute():
         return path
     return (base_dir / path).resolve()
 
 
-def load_config(path: str | Path = "config.yaml") -> AppConfig:
-    """功能：
-        读取 YAML 配置，完成类型转换、路径解析与 dataclass 配置对象组装。
-
-    参数：
-        path (str | Path)：文件路径、API 相对路径或目标输出路径，具体含义由函数上下文决定。
-
-    返回：
-        AppConfig：包含全部子配置的 AppConfig。
-    """
+def load_config(path: str | Path = "config.yaml") -> AppConfig:  # 读取 YAML 配置，完成类型转换、路径解析与 dataclass 配置对象组装。
     config_path = Path(path).resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     base_dir = config_path.parent
@@ -193,9 +139,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     runtime = _required(raw, "runtime")
 
     aggregation = str(platform.get("aggregation", "max")).lower()
-    # v0.3.2 曾使用 any 表示“任一入口 idle>0 即通过”。该语义与 max 在
-    # 是否允许开机这一点上完全一致，因此保留 any 作为兼容别名。
-    if aggregation == "any":
+    if aggregation == "any":  # v0.3.2 曾使用 any 表示“任一入口 idle>0 即通过”。该语义与 max 在 是否允许开机这一点上完全一致，因此保留 any 作为兼容别名。
         aggregation = "max"
     if aggregation not in {"max", "min", "sum"}:
         raise ValueError("platform.aggregation must be one of: max, min, sum")
@@ -249,10 +193,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
             aggregation=aggregation,
             autodl_direct=bool(platform.get("autodl_direct", True)),
             proxy_bypass_list=str(
-                platform.get(
-                    "proxy_bypass_list",
-                    "private.autodl.com;*.autodl.com;<local>",
-                )
+                platform.get( "proxy_bypass_list", "private.autodl.com;*.autodl.com;<local>", )
             ),
         ),
         telemetry=TelemetryConfig(
@@ -275,28 +216,20 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         ),
         usage_tracking=UsageTrackingConfig(
             enabled=bool(usage_tracking.get("enabled", True)),
-            interval_seconds=int(usage_tracking.get("interval_seconds", 60)),
+            interval_seconds=float(usage_tracking.get("interval_seconds", 60)),
             database_path=_resolve_path(
                 base_dir,
-                usage_tracking.get(
-                    "database_path",
-                    "../autodl_watcher_runtime/usage/occupancy.db",
-                ),
+                usage_tracking.get( "database_path", "../autodl_watcher_runtime/usage/occupancy.db", ),
             ),
             export_dir=_resolve_path(
                 base_dir,
-                usage_tracking.get(
-                    "export_dir",
-                    "../autodl_watcher_runtime/usage/exports",
-                ),
+                usage_tracking.get( "export_dir", "../autodl_watcher_runtime/usage/exports", ),
             ),
             self_user=str(usage_tracking.get("self_user", "")).strip(),
             absent_confirmations_required=max(
                 1, int(usage_tracking.get("absent_confirmations_required", 2))
             ),
-            absence_recheck_seconds=max(
-                0.0, float(usage_tracking.get("absence_recheck_seconds", 5.0))
-            ),
+            absence_recheck_seconds=max( 0.0, float(usage_tracking.get("absence_recheck_seconds", 5.0)) ),
         ),
         runtime=RuntimeConfig(
             state_file=_resolve_path(base_dir, runtime["state_file"]),

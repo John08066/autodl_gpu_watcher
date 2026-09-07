@@ -1,23 +1,4 @@
-"""
-占用报表生成器 — 从 SQLite 数据库导出 CSV 报表并统计 GPU 使用时长。
-
-用法：
-    python -m autodl_watcher.usage_report
-
-输出（导出到 runtime/usage/exports/{timestamp}/）：
-    - occupancy_entry_snapshots.csv:     原始入口快照数据
-    - occupancy_instance_snapshots.csv:  去重后的实例快照
-    - occupancy_gpu_snapshots.csv:       每张 GPU 的并发占用统计
-    - occupancy_events.csv:              实例开始/结束事件
-    - current_instances.csv:             当前活跃实例
-    - user_gpu_share.csv:                用户 GPU 使用时长排名（两种度量）
-
-两种度量指标：
-    1. allocated_gpu_hours — 每个实例独占计算 GPU 时间（相加可能超过物理卡数）
-    2. physical_equivalent_gpu_hours — 物理等价时间（并发用户均分时间，总和=物理卡时）
-       建议饼图使用 physical_share_pct。
-"""
-from __future__ import annotations
+from __future__ import annotations  # 占用报表生成器 — 从 SQLite 数据库导出 CSV 报表并统计 GPU 使用时长。
 
 import csv
 import json
@@ -29,31 +10,11 @@ from pathlib import Path
 from .config import load_config
 
 
-def _parse_time(value: str) -> datetime:
-    """功能：
-        解析 SQLite 或 CSV 中使用的 ISO 时间字符串。
-
-    参数：
-        value (str)：待规范化、解析或转换的输入值。
-
-    返回：
-        datetime：解析后的 datetime。
-    """
+def _parse_time(value: str) -> datetime:  # 解析 SQLite 或 CSV 中使用的 ISO 时间字符串。
     return datetime.fromisoformat(value)
 
 
-def _write_csv(path: Path, rows: list[dict[str, object]], fields: list[str]) -> None:
-    """功能：
-        按指定字段顺序把字典行写入 UTF-8 BOM CSV，便于 WPS/Excel 直接打开。
-
-    参数：
-        path (Path)：文件路径、API 相对路径或目标输出路径，具体含义由函数上下文决定。
-        rows (list[dict[str, object]])：待输出或待聚合的字典记录列表。
-        fields (list[str])：CSV 输出列名及其固定顺序。
-
-    返回：
-        None：无返回值。
-    """
+def _write_csv(path: Path, rows: list[dict[str, object]], fields: list[str]) -> None:  # 按指定字段顺序把字典行写入 UTF-8 BOM CSV，便于 WPS/Excel 直接打开。
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -62,17 +23,7 @@ def _write_csv(path: Path, rows: list[dict[str, object]], fields: list[str]) -> 
             writer.writerow({field: row.get(field, "") for field in fields})
 
 
-def _rows(conn: sqlite3.Connection, query: str) -> list[dict[str, object]]:
-    """功能：
-        执行只读 SQL 查询，并把结果转换为普通字典列表。
-
-    参数：
-        conn (sqlite3.Connection)：已打开的 SQLite 数据库连接。
-        query (str)：要执行的只读 SQL 查询语句。
-
-    返回：
-        list[dict[str, object]]：SQL 结果的字典列表。
-    """
+def _rows(conn: sqlite3.Connection, query: str) -> list[dict[str, object]]:  # 执行只读 SQL 查询，并把结果转换为普通字典列表。
     conn.row_factory = sqlite3.Row
     return [dict(row) for row in conn.execute(query).fetchall()]
 
@@ -82,19 +33,7 @@ def _duration_to_next(
     index: int,
     interval: int,
     max_gap: int,
-) -> int:
-    """功能：
-        估计某条快照持续到下一条快照的有效秒数，并限制异常采样间隔。
-
-    参数：
-        series (list[dict[str, object]])：按时间排序的一组快照记录。
-        index (int)：当前快照在时间序列中的位置。
-        interval (int)：正常采样间隔秒数。
-        max_gap (int)：允许计入统计的最大相邻快照间隔秒数。
-
-    返回：
-        int：当前快照可计入统计的持续秒数。
-    """
+) -> int:  # 估计某条快照持续到下一条快照的有效秒数，并限制异常采样间隔。
     current = _parse_time(str(series[index]["observed_at"]))
     if index + 1 >= len(series):
         return interval
@@ -102,16 +41,7 @@ def _duration_to_next(
     return max(0, min(int((next_time - current).total_seconds()), max_gap))
 
 
-def main() -> None:
-    """功能：
-        从 SQLite 主库导出原始快照、事件、当前实例与用户 GPU 时间占比报表。
-
-    参数：
-        无。
-
-    返回：
-        None：函数通过副作用完成初始化、输出、持久化或资源管理。
-    """
+def main() -> None:  # 从 SQLite 主库导出原始快照、事件、当前实例与用户 GPU 时间占比报表。
     config = load_config(Path("config.yaml"))
     database = config.usage_tracking.database_path
     if not database.exists():
@@ -210,9 +140,7 @@ def main() -> None:
     interval = max(1, config.usage_tracking.interval_seconds)
     max_gap = interval * 2
 
-    # Metric 1: platform allocation time.  Each distinct instance contributes
-    # its own GPU time, even when several instances share one physical GPU.
-    allocated_seconds: dict[str, int] = defaultdict(int)
+    allocated_seconds: dict[str, int] = defaultdict(int)  # Metric 1: platform allocation time.  Each distinct instance contributes its own GPU time, even when several instances share one physical GPU.
     sample_count: dict[str, int] = defaultdict(int)
     instances_by_user: dict[str, set[str]] = defaultdict(set)
     by_instance: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
@@ -229,10 +157,7 @@ def main() -> None:
             sample_count[user] += 1
             instances_by_user[user].add(str(row["instance_id"]))
 
-    # Metric 2: physical-equivalent time.  If N users concurrently share one
-    # physical GPU, each receives 1/N of that interval.  Shares therefore sum
-    # to the actual physical GPU capacity and are appropriate for pie charts.
-    physical_seconds: dict[str, float] = defaultdict(float)
+    physical_seconds: dict[str, float] = defaultdict(float)  # Metric 2: physical-equivalent time.  If N users concurrently share one physical GPU, each receives 1/N of that interval.  Shares therefore sum to the actual physical GPU capacity and are appropriate for pie charts.
     by_gpu: dict[tuple[str, int], list[dict[str, object]]] = defaultdict(list)
     for row in gpu_rows:
         by_gpu[(str(row["host"]), int(row["gpu_index"]))].append(row)

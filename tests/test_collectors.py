@@ -1,13 +1,4 @@
-"""
-采集器模块的单元测试。
-
-测试覆盖：
-    - canonical_host 映射（入口名 → 物理主机名）
-    - 平台 payload 解析（多入口聚合、空闲/总数计算）
-    - Telemetry payload 解析（时区处理、离线主机过滤）
-    - 两层门控过滤（仅平台有空位的主机通过）
-"""
-from __future__ import annotations
+from __future__ import annotations  # 采集器模块的单元测试。
 
 import unittest
 from unittest.mock import MagicMock, Mock, patch
@@ -34,30 +25,12 @@ from autodl_watcher.models import GpuSample, OccupancyRecord, PlatformHost
 
 
 class CollectorParsingTest(unittest.TestCase):
-    def test_canonical_host_maps_access_entry_not_gpu_index(self) -> None:
-        """功能：
-            验证测试场景 `canonical_host_maps_access_entry_not_gpu_index` 的预期行为。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def test_canonical_host_maps_access_entry_not_gpu_index(self) -> None:  # 验证测试场景 `canonical_host_maps_access_entry_not_gpu_index` 的预期行为。
         self.assertEqual(canonical_host("autodl-202-2"), "gpu-202")
         self.assertEqual(canonical_host("autodl-202-4"), "gpu-202")
         self.assertEqual(canonical_host("gpu-202"), "gpu-202")
 
-    def test_any_visible_entry_with_idle_opens_gate(self) -> None:
-        """功能：
-            验证测试场景 `any_visible_entry_with_idle_opens_gate` 的预期行为。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def test_any_visible_entry_with_idle_opens_gate(self) -> None:  # 验证测试场景 `any_visible_entry_with_idle_opens_gate` 的预期行为。
         payload = {
             "data": {
                 "list": [
@@ -71,21 +44,9 @@ class CollectorParsingTest(unittest.TestCase):
         self.assertEqual(hosts[0].host, "gpu-202")
         self.assertEqual(hosts[0].free_count, 3)
         self.assertEqual(hosts[0].total_count, 3)
-        self.assertEqual(
-            hosts[0].source_slots,
-            (("autodl-202-2", 0, 3), ("autodl-202-4", 3, 3)),
-        )
+        self.assertEqual( hosts[0].source_slots, (("autodl-202-2", 0, 3), ("autodl-202-4", 3, 3)), )
 
-    def test_all_visible_entries_zero_close_gate(self) -> None:
-        """功能：
-            验证测试场景 `all_visible_entries_zero_close_gate` 的预期行为。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def test_all_visible_entries_zero_close_gate(self) -> None:  # 验证测试场景 `all_visible_entries_zero_close_gate` 的预期行为。
         payload = {
             "data": {
                 "list": [
@@ -97,16 +58,7 @@ class CollectorParsingTest(unittest.TestCase):
         host = parse_platform_payload(payload, aggregation="max")[0]
         self.assertEqual(host.free_count, 0)
 
-    def test_telemetry_filters_offline_hosts(self) -> None:
-        """功能：
-            验证测试场景 `telemetry_filters_offline_hosts` 的预期行为。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def test_telemetry_filters_offline_hosts(self) -> None:  # 验证测试场景 `telemetry_filters_offline_hosts` 的预期行为。
         payload = {
             "items": [
                 {
@@ -135,16 +87,7 @@ class CollectorParsingTest(unittest.TestCase):
         self.assertEqual(len(samples), 1)
         self.assertEqual(samples[0].host, "gpu-202")
 
-    def test_only_selected_platform_host_survives(self) -> None:
-        """功能：
-            验证测试场景 `only_selected_platform_host_survives` 的预期行为。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def test_only_selected_platform_host_survives(self) -> None:  # 验证测试场景 `only_selected_platform_host_survives` 的预期行为。
         now = datetime(2026, 7, 20, 16, 0, 0)
         samples = [
             GpuSample("gpu-202", 0, "TITAN RTX", 0, 300, 24576, now),
@@ -156,16 +99,7 @@ class CollectorParsingTest(unittest.TestCase):
         self.assertEqual(blocked, ())
         self.assertEqual(unauthorized, ("gpu-176",))
 
-    def test_visible_host_with_closed_entry_gate_does_not_reach_stage_two(self) -> None:
-        """功能：
-            验证测试场景 `visible_host_with_closed_entry_gate_does_not_reach_stage_two` 的预期行为。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def test_visible_host_with_closed_entry_gate_does_not_reach_stage_two(self) -> None:  # 验证测试场景 `visible_host_with_closed_entry_gate_does_not_reach_stage_two` 的预期行为。
         now = datetime(2026, 7, 20, 16, 0, 0)
         samples = [GpuSample("gpu-201", 2, "A100", 0, 300, 40960, now)]
         platform = [PlatformHost("gpu-201", 0, 1, ("autodl-201-1",))]
@@ -175,8 +109,7 @@ class CollectorParsingTest(unittest.TestCase):
         self.assertEqual(unauthorized, ())
 
 
-class TelemetryRetryTest(unittest.TestCase):
-    """Telemetry 瞬时故障重试逻辑的回归测试。"""
+class TelemetryRetryTest(unittest.TestCase):  # Telemetry 瞬时故障重试逻辑的回归测试。
 
     @staticmethod
     def _config() -> TelemetryConfig:
@@ -222,10 +155,7 @@ class TelemetryRetryTest(unittest.TestCase):
         self.assertEqual(len(samples), 1)
         self.assertEqual(samples[0].host, "gpu-203")
         self.assertEqual(collector._session.get.call_count, 2)
-        self.assertEqual(
-            collector._session.get.call_args_list[0].kwargs["timeout"],
-            20,
-        )
+        self.assertEqual( collector._session.get.call_args_list[0].kwargs["timeout"], 20, )
         sleep_mock.assert_called_once_with(2.0)
 
     @patch("autodl_watcher.collectors.telemetry.time.sleep")
@@ -370,8 +300,7 @@ class PlatformClassificationV052Test(unittest.TestCase):
         self.assertEqual(collector._machine_list_payload, {"page_index": 1, "page_size": 10})
 
 
-class PlatformApiResponseCompatibilityV053Test(unittest.TestCase):
-    """v0.5.3: direct Playwright APIResponse does not expose response.request."""
+class PlatformApiResponseCompatibilityV053Test(unittest.TestCase):  # v0.5.3: direct Playwright APIResponse does not expose response.request.
 
     @staticmethod
     def _config():
@@ -405,12 +334,7 @@ class PlatformApiResponseCompatibilityV053Test(unittest.TestCase):
                 return {
                     "code": "Success",
                     "data": {
-                        "list": [
-                            {
-                                "machine_name": "autodl-203-2",
-                                "gpu": {"idle": 1, "total": 2},
-                            }
-                        ]
+                        "list": [ { "machine_name": "autodl-203-2", "gpu": {"idle": 1, "total": 2}, } ]
                     },
                     "msg": "",
                 }
@@ -443,12 +367,7 @@ class PlatformApiResponseCompatibilityV053Test(unittest.TestCase):
                 return {
                     "code": "Success",
                     "data": {
-                        "list": [
-                            {
-                                "machine_name": "autodl-203-2",
-                                "gpu": {"idle": 1, "total": 2},
-                            }
-                        ]
+                        "list": [ { "machine_name": "autodl-203-2", "gpu": {"idle": 1, "total": 2}, } ]
                     },
                     "msg": "",
                 }
@@ -478,8 +397,7 @@ class OccupancyValidationV054Test(unittest.TestCase):
         )
 
     def test_rejects_cross_entry_occupancy_pattern(self) -> None:
-        # 203-1 平台显示 2/2 空闲，却读到了 203-2 的两张占用数据。
-        records = [
+        records = [  # 203-1 平台显示 2/2 空闲，却读到了 203-2 的两张占用数据。
             self._record("autodl-203-1", 0, True, "炼丹师6912"),
             self._record("autodl-203-1", 1, True, "何太急"),
         ]
@@ -492,10 +410,7 @@ class OccupancyValidationV054Test(unittest.TestCase):
             )
 
     def test_accepts_matching_empty_entry(self) -> None:
-        records = [
-            self._record("autodl-203-1", 0, False),
-            self._record("autodl-203-1", 1, False),
-        ]
+        records = [ self._record("autodl-203-1", 0, False), self._record("autodl-203-1", 1, False), ]
         actual = validate_occupancy_snapshot(
             records,
             machine_name="autodl-203-1",
@@ -513,3 +428,23 @@ class OccupancyValidationV054Test(unittest.TestCase):
                 expected_idle=0,
                 expected_total=2,
             )
+
+    def test_extra_empty_row_requires_matching_telemetry_indices(self):
+        records = [self._record("autodl-202-4", index, False) for index in range(4)]
+        with self.assertRaises(OccupancySnapshotMismatchError):
+            validate_occupancy_snapshot(records, machine_name="autodl-202-4", expected_idle=3, expected_total=3)
+        actual = validate_occupancy_snapshot(records, machine_name="autodl-202-4", expected_idle=3,
+                                             expected_total=3, expected_gpu_indices={0, 1, 2})
+        self.assertEqual([item.gpu_index for item in actual], [0, 1, 2])
+
+    def test_extra_occupied_row_is_never_discarded(self):
+        records = [self._record("autodl-202-4", index, index == 3, "user") for index in range(4)]
+        with self.assertRaises(OccupancySnapshotMismatchError):
+            validate_occupancy_snapshot(records, machine_name="autodl-202-4", expected_idle=3,
+                                        expected_total=3, expected_gpu_indices={0, 1, 2})
+
+    def test_incomplete_telemetry_cannot_relax_row_validation(self):
+        records = [self._record("autodl-202-4", index, False) for index in range(4)]
+        with self.assertRaises(OccupancySnapshotMismatchError):
+            validate_occupancy_snapshot(records, machine_name="autodl-202-4", expected_idle=3,
+                                        expected_total=3, expected_gpu_indices={0, 1})

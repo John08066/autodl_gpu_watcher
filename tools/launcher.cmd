@@ -32,4 +32,6 @@ if not errorlevel 1 (
 )
 
 cd /d "%PROJECT_DIR%"
+set "PYTHONPATH=%PROJECT_DIR%src;%PYTHONPATH%"
+set "PYTHONUTF8=1"
 exit /b 0

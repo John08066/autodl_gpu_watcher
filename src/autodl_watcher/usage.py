@@ -1,21 +1,4 @@
-"""
-GPU 占用日志模块 — SQLite 数据库记录各入口的 GPU 占用情况。
-
-数据流：
-    PlatformBrowserCollector.collect_occupancy()
-        → parse_occupancy_cells() → OccupancyRecord
-        → UsageSqliteLogger.record()
-            → entry_snapshots 表（原始每行数据）
-            → instance_snapshots 表（按 instance_id 去重后的数据）
-            → gpu_snapshots 表（每张物理 GPU 的并发占用统计）
-            → occupancy_events 表（实例开始/结束事件）
-            → current_instances 表（当前活跃的实例快照）
-
-设计原则：
-    - SQLite 是唯一的事实源，CSV 只是导出产物
-    - Windows 上使用 WAL 模式和 busy_timeout 避免文件锁定
-    - 每次 record() 后立即关闭数据库连接，释放文件句柄
-"""
+# GPU 占用日志模块 — SQLite 数据库记录各入口的 GPU 占用情况。
 
 from __future__ import annotations
 
@@ -59,22 +42,7 @@ EVENT_FIELDS = (
 )
 
 
-def _parse_started_at(text: str) -> datetime | None:
-    """功能：
-        解析 AutoDL 页面上的"启动时间"字符串。
-
-    参数：
-        text (str)：待解析或转换的文本。
-
-    返回：
-        datetime | None：解析成功的 datetime；空值或无效值返回 `None`。
-
-    补充说明：
-        支持多种格式：
-            - "2026-07-20 18:29:58"
-            - "2026/07/20 18:29:58"
-            - ISO 格式
-    """
+def _parse_started_at(text: str) -> datetime | None:  # 解析 AutoDL 页面上的"启动时间"字符串。
     value = text.strip()
     if not value:
         return None
@@ -89,21 +57,7 @@ def _parse_started_at(text: str) -> datetime | None:
         return None
 
 
-def _duration_seconds(started_at: str, fallback: str, ended_at: datetime) -> int:
-    """功能：
-        计算从 started_at 到 ended_at 的持续秒数。
-
-    参数：
-        started_at (str)：平台记录的实例占用开始时间字符串。
-        fallback (str)：主时间字段不可用时采用的备用时间字符串。
-        ended_at (datetime)：占用结束或当前统计截止时间。
-
-    返回：
-        int：起止时间之间的非负秒数。
-
-    补充说明：
-        如果 started_at 无法解析，使用 fallback（first_seen_at）作为后备。
-    """
+def _duration_seconds(started_at: str, fallback: str, ended_at: datetime) -> int:  # 计算从 started_at 到 ended_at 的持续秒数。
     start = _parse_started_at(started_at)
     if start is None:
         try:
@@ -113,26 +67,7 @@ def _duration_seconds(started_at: str, fallback: str, ended_at: datetime) -> int
     return max(0, int((ended_at - start).total_seconds()))
 
 
-def merge_duplicate_instances(records: list[OccupancyRecord]) -> list[OccupancyRecord]:
-    """功能：
-        按 (host, instance_id) 去重，保留同一实例的最新记录。
-
-    参数：
-        records (list[OccupancyRecord])：一轮或多轮 GPU 占用记录列表。
-
-    返回：
-        list[OccupancyRecord]：按 `(host, instance_id)` 去重后的实例占用列表。
-
-    补充说明：
-        不同 AutoDL 入口可能暴露同一张物理 GPU INDEX，并报告不同的 instance_id/user。
-        这些是不同的分配，必须全部保留。
-
-        去重规则：
-            - 仅对 occupied=True 且 instance_id 非空的记录去重
-            - 去重键为 (host, instance_id)
-            - 同键的多条记录取 observed_at 最新的那条
-            - machine_name 合并为 "entry1|entry2" 形式
-    """
+def merge_duplicate_instances(records: list[OccupancyRecord]) -> list[OccupancyRecord]:  # 按 (host, instance_id) 去重，保留同一实例的最新记录。
 
     grouped: dict[tuple[str, str], list[OccupancyRecord]] = defaultdict(list)
     for item in records:
@@ -161,27 +96,7 @@ def merge_duplicate_instances(records: list[OccupancyRecord]) -> list[OccupancyR
     return merged
 
 
-def aggregate_gpu_occupants(records: list[OccupancyRecord]) -> list[dict[str, Any]]:
-    """功能：
-        统计每张物理 GPU INDEX 上的并发占用情况。
-
-    参数：
-        records (list[OccupancyRecord])：一轮或多轮 GPU 占用记录列表。
-
-    返回：
-        list[dict[str, Any]]：按物理 GPU INDEX 聚合的并发用户统计行。
-
-    补充说明：
-        与旧实现不同：不选择"胜者"。
-        一张物理 GPU 上可能有多个平台实例/用户同时运行，
-        尤其是当两个 AutoDL 入口对应同一张物理 INDEX 时。
-
-        返回每张 GPU 的：
-            - occupant_count: 并发占用数
-            - active_users: 活跃用户列表（JSON）
-            - active_instance_ids: 活跃实例 ID 列表（JSON）
-            - active_entries: 对应的入口名列表（JSON）
-    """
+def aggregate_gpu_occupants(records: list[OccupancyRecord]) -> list[dict[str, Any]]:  # 统计每张物理 GPU INDEX 上的并发占用情况。
 
     instances = merge_duplicate_instances(records)
     all_gpu_rows: dict[tuple[str, int], list[OccupancyRecord]] = defaultdict(list)
@@ -206,9 +121,7 @@ def aggregate_gpu_occupants(records: list[OccupancyRecord]) -> list[dict[str, An
         )
         result.append(
             {
-                "observed_at": max(
-                    [meta.observed_at, *(item.observed_at for item in occupants)]
-                ).isoformat(timespec="seconds"),
+                "observed_at": max( [meta.observed_at, *(item.observed_at for item in occupants)] ).isoformat(timespec="seconds"),
                 "host": host,
                 "gpu_index": gpu_index,
                 "gpu_uuid": meta.gpu_uuid,
@@ -238,48 +151,14 @@ def aggregate_gpu_occupants(records: list[OccupancyRecord]) -> list[dict[str, An
     return result
 
 
-class UsageSqliteLogger:
-    """SQLite 占用日志记录器。
+class UsageSqliteLogger:  # SQLite 占用日志记录器。
 
-    SQLite 是唯一的事实源（source of truth）。CSV 只是导出产物，
-    因此 WPS/Excel 打开 CSV 不会阻塞实时监控。
-
-    数据库包含 5 张表：
-        - entry_snapshots:  原始每行数据（来自页面弹窗）
-        - instance_snapshots: 按 instance_id 去重后的实例数据
-        - gpu_snapshots:    每张物理 GPU 的并发占用统计
-        - occupancy_events: 实例开始/结束事件
-        - current_instances: 当前活跃的实例（用于计算事件）
-    """
-
-    def __init__(self, database_path: Path) -> None:
-        """功能：
-            初始化 SQLite 占用日志器，创建父目录并建立所需数据表。
-
-        参数：
-            database_path (Path)：SQLite 占用数据库文件路径。
-
-        返回：
-            None：函数通过副作用完成初始化、输出、持久化或资源管理。
-        """
+    def __init__(self, database_path: Path) -> None:  # 初始化 SQLite 占用日志器，创建父目录并建立所需数据表。
         self.database_path = database_path
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        """功能：
-            创建并配置一个 SQLite 连接。
-
-        参数：
-            无。
-
-        返回：
-            sqlite3.Connection：已配置 WAL、超时和行工厂的 SQLite Connection。
-
-        补充说明：
-            WAL 模式：允许并发读，提升写入性能。
-            busy_timeout=30000：等待 30 秒而非立即失败。
-        """
+    def _connect(self) -> sqlite3.Connection:  # 创建并配置一个 SQLite 连接。
         connection = sqlite3.connect(self.database_path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
@@ -288,21 +167,7 @@ class UsageSqliteLogger:
         return connection
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
-        """功能：
-            上下文管理器：确保数据库连接在使用后关闭。
-
-        参数：
-            无。
-
-        返回：
-            Iterator[sqlite3.Connection]：上下文管理器迭代产出的 SQLite Connection。
-
-        补充说明：
-            Windows 上 sqlite3.Connection 作为上下文管理器只会 commit/rollback
-            而不会关闭连接，这会导致文件句柄泄漏和 TemporaryDirectory 清理失败。
-            因此我们在 finally 中显式调用 close()。
-        """
+    def _connection(self) -> Iterator[sqlite3.Connection]:  # 上下文管理器：确保数据库连接在使用后关闭。
 
         connection = self._connect()
         try:
@@ -311,16 +176,7 @@ class UsageSqliteLogger:
         finally:
             connection.close()
 
-    def _init_schema(self) -> None:
-        """功能：
-            创建占用快照、实例状态、GPU 并发和上下机事件等 SQLite 表与索引。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def _init_schema(self) -> None:  # 创建占用快照、实例状态、GPU 并发和上下机事件等 SQLite 表与索引。
         with self._connection() as conn:
             conn.executescript(
                 """
@@ -413,19 +269,9 @@ class UsageSqliteLogger:
             )
 
     @staticmethod
-    def _capture_id(records: list[OccupancyRecord]) -> tuple[str, datetime]:
-        """功能：
-            根据一批占用记录生成本轮采集批次 ID 和统一采集时间。
-
-        参数：
-            records (list[OccupancyRecord])：同一次采集获得的全部入口占用记录；可为空列表。
-
-        返回：
-            tuple[str, datetime]：二元组：批次 ID 与该批次统一 observed_at。
-        """
+    def _capture_id(records: list[OccupancyRecord]) -> tuple[str, datetime]:  # 根据一批占用记录生成本轮采集批次 ID 和统一采集时间。
         observed_at = max(item.observed_at for item in records)
-        # Microseconds make consecutive captures unique without external UUIDs.
-        return observed_at.isoformat(timespec="microseconds"), observed_at
+        return observed_at.isoformat(timespec="microseconds"), observed_at  # Microseconds make consecutive captures unique without external UUIDs.
 
     def record(
         self,
@@ -433,23 +279,9 @@ class UsageSqliteLogger:
         *,
         complete_snapshot: bool = True,
         snapshot_hosts: set[str] | None = None,
-    ) -> list[dict[str, Any]]:
-        """功能：
-            将一轮所有入口的占用事实写入 SQLite，并根据实例变化生成上下机事件。
-
-        参数：
-            records (list[OccupancyRecord])：一轮或多轮 GPU 占用记录列表。
-            complete_snapshot (bool)：本轮目标入口是否全部采集成功。False 时只写快照，
-                不更新 current_instances，也不生成 END_SEEN。
-            snapshot_hosts (set[str] | None)：完整快照覆盖的物理主机范围。
-
-        返回：
-            list[dict[str, Any]]：本轮新增的 start、switch 或 end 事件字典列表。
-        """
+    ) -> list[dict[str, Any]]:  # 将一轮所有入口的占用事实写入 SQLite，并根据实例变化生成上下机事件。
         if not records:
-            # 没有原始行时无法生成快照时间。主流程正常情况下每个 GPU 都会有一行，
-            # 因此这里保持无操作；“完整/不完整”判定由调用方负责。
-            return []
+            return []  # 没有原始行时无法生成快照时间。主流程正常情况下每个 GPU 都会有一行， 因此这里保持无操作；“完整/不完整”判定由调用方负责。
 
         capture_id, capture_at = self._capture_id(records)
         instance_records = merge_duplicate_instances(records)
@@ -530,10 +362,7 @@ class UsageSqliteLogger:
                 ],
             )
 
-            # v0.5.0：部分入口采集失败时，只记录“看见了什么”，绝不据此推断
-            # “没看见的实例已经结束”。旧版会在部分失败时制造伪 END_SEEN，
-            # 并污染 current_instances。
-            if not complete_snapshot:
+            if not complete_snapshot:  # v0.5.0：部分入口采集失败时，只记录“看见了什么”，绝不据此推断 “没看见的实例已经结束”。旧版会在部分失败时制造伪 END_SEEN， 并污染 current_instances。
                 return []
 
             scoped_hosts = set(snapshot_hosts or {item.host for item in records})
@@ -671,16 +500,7 @@ class UsageSqliteLogger:
 
         return events
 
-    def current_instances(self) -> list[dict[str, Any]]:
-        """功能：
-            读取数据库中当前仍处于占用状态的实例快照。
-
-        参数：
-            无。
-
-        返回：
-            list[dict[str, Any]]：当前活跃实例的字典列表。
-        """
+    def current_instances(self) -> list[dict[str, Any]]:  # 读取数据库中当前仍处于占用状态的实例快照。
         with self._connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM current_instances ORDER BY host, gpu_index, user, instance_id"
@@ -689,16 +509,7 @@ class UsageSqliteLogger:
 
 
 # Compatibility aliases for older imports/tests.
-def merge_occupancy_records(records: list[OccupancyRecord]) -> list[OccupancyRecord]:
-    """功能：
-        兼容旧调用名称，将相同实例的重复入口记录合并。
-
-    参数：
-        records (list[OccupancyRecord])：一轮或多轮 GPU 占用记录列表。
-
-    返回：
-        list[OccupancyRecord]：按实例去重后的 OccupancyRecord 列表。
-    """
+def merge_occupancy_records(records: list[OccupancyRecord]) -> list[OccupancyRecord]:  # 兼容旧调用名称，将相同实例的重复入口记录合并。
     return merge_duplicate_instances(records)
 
 

@@ -1,15 +1,4 @@
-"""
-项目入口脚本 — 直接运行源码树，避免读取过期的 editable 安装包。
-
-用法：
-    python run_watcher.py [--host HOST] [--entry ENTRY] [--dry-run | --live]
-
-设计意图：
-    pip install -e . 后，源码变更不会自动反映到安装包。
-    本脚本将 src/ 加入 sys.path，确保始终运行最新的源码，
-    与开发调试场景（频繁改代码）完全兼容。
-"""
-from __future__ import annotations
+from __future__ import annotations  # 项目入口脚本 — 直接运行源码树，避免读取过期的 editable 安装包。
 
 import sys
 from pathlib import Path
