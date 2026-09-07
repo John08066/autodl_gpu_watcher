@@ -39,6 +39,10 @@ class PackageLayoutV051Test(unittest.TestCase):
         self.assertIn(":option7", source)
         self.assertNotIn("if errorlevel 7 powershell", source.lower())
 
+    def test_launcher_bypasses_autodl_from_http_proxy(self) -> None:
+        source = (self.root / "tools" / "launcher.cmd").read_text(encoding="ascii")
+        self.assertIn("private.autodl.com,.autodl.com", source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-# AutoDL GPU Watcher v0.5.3
+# AutoDL GPU Watcher v0.5.4
 
 用于实验室 AutoDL 私有云 GPU 资源监控、占用统计和满足条件后的自动开机。
 
@@ -7,7 +7,7 @@
 根目录只保留日常会直接接触的文件；辅助启动脚本统一放进 `tools/`：
 
 ```text
-autodl_gpu_watcher_v0.5.3/
+autodl_gpu_watcher_v0.5.4/
 ├─ src/                  Python 主代码
 ├─ tests/                单元测试
 ├─ tools/                一键菜单使用的辅助脚本
@@ -51,7 +51,62 @@ START_HERE.cmd
 
 以后通常直接按 `2` 或 `3`。
 
-## v0.5.3 关键修复
+## v0.5.4 关键修复
+
+### A. 修复 203-1 / 203-2 占用串读
+
+占用采集现在必须同时满足：
+
+```text
+弹窗标题 = 占用详情
+AND
+弹窗正文明确包含当前入口 machine_name
+AND
+只解析该弹窗内部表格
+AND
+machine/list 的 idle/total 与弹窗占用数一致
+```
+
+任一条件不满足，本轮直接显示“采集失败”，绝不拿另一入口的数据顶上。
+
+### B. 误判关机改为连续确认
+
+一次空占用详情只记为：
+
+```text
+本人状态[疑似结束 1/2，待复核]
+```
+
+随后快速复核；只有连续两次可靠空快照才执行：
+
+```text
+ACTIVE -> ABSENT -> 清 alerted -> 自动开机重新武装
+```
+
+采集失败不会推进确认次数。第一次疑似空快照也不会在 SQLite 中生成 `END_SEEN`。
+
+### C. AutoDL 控制面默认绕过系统代理
+
+该 PC 实测开启 Clash 系统代理时 `private.autodl.com` 明显更慢，而关闭代理后恢复。
+v0.5.4 因此把 watcher 自己访问 AutoDL 的流量设为直连：
+
+```text
+private.autodl.com / *.autodl.com -> DIRECT
+watchgpu.vpms-lab.com            -> 仍可走本机 Clash 7897
+```
+
+这只影响 watcher 的专用登录 Edge / 后台 Edge，不会修改你普通 Edge 的全局 Clash 配置。
+
+### D. 固定 203-2 没空位时不再假触发
+
+如果 203-1 有空位、但固定目标 203-2 没空位，终端只会显示：
+
+```text
+固定入口当前无可用实例，继续等待
+```
+
+不会再每 10 秒刷“没有可用固定实例”。
+
 
 
 ### 0. 修复“已登录却反复判定登录失效”
@@ -268,6 +323,6 @@ Ctrl+C
 python -m unittest discover -s tests -v
 ```
 
-v0.5.3 发布前回归测试：63 项通过。
+v0.5.4 发布前回归测试：70 项通过。
 
 完整版本变化见同级 [`CHANGELOG.md`](CHANGELOG.md)。

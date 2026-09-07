@@ -185,15 +185,27 @@ def prepare_profile_for_exclusive_use(user_data_dir: Path) -> None:
     remove_stale_profile_locks(user_data_dir)
 
 
-def launch_native_edge(edge_path: Path, user_data_dir: Path, page_url: str) -> subprocess.Popen[bytes]:
-    """启动不受 Playwright 控制的普通 Edge。"""
+def launch_native_edge(
+    edge_path: Path,
+    user_data_dir: Path,
+    page_url: str,
+    *,
+    proxy_bypass_list: str = "",
+) -> subprocess.Popen[bytes]:
+    """启动不受 Playwright 控制的普通 Edge。
+
+    ``proxy_bypass_list`` 仅用于让 AutoDL 控制面绕过系统代理。系统默认 Edge
+    和其他网站不受影响；这只是 watcher 专用登录窗口的启动参数。
+    """
     user_data_dir.mkdir(parents=True, exist_ok=True)
     command = [
         str(edge_path),
         f"--user-data-dir={user_data_dir}",
         "--new-window",
-        page_url,
     ]
+    if proxy_bypass_list.strip():
+        command.append(f"--proxy-bypass-list={proxy_bypass_list.strip()}")
+    command.append(page_url)
     return subprocess.Popen(command)
 
 
@@ -266,13 +278,34 @@ def interactive_login(config: AppConfig | None = None, *, reason: str = "manual"
     print("完成 AutoDL 登录并确认能看到“所有主机”后，关闭这个 Edge 窗口。")
     print("然后回到此终端按 Enter；验证码仍需手动完成。")
 
-    launch_native_edge(edge_path, clean_profile, config.platform.page_url)
+    bypass = (
+        config.platform.proxy_bypass_list
+        if getattr(config.platform, "autodl_direct", False)
+        else ""
+    )
+    if bypass:
+        if bypass:
+            launch_native_edge(
+                edge_path,
+                clean_profile,
+                config.platform.page_url,
+                proxy_bypass_list=bypass,
+            )
+        else:
+            launch_native_edge(edge_path, clean_profile, config.platform.page_url)
+    else:
+        launch_native_edge(edge_path, clean_profile, config.platform.page_url)
     time.sleep(1.5)
 
     if automation_flags_present(clean_profile):
         # 理论上不会发生；若系统复用了污染进程，则强制清理并再启动一次。
         prepare_profile_for_exclusive_use(clean_profile)
-        launch_native_edge(edge_path, clean_profile, config.platform.page_url)
+        launch_native_edge(
+            edge_path,
+            clean_profile,
+            config.platform.page_url,
+            proxy_bypass_list=bypass,
+        )
         time.sleep(1.5)
         if automation_flags_present(clean_profile):
             prepare_profile_for_exclusive_use(clean_profile)
