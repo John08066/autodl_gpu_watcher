@@ -33,6 +33,7 @@ from .cli import normalize_entry, normalize_host, select_cli_targets
 from .collectors import (
     PlatformAuthenticationError,
     PlatformBrowserCollector,
+    PlatformTransientError,
     TelemetryApiCollector,
     filter_samples_to_platform_candidates,
 )
@@ -429,7 +430,7 @@ def main() -> None:
     target_signature = ",".join(item.machine_name for item in selected_targets)
     # capacity_fingerprint 是配置的哈希摘要，用于检测配置是否变更
     capacity_fingerprint = (
-        f"v5.1|host={selected_host}|targets={target_signature}|"
+        f"v5.2|host={selected_host}|targets={target_signature}|"
         f"util={config.idle_thresholds.gpu_util_check_enabled}:"
         f"{config.idle_thresholds.gpu_util_max_pct}|"
         f"free={config.idle_thresholds.memory_free_min_mb}:"
@@ -488,6 +489,7 @@ def main() -> None:
         key=lambda item: (item.priority, item.machine_name, item.instance_uuid),
     )
     next_usage_capture = 0.0  # 下次采集占用快照的时间戳（monotonic）
+    login_validation_pending = False
 
     # ── 创建自动开机协调器 ──
     starter = AutoStartCoordinator(
@@ -547,6 +549,13 @@ def main() -> None:
                 # ── Step 1: 采集两层数据 ──
                 # 1a. 从 AutoDL 控制台采集平台级 GPU ID 空位（Playwright 控制浏览器）
                 all_platform_hosts = platform_collector.collect()
+                if login_validation_pending:
+                    print(
+                        f"[{datetime.now():%H:%M:%S}] 登录验证成功，平台主机接口已恢复，继续监控。",
+                        flush=True,
+                    )
+                    logger.info("platform login recovery verified by machine/list success")
+                    login_validation_pending = False
                 platform_hosts = [
                     item for item in all_platform_hosts if item.host == selected_host
                 ]
@@ -897,18 +906,18 @@ def main() -> None:
                     }
                 )
             except PlatformAuthenticationError as exc:
-                # v0.5.1：会话过期时不再每 10 秒刷 /login 错误。关闭 Playwright，
-                # 自动弹出普通 Edge；用户完成验证码后，当前监控进程直接恢复。
+                # v0.5.2：只有明确 /login 或 HTTP 401/403 才进入人工登录恢复。
                 now = datetime.now()
-                print(f"[{now:%H:%M:%S}] 登录会话失效：{exc}", flush=True)
+                print(f"[{now:%H:%M:%S}] 登录会话确认失效：{exc}", flush=True)
                 logger.warning("platform authentication expired: %s", exc)
                 platform_collector.close()
                 try:
                     interactive_login(config, reason="expired")
                     print(
-                        f"[{datetime.now():%H:%M:%S}] 登录恢复完成，自动继续监控。",
+                        f"[{datetime.now():%H:%M:%S}] 登录资料已更新；下一轮将验证主机接口，验证成功后再恢复监控。",
                         flush=True,
                     )
+                    login_validation_pending = True
                     self_occupancy_known = False
                     owned_instances = []
                     pending_start_until = 0.0
@@ -921,6 +930,16 @@ def main() -> None:
                         flush=True,
                     )
                     logger.exception("interactive login recovery failed")
+            except PlatformTransientError as exc:
+                # 页面/API 慢、超时、429、5xx 都属于数据采集瞬时故障。
+                # 不弹登录窗口，不修改本人占用状态，也绝不发送开机请求。
+                now = datetime.now()
+                print(
+                    f"[{now:%H:%M:%S}] AutoDL 主机接口暂时不可用：{exc} | "
+                    "本轮跳过开机，保持登录状态并自动重试。",
+                    flush=True,
+                )
+                logger.warning("platform transient failure: %s", exc)
             except Exception as exc:
                 # 本轮任意环节抛异常 → 打日志，不中断循环
                 now = datetime.now()

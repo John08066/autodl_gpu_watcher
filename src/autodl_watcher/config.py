@@ -55,6 +55,8 @@ class PlatformConfig:
     user_data_dir: Path           # 浏览器用户数据目录（保存登录会话）
     headless: bool                # 是否无头模式
     response_timeout_seconds: int # 等待 API 响应的超时秒数
+    max_attempts: int              # 主机列表 API 单轮最多尝试次数
+    retry_delay_seconds: float     # 主机列表 API 瞬时失败后的重试等待秒数
     aggregation: str              # 多入口聚合策略：max / min / sum
 
 
@@ -238,6 +240,8 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
             user_data_dir=_resolve_path(base_dir, platform["user_data_dir"]),
             headless=bool(platform.get("headless", True)),
             response_timeout_seconds=int(platform.get("response_timeout_seconds", 20)),
+            max_attempts=max(1, int(platform.get("max_attempts", 2))),
+            retry_delay_seconds=max(0.0, float(platform.get("retry_delay_seconds", 2.0))),
             aggregation=aggregation,
         ),
         telemetry=TelemetryConfig(

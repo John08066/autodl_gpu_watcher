@@ -10,12 +10,18 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import requests
 from datetime import datetime
 
-from autodl_watcher.collectors.platform import canonical_host, parse_platform_payload
+from autodl_watcher.collectors.platform import (
+    PlatformAuthenticationError,
+    PlatformBrowserCollector,
+    PlatformTransientError,
+    canonical_host,
+    parse_platform_payload,
+)
 from autodl_watcher.collectors.telemetry import (
     TelemetryApiCollector,
     filter_samples_to_platform_candidates,
@@ -269,6 +275,8 @@ class PlatformBrowserRecoveryV050Test(unittest.TestCase):
             user_data_dir=Path("runtime/browser_profile"),
             headless=True,
             response_timeout_seconds=20,
+            max_attempts=2,
+            retry_delay_seconds=2.0,
             aggregation="max",
         )
         collector = PlatformBrowserCollector(config)
@@ -285,3 +293,76 @@ class PlatformBrowserRecoveryV050Test(unittest.TestCase):
         self.assertIsNone(collector._playwright)
         self.assertIsNone(collector._context)
         self.assertIsNone(collector._page)
+
+
+class PlatformClassificationV052Test(unittest.TestCase):
+    @staticmethod
+    def _config():
+        from pathlib import Path
+        from autodl_watcher.config import PlatformConfig
+
+        return PlatformConfig(
+            page_url="https://private.autodl.com/console/machine",
+            api_path_contains="/api/v2/machine/list",
+            api_base_url="https://private.autodl.com",
+            browser_channel="msedge",
+            user_data_dir=Path("runtime/browser_profile"),
+            headless=True,
+            response_timeout_seconds=20,
+            max_attempts=2,
+            retry_delay_seconds=0.0,
+            aggregation="max",
+        )
+
+    def test_console_timeout_is_transient_not_authentication_failure(self) -> None:
+        collector = PlatformBrowserCollector(self._config())
+        collector.start = Mock()
+        page = Mock()
+        page.url = "https://private.autodl.com/console/machine"
+        cm = MagicMock()
+        cm.__enter__.side_effect = __import__("playwright.sync_api", fromlist=["TimeoutError"]).TimeoutError("slow")
+        page.expect_response.return_value = cm
+        collector._page = page
+
+        with self.assertRaises(PlatformTransientError):
+            collector._collect_machine_list_via_browser()
+
+    def test_login_url_timeout_is_authentication_failure(self) -> None:
+        collector = PlatformBrowserCollector(self._config())
+        collector.start = Mock()
+        page = Mock()
+        page.url = "https://private.autodl.com/login"
+        cm = MagicMock()
+        cm.__enter__.side_effect = __import__("playwright.sync_api", fromlist=["TimeoutError"]).TimeoutError("slow")
+        page.expect_response.return_value = cm
+        collector._page = page
+
+        with self.assertRaises(PlatformAuthenticationError):
+            collector._collect_machine_list_via_browser()
+
+    def test_cached_machine_list_uses_direct_api_without_page_reload(self) -> None:
+        collector = PlatformBrowserCollector(self._config())
+        collector._authorization = "Bearer token"
+        collector._machine_list_payload = {"page_index": 1}
+        expected = [PlatformHost("gpu-203", 1, 2, ("autodl-203-2",))]
+        with patch.object(collector, "_collect_machine_list_direct", return_value=expected) as direct, \
+             patch.object(collector, "_collect_machine_list_via_browser") as browser, \
+             patch.object(collector, "start"):
+            actual = collector.collect()
+
+        self.assertEqual(actual, expected)
+        direct.assert_called_once_with()
+        browser.assert_not_called()
+
+    def test_request_listener_captures_token_and_payload_before_response(self) -> None:
+        collector = PlatformBrowserCollector(self._config())
+        request = Mock()
+        request.url = "https://private.autodl.com/api/v2/machine/list"
+        request.method = "POST"
+        request.all_headers.return_value = {"authorization": "Bearer abc"}
+        request.post_data_json = {"page_index": 1, "page_size": 10}
+
+        collector._capture_platform_request(request)
+
+        self.assertEqual(collector._authorization, "Bearer abc")
+        self.assertEqual(collector._machine_list_payload, {"page_index": 1, "page_size": 10})
