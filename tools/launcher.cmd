@@ -20,8 +20,16 @@ if not defined PYTHON_EXE (
   exit /b 1
 )
 
-set "HTTP_PROXY=http://127.0.0.1:7897"
-set "HTTPS_PROXY=http://127.0.0.1:7897"
-set "NO_PROXY=localhost,127.0.0.1"
+set "HTTP_PROXY="
+set "HTTPS_PROXY="
+set "NO_PROXY=localhost,127.0.0.1,private.autodl.com,.autodl.com"
+
+rem Use Clash only when the local proxy port is actually listening.
+"%PYTHON_EXE%" -c "import socket,sys;s=socket.socket();s.settimeout(0.25);r=s.connect_ex(('127.0.0.1',7897));s.close();sys.exit(0 if r==0 else 1)" >nul 2>&1
+if not errorlevel 1 (
+  set "HTTP_PROXY=http://127.0.0.1:7897"
+  set "HTTPS_PROXY=http://127.0.0.1:7897"
+)
+
 cd /d "%PROJECT_DIR%"
 exit /b 0

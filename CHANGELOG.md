@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.5.4 — 占用串读/误判关机与 AutoDL 代理绕行修复
+
+发布日期：2026-08-09
+
+### 修复：203-2 数据串到 203-1
+
+- `collect_occupancy()` 不再扫描整页 `tr:visible`。
+- 只解析同时包含“占用详情”、目标 `machine_name`、`GPU INDEX` 和“是否被占用”的最小可见弹窗容器。
+- 切换入口前先关闭旧弹窗；采集完成后等待当前弹窗真正隐藏，再采下一个入口。
+- 每个入口的占用结果与 `machine/list` 的 `idle/total` 做一致性校验。
+- 若 203-1 平台显示 `2/2` 空闲，却读到 2 张占用卡，直接判本轮采集失败，不再把 203-2 的数据贴到 203-1。
+
+### 修复：一次空弹窗误判本人已关机
+
+- `ACTIVE -> ABSENT` 不再由单次空快照触发。
+- 默认要求连续 2 次“全部入口采集成功 + 本人均不存在”才确认关机。
+- 第一次疑似下机后 5 秒进入快速复核，不再等待完整 60 秒。
+- 第一次空快照不会让 SQLite 生成 `END_SEEN`，避免历史统计产生伪下机/伪上机。
+- 任一入口采集失败会打断空快照连续计数，保持原本人状态。
+
+### 修复：固定 203-2 无空位时反复刷“没有可用固定实例”
+
+- evaluator 聚合层即使因为 203-1 有空位生成事件，固定入口 203-2 当前无可用实例时也会在主循环层吃掉该事件。
+- 终端改为“固定入口当前无可用实例，继续等待”，不再每 10 秒调用无意义的自动开机尝试。
+
+### 网络改进：AutoDL 控制面绕过 Clash 系统代理
+
+- 用户实测该 PC 关闭 Clash 系统代理后 `private.autodl.com` 明显恢复快速，说明系统代理路径是主要慢点。
+- watcher 的后台 Edge 和人工登录 Edge 默认对 `private.autodl.com` / `*.autodl.com` 使用 DIRECT bypass。
+- `NO_PROXY` 同步加入 AutoDL 域名；BrowserContext 及关联 APIRequestContext 采用同一 bypass 策略。
+- Telemetry 仍可使用 `127.0.0.1:7897`，因此不影响 `watchgpu.vpms-lab.com` 的代理需求。
+- launcher 只在本机 7897 端口实际监听时才注入 `HTTP_PROXY/HTTPS_PROXY`，新电脑没有 Clash 时不会被一个不存在的代理端口拖死。
+
+### 配置新增
+
+- `platform.autodl_direct: true`
+- `platform.proxy_bypass_list`
+- `usage_tracking.absent_confirmations_required: 2`
+- `usage_tracking.absence_recheck_seconds: 5`
+
+### 回归测试
+
+- 70 项单元测试通过。
+- 新增覆盖：跨入口占用串读拒绝、平台 idle/total 与弹窗矛盾拒绝、单次空快照不确认关机、第二次连续空快照才确认、采集失败打断空快照计数、launcher AutoDL NO_PROXY。
+
 ## v0.5.3 — Playwright APIResponse 兼容性修复
 
 - 修复直接调用 `machine/list` API 后持续报错：`'APIResponse' object has no attribute 'request'`。

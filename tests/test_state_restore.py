@@ -70,3 +70,49 @@ class StateRestoreV051Test(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class AbsenceDebounceV054Test(unittest.TestCase):
+    def test_first_empty_snapshot_does_not_confirm_shutdown(self) -> None:
+        from autodl_watcher.main import _advance_absence_confirmation
+
+        streak, confirmed, fast = _advance_absence_confirmation(
+            previous_known=True,
+            previous_active=True,
+            complete_snapshot=True,
+            captured_owned=False,
+            current_streak=0,
+            required=2,
+        )
+        self.assertEqual(streak, 1)
+        self.assertFalse(confirmed)
+        self.assertTrue(fast)
+
+    def test_second_consecutive_empty_snapshot_confirms_shutdown(self) -> None:
+        from autodl_watcher.main import _advance_absence_confirmation
+
+        streak, confirmed, fast = _advance_absence_confirmation(
+            previous_known=True,
+            previous_active=True,
+            complete_snapshot=True,
+            captured_owned=False,
+            current_streak=1,
+            required=2,
+        )
+        self.assertEqual(streak, 2)
+        self.assertTrue(confirmed)
+        self.assertFalse(fast)
+
+    def test_failed_snapshot_breaks_absence_streak(self) -> None:
+        from autodl_watcher.main import _advance_absence_confirmation
+
+        streak, confirmed, fast = _advance_absence_confirmation(
+            previous_known=True,
+            previous_active=True,
+            complete_snapshot=False,
+            captured_owned=False,
+            current_streak=1,
+            required=2,
+        )
+        self.assertEqual(streak, 0)
+        self.assertFalse(confirmed)
+        self.assertFalse(fast)

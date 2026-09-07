@@ -55,9 +55,11 @@ class PlatformConfig:
     user_data_dir: Path           # 浏览器用户数据目录（保存登录会话）
     headless: bool                # 是否无头模式
     response_timeout_seconds: int # 等待 API 响应的超时秒数
-    max_attempts: int              # 主机列表 API 单轮最多尝试次数
-    retry_delay_seconds: float     # 主机列表 API 瞬时失败后的重试等待秒数
+    max_attempts: int             # 主机列表 API 单轮最多尝试次数
+    retry_delay_seconds: float    # 主机列表 API 瞬时失败后的重试等待秒数
     aggregation: str              # 多入口聚合策略：max / min / sum
+    autodl_direct: bool = True    # AutoDL 域名是否强制绕过系统代理直连
+    proxy_bypass_list: str = "private.autodl.com;*.autodl.com;<local>"
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +112,8 @@ class UsageTrackingConfig:
     database_path: Path       # SQLite 数据库路径
     export_dir: Path          # CSV 导出目录
     self_user: str            # 当前账号在“查看占用”页面显示的用户标识
+    absent_confirmations_required: int = 2  # 连续多少次可靠空快照才确认本人已下机
+    absence_recheck_seconds: float = 5.0     # 疑似下机后多久触发快速复核
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +247,13 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
             max_attempts=max(1, int(platform.get("max_attempts", 2))),
             retry_delay_seconds=max(0.0, float(platform.get("retry_delay_seconds", 2.0))),
             aggregation=aggregation,
+            autodl_direct=bool(platform.get("autodl_direct", True)),
+            proxy_bypass_list=str(
+                platform.get(
+                    "proxy_bypass_list",
+                    "private.autodl.com;*.autodl.com;<local>",
+                )
+            ),
         ),
         telemetry=TelemetryConfig(
             endpoint=str(telemetry["endpoint"]),
@@ -280,6 +291,12 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
                 ),
             ),
             self_user=str(usage_tracking.get("self_user", "")).strip(),
+            absent_confirmations_required=max(
+                1, int(usage_tracking.get("absent_confirmations_required", 2))
+            ),
+            absence_recheck_seconds=max(
+                0.0, float(usage_tracking.get("absence_recheck_seconds", 5.0))
+            ),
         ),
         runtime=RuntimeConfig(
             state_file=_resolve_path(base_dir, runtime["state_file"]),

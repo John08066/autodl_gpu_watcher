@@ -42,6 +42,10 @@ platform:
   # v0.5.2：主机列表 API 瞬时超时只重试，不再误判为登录失效。
   max_attempts: 2
   retry_delay_seconds: 2
+  # v0.5.4：AutoDL 控制面优先直连，绕过 Windows/Clash 系统代理。
+  # 这只影响 watcher 自己的登录 Edge/后台 Edge；Telemetry 仍可走 HTTP_PROXY。
+  autodl_direct: true
+  proxy_bypass_list: "private.autodl.com;*.autodl.com;<local>"
   # 同一物理主机可能有多个登录入口；取各入口 idle 的最大值，不相加。
   # gpu.idle/gpu.total 表示平台视角下可分配 GPU ID 数/总 GPU ID 数。
   # 直接 SSH 任务可能未被平台计入，所以最终仍以资源监控页的 GPU INDEX 显存为准。
@@ -95,7 +99,11 @@ usage_tracking:
   enabled: true
   interval_seconds: 60
   # 本人在“查看占用”弹窗中的用户标识；用于识别“已经成功开机”状态。
-  self_user: "何太急"
+  self_user: "姜wen"
+  # v0.5.4：一次空弹窗不再判定本人已关机；必须连续两次可靠空快照。
+  absent_confirmations_required: 2
+  # 第一次疑似下机后下一轮立即复核，而不是再等完整 60 秒。
+  absence_recheck_seconds: 5
   # SQLite 是实时写入的唯一事实源。WPS/Excel 打开 CSV 不会再阻塞监控。
   database_path: "../autodl_watcher_runtime/usage/occupancy.db"
   # python -m autodl_watcher.usage_report 每次导出到独立时间戳目录。

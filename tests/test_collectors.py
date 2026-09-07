@@ -16,11 +16,13 @@ import requests
 from datetime import datetime
 
 from autodl_watcher.collectors.platform import (
+    OccupancySnapshotMismatchError,
     PlatformAuthenticationError,
     PlatformBrowserCollector,
     PlatformTransientError,
     canonical_host,
     parse_platform_payload,
+    validate_occupancy_snapshot,
 )
 from autodl_watcher.collectors.telemetry import (
     TelemetryApiCollector,
@@ -28,7 +30,7 @@ from autodl_watcher.collectors.telemetry import (
     parse_telemetry_payload,
 )
 from autodl_watcher.config import TelemetryConfig
-from autodl_watcher.models import GpuSample, PlatformHost
+from autodl_watcher.models import GpuSample, OccupancyRecord, PlatformHost
 
 
 class CollectorParsingTest(unittest.TestCase):
@@ -457,3 +459,57 @@ class PlatformApiResponseCompatibilityV053Test(unittest.TestCase):
         self.assertEqual(len(hosts), 1)
         self.assertEqual(hosts[0].host, "gpu-203")
         collector._context.request.post.assert_called_once()
+
+
+class OccupancyValidationV054Test(unittest.TestCase):
+    @staticmethod
+    def _record(machine: str, gpu_index: int, occupied: bool, user: str = "") -> OccupancyRecord:
+        return OccupancyRecord(
+            observed_at=datetime(2026, 8, 9, 15, 0, 0),
+            host="gpu-203",
+            machine_name=machine,
+            gpu_index=gpu_index,
+            gpu_uuid=f"gpu-{gpu_index}",
+            gpu_name="Tesla V100",
+            occupied=occupied,
+            instance_id=(f"inst-{gpu_index}" if occupied else ""),
+            user=(user if occupied else ""),
+            started_at_text=("2026-08-09 14:00:00" if occupied else ""),
+        )
+
+    def test_rejects_cross_entry_occupancy_pattern(self) -> None:
+        # 203-1 平台显示 2/2 空闲，却读到了 203-2 的两张占用数据。
+        records = [
+            self._record("autodl-203-1", 0, True, "炼丹师6912"),
+            self._record("autodl-203-1", 1, True, "何太急"),
+        ]
+        with self.assertRaises(OccupancySnapshotMismatchError):
+            validate_occupancy_snapshot(
+                records,
+                machine_name="autodl-203-1",
+                expected_idle=2,
+                expected_total=2,
+            )
+
+    def test_accepts_matching_empty_entry(self) -> None:
+        records = [
+            self._record("autodl-203-1", 0, False),
+            self._record("autodl-203-1", 1, False),
+        ]
+        actual = validate_occupancy_snapshot(
+            records,
+            machine_name="autodl-203-1",
+            expected_idle=2,
+            expected_total=2,
+        )
+        self.assertEqual(actual, records)
+
+    def test_rejects_wrong_row_count(self) -> None:
+        records = [self._record("autodl-203-2", 0, True, "何太急")]
+        with self.assertRaises(OccupancySnapshotMismatchError):
+            validate_occupancy_snapshot(
+                records,
+                machine_name="autodl-203-2",
+                expected_idle=0,
+                expected_total=2,
+            )

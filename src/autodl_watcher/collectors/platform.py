@@ -16,6 +16,7 @@ AutoDL 平台采集器 — 使用 Playwright 控制浏览器与 AutoDL 控制台
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 from collections import defaultdict
@@ -41,6 +42,11 @@ class PlatformAuthenticationError(RuntimeError):
 
 class PlatformTransientError(RuntimeError):
     """平台页面/API 暂时不可用，但没有证据表明登录已经失效。"""
+    pass
+
+
+class OccupancySnapshotMismatchError(RuntimeError):
+    """占用弹窗与目标入口/平台空位互相矛盾，拒绝把该轮数据当成事实。"""
     pass
 
 
@@ -176,6 +182,61 @@ def parse_occupancy_cells(
     )
 
 
+def validate_occupancy_snapshot(
+    records: list[OccupancyRecord],
+    *,
+    machine_name: str,
+    expected_idle: int | None = None,
+    expected_total: int | None = None,
+) -> list[OccupancyRecord]:
+    """校验一次占用弹窗是否真的属于目标入口且与 machine/list 一致。
+
+    v0.5.4 的原则是“宁可判采集失败，也不能把另一个入口的数据贴过来”。
+    machine/list 与占用弹窗在切换瞬间若短暂不一致，也按瞬时采集失败处理，
+    下一轮重试，不允许借此触发本人下机或自动开机。
+    """
+    if not records:
+        raise OccupancySnapshotMismatchError(
+            f"{machine_name} 占用弹窗没有解析到 GPU 行"
+        )
+    if any(item.machine_name != machine_name for item in records):
+        raise OccupancySnapshotMismatchError(
+            f"{machine_name} 占用记录混入了其他入口"
+        )
+
+    indexes = [item.gpu_index for item in records]
+    if len(indexes) != len(set(indexes)):
+        raise OccupancySnapshotMismatchError(
+            f"{machine_name} 占用弹窗出现重复 GPU INDEX：{indexes}"
+        )
+
+    if expected_total is not None:
+        if expected_total <= 0:
+            raise OccupancySnapshotMismatchError(
+                f"{machine_name} 平台 total={expected_total} 无效"
+            )
+        if len(records) != expected_total:
+            raise OccupancySnapshotMismatchError(
+                f"{machine_name} 占用行数={len(records)}，但平台 total={expected_total}"
+            )
+
+    if expected_idle is not None and expected_total is not None:
+        if not 0 <= expected_idle <= expected_total:
+            raise OccupancySnapshotMismatchError(
+                f"{machine_name} 平台 idle/total={expected_idle}/{expected_total} 无效"
+            )
+        actual_occupied = sum(1 for item in records if item.occupied)
+        expected_occupied = expected_total - expected_idle
+        if actual_occupied != expected_occupied:
+            raise OccupancySnapshotMismatchError(
+                f"{machine_name} 占用弹窗显示 {actual_occupied} 张被占用，"
+                f"但平台 idle/total={expected_idle}/{expected_total}，"
+                f"应为 {expected_occupied} 张；本轮拒绝采用"
+            )
+
+    return records
+
+
 class PlatformBrowserCollector:
     """AutoDL 平台数据采集器 — 通过 Playwright 控制浏览器与 AutoDL 交互。
 
@@ -234,12 +295,36 @@ class PlatformBrowserCollector:
         context = None
         try:
             playwright = sync_playwright().start()
-            context = playwright.chromium.launch_persistent_context(
-                user_data_dir=str(self.config.user_data_dir),
-                channel=self.config.browser_channel,
-                headless=self.config.headless,
-                chromium_sandbox=True,
-            )
+            launch_kwargs: dict[str, Any] = {
+                "user_data_dir": str(self.config.user_data_dir),
+                "channel": self.config.browser_channel,
+                "headless": self.config.headless,
+                "chromium_sandbox": True,
+            }
+            if self.config.autodl_direct and self.config.proxy_bypass_list.strip():
+                # v0.5.4：AutoDL 控制面在该 PC 上经 Clash 系统代理明显变慢。
+                # 监控专用 Edge 对 AutoDL 域名直连；其余流量仍可走本机 Clash。
+                bypass_arg = self.config.proxy_bypass_list.strip()
+                launch_kwargs["args"] = [f"--proxy-bypass-list={bypass_arg}"]
+
+                proxy_server = (
+                    os.environ.get("HTTPS_PROXY")
+                    or os.environ.get("HTTP_PROXY")
+                    or ""
+                ).strip()
+                if proxy_server:
+                    # Playwright proxy.bypass 使用逗号分隔。给 BrowserContext 与
+                    # 其关联 APIRequestContext 同一代理策略，避免浏览器直连、API 又绕韩国节点。
+                    bypass = ",".join(
+                        item
+                        for item in bypass_arg.replace("<local>", "localhost;127.0.0.1").split(";")
+                        if item
+                    )
+                    launch_kwargs["proxy"] = {
+                        "server": proxy_server,
+                        "bypass": bypass,
+                    }
+            context = playwright.chromium.launch_persistent_context(**launch_kwargs)
             self._playwright = playwright
             self._context = context
             self._page = context.pages[0] if context.pages else context.new_page()
@@ -528,39 +613,95 @@ class PlatformBrowserCollector:
 
         raise RuntimeError(f"{machine_name} 附近找不到‘查看占用’按钮；页面结构可能变化")
 
-    def collect_occupancy(self, machine_name: str) -> list[OccupancyRecord]:
-        """功能：
-            Read the visible ``查看占用`` modal for one AutoDL machine entry.。
+    def _find_visible_occupancy_modal(self, machine_name: str):
+        """找到标题和主机名都匹配的最小可见占用弹窗容器。"""
+        assert self._page is not None
+        deadline = time.monotonic() + self.config.response_timeout_seconds
+        while time.monotonic() < deadline:
+            titles = self._page.get_by_text("占用详情", exact=False)
+            for idx in range(titles.count()):
+                title = titles.nth(idx)
+                try:
+                    if not title.is_visible():
+                        continue
+                except Exception:
+                    continue
+                node = title
+                for _depth in range(10):
+                    try:
+                        text = node.inner_text(timeout=500)
+                    except Exception:
+                        text = ""
+                    if (
+                        "占用详情" in text
+                        and machine_name in text
+                        and "GPU INDEX" in text
+                        and "是否被占用" in text
+                    ):
+                        return node
+                    node = node.locator("xpath=..")
+            self._page.wait_for_timeout(100)
+        raise RuntimeError(
+            f"已点击 {machine_name} 查看占用，但没有出现与该入口匹配的占用详情弹窗"
+        )
 
-        参数：
-            machine_name (str)：AutoDL 平台入口名，例如 `autodl-203-2`；可为 `None` 表示自动选择。
+    def _close_occupancy_modal(self, modal) -> None:
+        """关闭当前占用弹窗，并等待 DOM 真正隐藏，避免下一入口读到旧弹窗。"""
+        assert self._page is not None
+        try:
+            close_button = modal.get_by_text("关闭", exact=True)
+            if close_button.count() > 0:
+                close_button.last.click(timeout=2000)
+            else:
+                self._page.keyboard.press("Escape")
+        except Exception:
+            try:
+                self._page.keyboard.press("Escape")
+            except Exception:
+                return
+        try:
+            modal.wait_for(state="hidden", timeout=3000)
+        except Exception:
+            # 后续入口仍会做标题+machine_name 双重校验，因此这里不强行报错。
+            pass
 
-        返回：
-            list[OccupancyRecord]：指定入口当前所有 GPU INDEX 的占用记录。
+    def collect_occupancy(
+        self,
+        machine_name: str,
+        *,
+        expected_idle: int | None = None,
+        expected_total: int | None = None,
+    ) -> list[OccupancyRecord]:
+        """读取一个入口的“占用详情”，并做入口身份及空位一致性校验。
 
-        补充说明：
-            This intentionally uses the page DOM because the occupancy API has not
-            yet been identified.  The method is isolated from the critical auto-
-            start loop and is used by ``usage_monitor`` in a separate process.
+        v0.5.4 不再扫描整个页面的 ``tr:visible``。只有标题容器中明确包含
+        当前 machine_name 的弹窗才会被解析；若 machine/list 的 idle/total 与
+        弹窗占用数矛盾，本轮直接标记采集失败，绝不拿另一个入口的数据补齐。
         """
         self.collect()
         assert self._page is not None
 
+        # 先尽力关掉上轮异常残留的弹窗。即使未关干净，后续 machine_name 校验
+        # 也会阻止读取旧入口。
+        try:
+            self._page.keyboard.press("Escape")
+            self._page.wait_for_timeout(150)
+        except Exception:
+            pass
+
         action = self._find_occupancy_action(machine_name)
         action.click()
+        modal = None
         try:
-            self._page.get_by_text("占用详情", exact=False).last.wait_for(
-                state="visible",
-                timeout=self.config.response_timeout_seconds * 1000,
-            )
-            self._page.wait_for_timeout(300)
+            modal = self._find_visible_occupancy_modal(machine_name)
+            self._page.wait_for_timeout(200)
 
             observed_at = datetime.now()
             host = canonical_host(machine_name)
             result: list[OccupancyRecord] = []
-            rows = self._page.locator("tr:visible")
+            rows = modal.locator("tr")
             for index in range(rows.count()):
-                cells = rows.nth(index).locator("td:visible").all_inner_texts()
+                cells = rows.nth(index).locator("td").all_inner_texts()
                 record = parse_occupancy_cells(
                     cells,
                     observed_at=observed_at,
@@ -569,23 +710,27 @@ class PlatformBrowserCollector:
                 )
                 if record is not None:
                     result.append(record)
-            if not result:
-                raise RuntimeError(
-                    f"已打开 {machine_name} 占用详情，但没有解析到 GPU 行；页面结构可能变化。"
-                )
-            return sorted(result, key=lambda item: item.gpu_index)
+
+            result = sorted(result, key=lambda item: item.gpu_index)
+            return validate_occupancy_snapshot(
+                result,
+                machine_name=machine_name,
+                expected_idle=expected_idle,
+                expected_total=expected_total,
+            )
         finally:
-            close_button = self._page.get_by_text("关闭", exact=True)
-            if close_button.count() > 0:
+            if modal is not None:
+                self._close_occupancy_modal(modal)
+            else:
                 try:
-                    close_button.last.click(timeout=2000)
+                    self._page.keyboard.press("Escape")
                 except Exception:
                     pass
 
     def collect(self) -> list[PlatformHost]:
         """采集平台主机列表。
 
-        v0.5.3 状态机：
+        v0.5.4 状态机：
             1. 已捕获 token/请求体时优先直接 API，请求稳定且不刷新整个网页。
             2. 首次启动或 token 失效时才刷新控制台页面重新捕获请求上下文。
             3. 页面/API 超时属于 TRANSIENT，不触发登录。
