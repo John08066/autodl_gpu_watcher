@@ -5,7 +5,7 @@ if errorlevel 1 pause & exit /b 1
 :menu
 cls
 echo ========================================
-echo AutoDL GPU Watcher v0.5.2
+echo AutoDL GPU Watcher v0.5.3
 echo Python: %PYTHON_EXE%
 echo ========================================
 echo 1. Login / refresh session

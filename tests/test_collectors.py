@@ -366,3 +366,94 @@ class PlatformClassificationV052Test(unittest.TestCase):
 
         self.assertEqual(collector._authorization, "Bearer abc")
         self.assertEqual(collector._machine_list_payload, {"page_index": 1, "page_size": 10})
+
+
+class PlatformApiResponseCompatibilityV053Test(unittest.TestCase):
+    """v0.5.3: direct Playwright APIResponse does not expose response.request."""
+
+    @staticmethod
+    def _config():
+        from pathlib import Path
+        from autodl_watcher.config import PlatformConfig
+
+        return PlatformConfig(
+            page_url="https://private.autodl.com/console/machine",
+            api_path_contains="/api/v2/machine/list",
+            api_base_url="https://private.autodl.com",
+            browser_channel="msedge",
+            user_data_dir=Path("runtime/browser_profile"),
+            headless=True,
+            response_timeout_seconds=20,
+            max_attempts=2,
+            retry_delay_seconds=0.0,
+            aggregation="max",
+        )
+
+    def test_parse_direct_api_response_without_request_attribute(self) -> None:
+        collector = PlatformBrowserCollector(self._config())
+        collector._authorization = "Bearer cached-token"
+        collector._machine_list_payload = {"page_index": 1, "page_size": 10}
+
+        class FakeApiResponse:
+            status = 200
+            ok = True
+
+            @staticmethod
+            def json():
+                return {
+                    "code": "Success",
+                    "data": {
+                        "list": [
+                            {
+                                "machine_name": "autodl-203-2",
+                                "gpu": {"idle": 1, "total": 2},
+                            }
+                        ]
+                    },
+                    "msg": "",
+                }
+
+        response = FakeApiResponse()
+        self.assertFalse(hasattr(response, "request"))
+
+        hosts = collector._parse_machine_list_response(response)
+
+        self.assertEqual(len(hosts), 1)
+        self.assertEqual(hosts[0].host, "gpu-203")
+        self.assertEqual(hosts[0].free_count, 1)
+        self.assertEqual(hosts[0].total_count, 2)
+        self.assertEqual(collector._authorization, "Bearer cached-token")
+        self.assertEqual(collector._machine_list_payload, {"page_index": 1, "page_size": 10})
+
+    def test_direct_api_collect_with_apiresponse_without_request_attribute(self) -> None:
+        collector = PlatformBrowserCollector(self._config())
+        collector.start = Mock()
+        collector._authorization = "Bearer cached-token"
+        collector._machine_list_payload = {"page_index": 1, "page_size": 10}
+        collector._context = Mock()
+
+        class FakeApiResponse:
+            status = 200
+            ok = True
+
+            @staticmethod
+            def json():
+                return {
+                    "code": "Success",
+                    "data": {
+                        "list": [
+                            {
+                                "machine_name": "autodl-203-2",
+                                "gpu": {"idle": 1, "total": 2},
+                            }
+                        ]
+                    },
+                    "msg": "",
+                }
+
+        collector._context.request.post.return_value = FakeApiResponse()
+        hosts = collector._collect_machine_list_direct()
+
+        self.assertEqual(len(hosts), 1)
+        self.assertEqual(hosts[0].host, "gpu-203")
+        collector._context.request.post.assert_called_once()

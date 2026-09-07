@@ -1,3 +1,13 @@
+# Changelog
+
+## v0.5.3 — Playwright APIResponse 兼容性修复
+
+- 修复直接调用 `machine/list` API 后持续报错：`'APIResponse' object has no attribute 'request'`。
+- 根因：浏览器页面的 `Response` 有 `.request`，但 `context.request.post()` 返回的 `APIResponse` 没有该属性；v0.5.2 把两种响应对象当成了同一种。
+- 现在解析器仅在响应对象确实带有 `.request` 时才读取请求元数据；直接 API 路径继续复用内存中的 Authorization 与请求体。
+- 保留 v0.5.2 的认证状态机：只有 `/login` 或 HTTP 401/403 才判定登录失效，普通页面/API 超时仍按瞬时采集故障处理。
+- 新增回归测试，模拟没有 `.request` 属性的 Playwright `APIResponse`，确保直接 API 快路径可以连续运行。
+
 # Version History / 版本迭代记录
 
 ## v0.5.2 — 平台接口慢响应与登录误判修复

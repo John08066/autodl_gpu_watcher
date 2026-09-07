@@ -339,19 +339,29 @@ class PlatformBrowserCollector:
         if response.status != 200:
             raise RuntimeError(f"AutoDL machine/list returned HTTP {response.status}")
 
-        try:
-            headers = response.request.all_headers()
-        except Exception:
-            headers = response.request.headers
-        authorization = headers.get("authorization") or headers.get("Authorization")
-        if authorization:
-            self._authorization = authorization
-        try:
-            request_payload = response.request.post_data_json
-        except Exception:
-            request_payload = None
-        if isinstance(request_payload, dict):
-            self._machine_list_payload = request_payload
+        # Browser ``Response`` exposes ``response.request``; Playwright's
+        # ``APIResponse`` (returned by ``context.request.post``) does not.
+        # The direct-API path already has Authorization and request payload in
+        # memory, so request metadata is optional here.  Never assume the
+        # response object owns a ``request`` attribute.
+        request = getattr(response, "request", None)
+        if request is not None:
+            try:
+                headers = request.all_headers()
+            except Exception:
+                try:
+                    headers = request.headers
+                except Exception:
+                    headers = {}
+            authorization = headers.get("authorization") or headers.get("Authorization")
+            if authorization:
+                self._authorization = authorization
+            try:
+                request_payload = request.post_data_json
+            except Exception:
+                request_payload = None
+            if isinstance(request_payload, dict):
+                self._machine_list_payload = request_payload
 
         payload = response.json()
         if not isinstance(payload, dict):
@@ -575,7 +585,7 @@ class PlatformBrowserCollector:
     def collect(self) -> list[PlatformHost]:
         """采集平台主机列表。
 
-        v0.5.2 状态机：
+        v0.5.3 状态机：
             1. 已捕获 token/请求体时优先直接 API，请求稳定且不刷新整个网页。
             2. 首次启动或 token 失效时才刷新控制台页面重新捕获请求上下文。
             3. 页面/API 超时属于 TRANSIENT，不触发登录。
