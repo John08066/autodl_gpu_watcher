@@ -13,7 +13,12 @@
 
 两层数据在 main.py 中通过 filter_samples_to_platform_candidates 交叉验证。
 """
-from .platform import PlatformAuthenticationError, PlatformBrowserCollector, parse_platform_payload
+from .platform import (
+    PlatformAuthenticationError,
+    PlatformBrowserCollector,
+    PlatformTransientError,
+    parse_platform_payload,
+)
 from .telemetry import (
     TelemetryApiCollector,
     filter_samples_to_authorized_hosts,
@@ -24,6 +29,7 @@ from .telemetry import (
 __all__ = [
     "PlatformAuthenticationError",
     "PlatformBrowserCollector",
+    "PlatformTransientError",
     "TelemetryApiCollector",
     "filter_samples_to_authorized_hosts",
     "filter_samples_to_platform_candidates",

@@ -39,6 +39,9 @@ platform:
   user_data_dir: "../autodl_watcher_runtime/browser_profile"
   headless: true
   response_timeout_seconds: 20
+  # v0.5.2：主机列表 API 瞬时超时只重试，不再误判为登录失效。
+  max_attempts: 2
+  retry_delay_seconds: 2
   # 同一物理主机可能有多个登录入口；取各入口 idle 的最大值，不相加。
   # gpu.idle/gpu.total 表示平台视角下可分配 GPU ID 数/总 GPU ID 数。
   # 直接 SSH 任务可能未被平台计入，所以最终仍以资源监控页的 GPU INDEX 显存为准。

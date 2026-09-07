@@ -24,4 +24,4 @@ AutoDL GPU Watcher — 私有云 GPU 资源监控与自动开机工具。
         └─ autostart_demo.py    手动验证 power_on 开机链路的独立脚本
 """
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"

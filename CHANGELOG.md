@@ -1,5 +1,52 @@
 # Version History / 版本迭代记录
 
+## v0.5.2 — 平台接口慢响应与登录误判修复
+
+发布日期：2026-08-09
+
+### 修复：已登录却反复弹登录窗口
+
+- 删除“20 秒没捕获到 machine/list 响应 = 登录失效”的错误判定。
+- 只有以下明确证据才触发人工登录恢复：
+  - 当前页面进入 `/login`；
+  - machine/list / AutoDL API 返回 HTTP 401 或 403。
+- 页面仍停留在 `/console/machine` 时，API 超时、429、5xx 全部视为瞬时采集故障。
+- 瞬时故障只跳过本轮自动开机，保持登录状态并继续下一轮，不再重复弹 Edge。
+
+### 改进：主机列表不再每 10 秒整页刷新
+
+- Playwright 首次捕获 machine/list 请求时，立即在内存保存 Authorization 与请求体。
+- 后续轮询优先通过 BrowserContext APIRequestContext 直接 POST machine/list。
+- 减少 AutoDL 前端页面频繁 reload、长时间转圈和前端资源重复加载。
+- direct API 支持瞬时失败重试，配置项：
+  - `platform.max_attempts`；
+  - `platform.retry_delay_seconds`。
+
+### 修复：人工登录后的假“恢复成功”
+
+- 人工登录并同步 profile 后只提示“登录资料已更新，等待验证”。
+- 必须等下一轮真实 machine/list 成功后，才打印“登录验证成功，平台主机接口已恢复”。
+
+### 修复：未捕获 Authorization 不再误判登录失效
+
+- 没捕获到 Authorization 但没有 `/login` / 401 / 403 时，改为瞬时平台故障。
+- 避免已登录页面因为网络抖动再次被送去验证码。
+
+### 保留 v0.5.1 状态机修复
+
+- SQLite 历史记录不参与本人实时开机状态。
+- ACTIVE -> ABSENT 后重新武装。
+- power_on Success 仅表示请求受理，等待占用详情确认。
+- 人工登录与 Playwright profile 隔离。
+- watcher Edge/profile 锁自动清理。
+
+### 回归测试
+
+- 61 项单元测试通过。
+- 新增覆盖：控制台超时不判认证失败、登录页超时才判认证失败、请求监听提前捕获 token/请求体、缓存请求上下文后不再整页 reload。
+
+---
+
 ## v0.5.1 — 目录整理、状态机收口与登录/清理修复
 
 发布日期：2026-08-09

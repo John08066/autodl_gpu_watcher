@@ -17,6 +17,7 @@ AutoDL 平台采集器 — 使用 Playwright 控制浏览器与 AutoDL 控制台
 from __future__ import annotations
 
 import re
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -34,7 +35,12 @@ _MACHINE_PATTERN = re.compile(r"^autodl-(\d+)-\d+$", re.IGNORECASE)
 
 
 class PlatformAuthenticationError(RuntimeError):
-    """登录会话已失效，需要重新执行 python -m autodl_watcher.login。"""
+    """已得到明确认证失败证据：登录页、HTTP 401/403 等。"""
+    pass
+
+
+class PlatformTransientError(RuntimeError):
+    """平台页面/API 暂时不可用，但没有证据表明登录已经失效。"""
     pass
 
 
@@ -198,6 +204,7 @@ class PlatformBrowserCollector:
         self._context: BrowserContext | None = None   # 持久化浏览器上下文
         self._page: Page | None = None                # 当前页面
         self._authorization: str | None = None        # 内存中的 API 令牌
+        self._machine_list_payload: dict[str, Any] | None = None
 
     def start(self) -> None:
         """功能：
@@ -236,6 +243,10 @@ class PlatformBrowserCollector:
             self._playwright = playwright
             self._context = context
             self._page = context.pages[0] if context.pages else context.new_page()
+            # v0.5.2：请求一发出就捕获 Authorization 与 machine/list 请求体。
+            # 即使页面响应很慢、expect_response 超时，后续也能直接走 API 重试，
+            # 不必每 10 秒整页 reload，更不会仅凭超时就误判“登录失效”。
+            context.on("request", self._capture_platform_request)
         except Exception:
             if context is not None:
                 try:
@@ -251,6 +262,7 @@ class PlatformBrowserCollector:
             self._context = None
             self._playwright = None
             self._authorization = None
+            self._machine_list_payload = None
             raise
 
     def close(self) -> None:
@@ -269,6 +281,7 @@ class PlatformBrowserCollector:
         self._context = None
         self._playwright = None
         self._authorization = None
+        self._machine_list_payload = None
         if context is not None:
             try:
                 context.close()
@@ -279,6 +292,154 @@ class PlatformBrowserCollector:
                 playwright.stop()
             except Exception:
                 pass
+
+    @staticmethod
+    def _url_is_login(url: str) -> bool:
+        """只根据明确 URL 证据判断是否已进入登录页。"""
+        value = (url or "").lower()
+        return "/login" in value and "autodl.com" in value
+
+    def _capture_platform_request(self, request: Any) -> None:
+        """捕获 machine/list 请求的 Authorization 和请求体，仅保存在内存。"""
+        try:
+            if (
+                self.config.api_path_contains not in request.url
+                or request.method.upper() != "POST"
+            ):
+                return
+            try:
+                headers = request.all_headers()
+            except Exception:
+                headers = request.headers
+            authorization = headers.get("authorization") or headers.get("Authorization")
+            if authorization:
+                self._authorization = authorization
+
+            payload = None
+            try:
+                payload = request.post_data_json
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                self._machine_list_payload = payload
+        except Exception:
+            # 监听器绝不能反向破坏浏览器主流程。
+            return
+
+    def _parse_machine_list_response(self, response: Any) -> list[PlatformHost]:
+        """统一解析 machine/list 响应并区分认证失败与普通 HTTP 故障。"""
+        if response.status in {401, 403}:
+            raise PlatformAuthenticationError(
+                f"AutoDL machine/list 返回 HTTP {response.status}；会话认证已失效。"
+            )
+        if response.status == 429 or response.status >= 500:
+            raise PlatformTransientError(
+                f"AutoDL machine/list 暂时不可用：HTTP {response.status}"
+            )
+        if response.status != 200:
+            raise RuntimeError(f"AutoDL machine/list returned HTTP {response.status}")
+
+        try:
+            headers = response.request.all_headers()
+        except Exception:
+            headers = response.request.headers
+        authorization = headers.get("authorization") or headers.get("Authorization")
+        if authorization:
+            self._authorization = authorization
+        try:
+            request_payload = response.request.post_data_json
+        except Exception:
+            request_payload = None
+        if isinstance(request_payload, dict):
+            self._machine_list_payload = request_payload
+
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("AutoDL machine/list returned non-object JSON")
+        if payload.get("code") != "Success":
+            raise RuntimeError(f"AutoDL machine/list failed: {payload.get('msg', payload)}")
+        return parse_platform_payload(payload, aggregation=self.config.aggregation)
+
+    def _collect_machine_list_direct(self) -> list[PlatformHost]:
+        """使用已捕获 token/请求体直接调用 machine/list，避免每轮整页刷新。"""
+        self.start()
+        assert self._context is not None
+        if not self._authorization or self._machine_list_payload is None:
+            raise PlatformTransientError("尚未捕获到可复用的 machine/list 请求上下文")
+
+        url = f"{self.config.api_base_url.rstrip('/')}/{self.config.api_path_contains.lstrip('/')}"
+        last_error: Exception | None = None
+        for attempt in range(1, self.config.max_attempts + 1):
+            try:
+                response = self._context.request.post(
+                    url,
+                    data=self._machine_list_payload,
+                    headers={
+                        "Accept": "application/json, text/plain, */*",
+                        "Authorization": self._authorization,
+                        "Origin": self.config.api_base_url.rstrip('/'),
+                        "Referer": self.config.page_url,
+                    },
+                    timeout=self.config.response_timeout_seconds * 1000,
+                )
+                return self._parse_machine_list_response(response)
+            except PlatformAuthenticationError:
+                raise
+            except (PlatformTransientError, PlaywrightTimeoutError) as exc:
+                last_error = exc
+                if attempt < self.config.max_attempts:
+                    time.sleep(self.config.retry_delay_seconds)
+                    continue
+                break
+        raise PlatformTransientError(
+            "AutoDL 主机列表 API 本轮超时/暂时不可用；已登录状态不会因此被判定为失效。"
+        ) from last_error
+
+    def _collect_machine_list_via_browser(self) -> list[PlatformHost]:
+        """通过页面触发 machine/list；只有明确登录页/401/403 才判定认证失效。"""
+        self.start()
+        assert self._page is not None
+
+        def is_target(response: Any) -> bool:
+            return (
+                self.config.api_path_contains in response.url
+                and response.request.method.upper() == "POST"
+            )
+
+        try:
+            with self._page.expect_response(
+                is_target,
+                timeout=self.config.response_timeout_seconds * 1000,
+            ) as response_info:
+                if self._page.url == "about:blank":
+                    self._page.goto(self.config.page_url, wait_until="domcontentloaded")
+                else:
+                    self._page.reload(wait_until="domcontentloaded")
+            return self._parse_machine_list_response(response_info.value)
+        except PlaywrightTimeoutError as exc:
+            current_url = self._page.url
+            if self._url_is_login(current_url):
+                raise PlatformAuthenticationError(
+                    f"AutoDL 已跳转到登录页：{current_url}"
+                ) from exc
+
+            # request 监听器可能已经拿到 token/请求体，只是网页响应过慢。
+            # 此时直接 API 重试一次链路，而不是误弹登录窗口。
+            if self._authorization and self._machine_list_payload is not None:
+                try:
+                    return self._collect_machine_list_direct()
+                except PlatformAuthenticationError:
+                    raise
+                except PlatformTransientError as direct_exc:
+                    raise PlatformTransientError(
+                        f"AutoDL 控制台仍在 {current_url}，但主机列表接口本轮超时；"
+                        "这是数据采集故障，不是登录失效。"
+                    ) from direct_exc
+
+            raise PlatformTransientError(
+                f"AutoDL 控制台仍在 {current_url}，但本轮未捕获到主机列表响应；"
+                "没有登录失效证据，本轮仅跳过开机。"
+            ) from exc
 
     def post_api_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         """功能：
@@ -302,8 +463,9 @@ class PlatformBrowserCollector:
             # Refreshing the machine list also refreshes/captures the current token.
             self.collect()
         if self._authorization is None:
-            raise PlatformAuthenticationError(
-                "没有从 AutoDL 页面捕获到 Authorization；请重新执行登录初始化。"
+            raise PlatformTransientError(
+                "当前页面未捕获到 Authorization；没有 401/403 或 /login 证据，"
+                "本轮不按登录失效处理。"
             )
 
         url = f"{self.config.api_base_url.rstrip('/')}/{path.lstrip('/')}"
@@ -411,63 +573,27 @@ class PlatformBrowserCollector:
                     pass
 
     def collect(self) -> list[PlatformHost]:
-        """功能：
-            拦截 AutoDL 主机列表接口响应，并解析当前账号可见的主机与平台 GPU ID 空位。
+        """采集平台主机列表。
 
-        参数：
-            无。
-
-        返回：
-            list[PlatformHost]：本轮采集得到的平台主机列表或物理 GPU 样本列表。
+        v0.5.2 状态机：
+            1. 已捕获 token/请求体时优先直接 API，请求稳定且不刷新整个网页。
+            2. 首次启动或 token 失效时才刷新控制台页面重新捕获请求上下文。
+            3. 页面/API 超时属于 TRANSIENT，不触发登录。
+            4. 只有明确进入 /login 或收到 401/403 才抛 PlatformAuthenticationError。
         """
         self.start()
-        assert self._page is not None
 
-        def is_target(response: Any) -> bool:
-            """功能：
-                判断 Playwright 捕获的响应是否为目标主机列表接口。
+        if self._authorization and self._machine_list_payload is not None:
+            try:
+                return self._collect_machine_list_direct()
+            except PlatformAuthenticationError:
+                # token 可能刚过期；先通过浏览器刷新一次，Cookie 仍有效时可自动拿到新 token。
+                self._authorization = None
+                self._machine_list_payload = None
+                return self._collect_machine_list_via_browser()
+            except PlatformTransientError:
+                # 纯网络/API 抖动不整页刷新，避免给 AutoDL 页面和本机 Edge 增加额外压力。
+                raise
 
-            参数：
-                response (Any)：Playwright 捕获的网络响应对象。
+        return self._collect_machine_list_via_browser()
 
-            返回：
-                bool：响应是否匹配目标 API。
-            """
-            return (
-                self.config.api_path_contains in response.url
-                and response.request.method.upper() == "POST"
-            )
-
-        try:
-            with self._page.expect_response(
-                is_target,
-                timeout=self.config.response_timeout_seconds * 1000,
-            ) as response_info:
-                if self._page.url == "about:blank":
-                    self._page.goto(self.config.page_url, wait_until="domcontentloaded")
-                else:
-                    self._page.reload(wait_until="domcontentloaded")
-            response = response_info.value
-        except PlaywrightTimeoutError as exc:
-            current_url = self._page.url
-            raise PlatformAuthenticationError(
-                "没有捕获到 AutoDL 主机列表接口。登录可能已失效；"
-                "请执行 python -m autodl_watcher.login 后重试。"
-                f" 当前页面：{current_url}"
-            ) from exc
-
-        if response.status != 200:
-            raise RuntimeError(f"AutoDL machine/list returned HTTP {response.status}")
-
-        try:
-            headers = response.request.all_headers()
-        except Exception:
-            headers = response.request.headers
-        authorization = headers.get("authorization") or headers.get("Authorization")
-        if authorization:
-            self._authorization = authorization
-
-        payload = response.json()
-        if payload.get("code") != "Success":
-            raise RuntimeError(f"AutoDL machine/list failed: {payload.get('msg', payload)}")
-        return parse_platform_payload(payload, aggregation=self.config.aggregation)
