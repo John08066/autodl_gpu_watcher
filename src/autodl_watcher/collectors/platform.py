@@ -25,6 +25,7 @@ from typing import Any
 from playwright.sync_api import BrowserContext, Page, Playwright, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 from ..config import PlatformConfig
+from ..login import prepare_profile_for_exclusive_use
 from ..models import OccupancyRecord, PlatformHost
 
 
@@ -215,7 +216,11 @@ class PlatformBrowserCollector:
             return
         self.config.user_data_dir.mkdir(parents=True, exist_ok=True)
 
-        # v0.5.0：首次启动失败时必须把 sync_playwright() 完整释放。
+        # v0.5.1：启动后台监控 Edge 前先清理上次异常退出遗留的 Edge/锁文件。
+        # 这样登录结束后不需要手工执行菜单 7 才能重新启动监控。
+        prepare_profile_for_exclusive_use(self.config.user_data_dir)
+
+        # 首次启动失败时必须把 sync_playwright() 完整释放。
         # 旧版若 browser_profile 被 Edge 锁住，launch 失败后 _playwright 会残留，
         # 下一轮便持续报“Sync API inside the asyncio loop”。
         playwright = None

@@ -1,104 +1,166 @@
-# AutoDL GPU Watcher v0.5.0
+# AutoDL GPU Watcher v0.5.1
 
 用于实验室 AutoDL 私有云 GPU 资源监控、占用统计和满足条件后的自动开机。
 
-## 日常使用
+## 目录结构
 
-Windows 下建议直接双击项目根目录的：
+根目录只保留日常会直接接触的文件；辅助启动脚本统一放进 `tools/`：
+
+```text
+autodl_gpu_watcher_v0.5.1/
+├─ src/                  Python 主代码
+├─ tests/                单元测试
+├─ tools/                一键菜单使用的辅助脚本
+├─ START_HERE.cmd        日常唯一入口
+├─ README.md             使用说明
+├─ CHANGELOG.md          版本迭代记录
+├─ config.yaml           配置文件
+├─ pyproject.toml        Python 项目配置
+├─ run_watcher.py        Python 直接启动入口
+├─ .env.example
+└─ .gitignore
+```
+
+正常使用时只需要双击：
 
 ```text
 START_HERE.cmd
 ```
 
-菜单：
+## 一键菜单
 
 ```text
-1  Login / refresh session
-2  Start monitor - auto-select entry
-3  Start monitor - 203-2 only
-4  Dry run - no automatic power-on
-5  View live log
-6  Export usage report
-7  Clean watcher Edge processes
-8  Install / update this version
-0  Exit
+1. Login / refresh session
+2. Start monitor - auto-select entry
+3. Start monitor - 203-2 only
+4. Dry run - no automatic power-on
+5. View live log
+6. Export usage report
+7. Clean watcher Edge processes
+8. Install / update this version
+0. Exit
 ```
 
-第一次解压新版本，先按 `8` 安装当前版本，再按 `1` 登录；以后通常直接按 `2` 或 `3`。
-
-## v0.5.0 关键修复
-
-### 1. 不再把 SQLite 历史记录误判为“本人正在占用”
-
-`current_instances` 只代表上一次成功看到的状态，不再作为实时真值。
-
-- 启动时不会因为数据库里残留 `何太急` 就直接显示绿色“已开机”；
-- 只有当前进程的实时“查看占用”结果明确看见本人实例，才进入绿色状态；
-- 旧的 evaluator `alerted=True` 只在 5 分钟内允许恢复，避免放假/关机数小时后旧状态锁死；
-- 近期 SQLite 占用仅作为 3 分钟启动保护提示，保护期过后会重新武装，不会永久阻止自动开机；
-- `power_on` 返回 Success 只表示请求受理，不再立即伪装成“本人已开机”。
-
-### 2. 部分占用采集失败不再制造伪下机事件
-
-任一入口采集失败时：
-
-- 仍保存已经成功采到的快照；
-- 不更新 `current_instances`；
-- 不生成伪 `END_SEEN`；
-- 只有所有目标入口都成功，才允许确认“本人已经不再占用”并重新武装。
-
-### 3. PC 登录验证码环境重做
-
-人工登录改为两个 profile：
+第一次解压新版本：
 
 ```text
-runtime/login_profile     普通 Edge 人工登录专用，永不交给 Playwright
-runtime/browser_profile   后台监控专用，Playwright 使用
+8  安装/更新当前版本
+1  重新登录一次
+3  固定监控 203-2
 ```
 
-流程：
+以后通常直接按 `2` 或 `3`。
+
+## v0.5.1 关键修复
+
+### 1. 彻底取消 SQLite 对“本人已开机”的参与
+
+`occupancy.db/current_instances` 现在只用于历史统计，不再用于当前开机状态判断。
+
+程序每次启动时本人状态固定从：
 
 ```text
-普通 Edge + login_profile 完成人工登录/验证码
-→ 关闭 Edge 并按 Enter
-→ 自动清理残留 Edge
-→ 将干净登录 profile 同步到 browser_profile
-→ 监控启动
+UNKNOWN
 ```
 
-这样人工验证码窗口不会复用后台 Playwright 的 `--no-sandbox`、`--headless`、`--remote-debugging-pipe` 环境。
-
-> 验证码仍由用户本人完成。本工具不会自动破解或绕过验证码。平台自身的 IP/账号风控仍可能要求重新验证，因此不能承诺验证码 100% 永远通过。
-
-### 4. 会话过期后自动进入登录恢复流程
-
-监控中检测到 AutoDL 跳到 `/login` 后：
+开始。只有本进程实时“查看占用”明确看到 `何太急`，才会显示绿色：
 
 ```text
-关闭后台 Playwright
-→ 自动弹普通 Edge
-→ 提示音提醒
-→ 用户完成验证码并关闭 Edge
-→ 回终端按 Enter
-→ 自动同步会话
-→ 当前监控进程继续运行
+已占用 / 已开机
 ```
 
-不再需要 `Ctrl+C → 单独执行 login → 再重新启动 main`。
+因此不会再出现“数据库里残留旧记录 → 实际没开机 → 终端却一直绿色”的情况。
 
-### 5. 修复 Playwright 首次启动失败后的永久报错
+### 2. 启动前先确认本人是否已经占用
 
-旧版遇到 profile 锁时，第一次 `launch_persistent_context` 失败后会残留 Playwright 状态，之后不断出现：
+程序刚启动、或者会话刚恢复时，如果还没有成功采到完整占用详情：
 
 ```text
-It looks like you are using Playwright Sync API inside the asyncio loop.
+开机达标=本人状态未知
+动作=暂缓开机，先确认本人占用
 ```
 
-v0.5.0 在启动失败时完整释放 context/playwright；下一轮可以正常重试。
+这时不会贸然再开第二个实例。
 
-### 6. “查看占用”兼容表格和卡片页面结构
+完整快照确认本人不在后，下一轮才允许真正自动开机。
 
-先按旧 `<tr>` 结构定位；找不到时从入口名称逐级向父容器寻找“查看占用”，降低 AutoDL 页面 DOM 小改动导致的持续采集失败。
+### 3. 被 K / 关机后重新武装
+
+实时占用状态从：
+
+```text
+ACTIVE -> ABSENT
+```
+
+时，立即清除该主机 evaluator 的 `alerted` 状态：
+
+```text
+自动开机=重新武装
+```
+
+后续平台空位和显存再次达标即可重新开机。
+
+### 4. power_on Success 不再冒充“已开机”
+
+AutoDL 返回 `Success` 只代表平台受理开机请求。
+
+v0.5.1 会进入最长 120 秒的：
+
+```text
+请求已受理 -> 等待实例出现在占用详情
+```
+
+只有占用详情真实看到本人实例才变绿色。
+
+120 秒仍看不到本人实例时，自动重新武装，不会永久锁死。
+
+### 5. PC 登录与监控浏览器进一步隔离
+
+人工验证码改用全新的：
+
+```text
+../autodl_watcher_runtime/native_login_profile
+```
+
+后台 Playwright 继续使用：
+
+```text
+../autodl_watcher_runtime/browser_profile
+```
+
+人工登录窗口由系统 Microsoft Edge 直接启动，不使用 Playwright，不带：
+
+```text
+--no-sandbox
+--headless
+--remote-debugging-pipe
+```
+
+登录前、同步前会主动等待旧 Edge 完全退出并清理 `Singleton*` / `DevToolsActivePort` 等残留锁文件。
+
+> 这修复的是脚本自身导致的验证码高风险浏览器环境。AutoDL 平台自身仍可能根据账号/IP/设备风控要求验证码，工具不会自动破解验证码。
+
+### 6. 修复菜单 7 的 PowerShell 报错
+
+v0.5.0 的菜单 7 把 CMD 转义符 `^` 错传给 PowerShell，导致：
+
+```text
+Get-CimInstance : 找不到接受实际参数“^”的位置形式参数
+```
+
+v0.5.1 已把清理逻辑独立到：
+
+```text
+tools/clean_watcher_edge.ps1
+```
+
+不再使用错误的 `^|` 管道写法；PID 已提前退出时也静默忽略。
+
+### 7. 后台 Edge profile 锁自动自愈
+
+后台 Playwright 启动前会主动清理 watcher 专用 `browser_profile` 的残留 Edge 与锁文件。
+
+因此登录完成后通常不再需要手工先执行菜单 `7` 才能启动监控。
 
 ## 自动开机判定
 
@@ -106,44 +168,52 @@ v0.5.0 在启动失败时完整释放 context/playwright；下一轮可以正常
 平台对应入口存在空闲 GPU ID
 AND
 物理 GPU 可用显存 >= max(8192 MB, 总显存 × 25%)
+AND
+本人占用状态已实时确认不是 ACTIVE
 ```
 
 GPU Util 默认只记录，不作为硬门槛。
 
 ## 运行数据
 
-默认公共 runtime：
+所有版本共用：
 
 ```text
-../autodl_watcher_runtime/
+D:\Dev\MCP\autodl_watcher_runtime\
 ```
 
-主要文件：
+主要内容：
 
 ```text
 logs/watcher.log
 state.json
 usage/occupancy.db
 usage/exports/
-login_profile/
+native_login_profile/
 browser_profile/
 ```
 
-## PowerShell 直接运行
+## 常见操作
 
-激活自己的 Python 环境后：
+安全停止监控：
 
-```powershell
-python -m pip install -e . --no-deps
-python -m autodl_watcher.login
-python -m autodl_watcher.main --entry 2
+```text
+Ctrl+C
 ```
 
-只观察：
+窗口标题出现“选择”时：
 
-```powershell
-python -m autodl_watcher.main --dry-run
+```text
+按 Esc
 ```
+
+传统 PowerShell/CMD 进入选择模式会暂停前台 Python。
+
+查看原始日志：菜单 `5`。
+
+导出占用报表：菜单 `6`。
+
+会话过期时，主程序会停止后台 Playwright并弹出普通 Edge；完成验证码和登录后按 Enter，原监控进程继续运行。
 
 ## 测试
 
@@ -151,6 +221,6 @@ python -m autodl_watcher.main --dry-run
 python -m unittest discover -s tests -v
 ```
 
-v0.5.0 发布包：51 项单元测试通过。
+v0.5.1 发布前回归测试：57 项通过。
 
-完整版本变化见同级文件 [`CHANGELOG.md`](CHANGELOG.md)。
+完整版本变化见同级 [`CHANGELOG.md`](CHANGELOG.md)。

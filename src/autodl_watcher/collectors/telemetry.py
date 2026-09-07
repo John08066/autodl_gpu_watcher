@@ -164,7 +164,7 @@ class TelemetryApiCollector:
             {
                 "Accept": "application/json",
                 "Cache-Control": "no-cache",
-                "User-Agent": "autodl-gpu-watcher/0.5.0",
+                "User-Agent": "autodl-gpu-watcher/0.5.1",
             }
         )
 
