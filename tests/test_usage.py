@@ -1,15 +1,4 @@
-"""
-占用日志模块的单元测试。
-
-测试覆盖：
-    - 页面弹窗表格行解析
-    - 同 GPU 不同实例的保留（不做错误去重）
-    - 同实例跨入口的去重
-    - SQLite 写入和查询（entry/instance/gpu 维度）
-    - 结束事件的正确触发（按 instance_id 而非 GPU INDEX）
-    - Windows 上 SQLite 文件句柄的及时释放
-"""
-from __future__ import annotations
+from __future__ import annotations  # 占用日志模块的单元测试。
 
 import sqlite3
 import tempfile
@@ -27,16 +16,7 @@ from autodl_watcher.usage import (
 
 
 class UsageTest(unittest.TestCase):
-    def test_parses_occupancy_table_row(self) -> None:
-        """功能：
-            验证测试场景 `parses_occupancy_table_row` 的预期行为。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def test_parses_occupancy_table_row(self) -> None:  # 验证测试场景 `parses_occupancy_table_row` 的预期行为。
         observed = datetime(2026, 7, 20, 20, 43, 0)
         record = parse_occupancy_cells(
             [
@@ -58,16 +38,7 @@ class UsageTest(unittest.TestCase):
         self.assertTrue(record.occupied)
         self.assertEqual(record.user, "用户甲")
 
-    def test_different_instances_on_same_gpu_are_both_preserved(self) -> None:
-        """功能：
-            验证测试场景 `different_instances_on_same_gpu_are_both_preserved` 的预期行为。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def test_different_instances_on_same_gpu_are_both_preserved(self) -> None:  # 验证测试场景 `different_instances_on_same_gpu_are_both_preserved` 的预期行为。
         now = datetime(2026, 7, 20, 21, 0, 0)
         records = [
             OccupancyRecord(now, "gpu-203", "autodl-203-1", 0, "uuid-0", "V100", True, "i-1", "甲", ""),
@@ -83,16 +54,7 @@ class UsageTest(unittest.TestCase):
         self.assertIn("甲", gpu_rows[0]["active_users"])
         self.assertIn("乙", gpu_rows[0]["active_users"])
 
-    def test_same_instance_seen_from_two_entries_is_deduplicated(self) -> None:
-        """功能：
-            验证测试场景 `same_instance_seen_from_two_entries_is_deduplicated` 的预期行为。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def test_same_instance_seen_from_two_entries_is_deduplicated(self) -> None:  # 验证测试场景 `same_instance_seen_from_two_entries_is_deduplicated` 的预期行为。
         now = datetime(2026, 7, 20, 21, 0, 0)
         records = [
             OccupancyRecord(now, "gpu-203", "autodl-203-1", 0, "uuid-0", "V100", True, "same", "甲", ""),
@@ -102,16 +64,7 @@ class UsageTest(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0].machine_name, "autodl-203-1|autodl-203-2")
 
-    def test_sqlite_records_all_entries_instances_and_gpu_concurrency(self) -> None:
-        """功能：
-            验证测试场景 `sqlite_records_all_entries_instances_and_gpu_concurrency` 的预期行为。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def test_sqlite_records_all_entries_instances_and_gpu_concurrency(self) -> None:  # 验证测试场景 `sqlite_records_all_entries_instances_and_gpu_concurrency` 的预期行为。
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "occupancy.db"
             logger = UsageSqliteLogger(database)
@@ -142,22 +95,11 @@ class UsageTest(unittest.TestCase):
             self.assertEqual(current_count, 2)
             self.assertEqual(occupant_count, 2)
 
-            # Windows regression: both logger and verification connection must
-            # be closed before TemporaryDirectory cleanup.
-            renamed = database.with_suffix(".verified")
+            renamed = database.with_suffix(".verified")  # Windows regression: both logger and verification connection must be closed before TemporaryDirectory cleanup.
             database.rename(renamed)
             renamed.rename(database)
 
-    def test_end_event_is_keyed_by_instance_not_gpu(self) -> None:
-        """功能：
-            验证测试场景 `end_event_is_keyed_by_instance_not_gpu` 的预期行为。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def test_end_event_is_keyed_by_instance_not_gpu(self) -> None:  # 验证测试场景 `end_event_is_keyed_by_instance_not_gpu` 的预期行为。
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "occupancy.db"
             logger = UsageSqliteLogger(database)
@@ -180,16 +122,7 @@ class UsageTest(unittest.TestCase):
             self.assertEqual(len(current), 1)
             self.assertEqual(current[0]["user"], "乙")
 
-    def test_sqlite_connection_is_closed_after_record(self) -> None:
-        """功能：
-            验证测试场景 `sqlite_connection_is_closed_after_record` 的预期行为。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def test_sqlite_connection_is_closed_after_record(self) -> None:  # 验证测试场景 `sqlite_connection_is_closed_after_record` 的预期行为。
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "occupancy.db"
             logger = UsageSqliteLogger(database)
@@ -202,12 +135,9 @@ class UsageTest(unittest.TestCase):
                     )
                 ]
             )
-            # On Windows this rename fails immediately if SQLite still holds
-            # an open file handle.  Renaming back preserves the fixture.
-            renamed = database.with_suffix(".moved")
+            renamed = database.with_suffix(".moved")  # On Windows this rename fails immediately if SQLite still holds an open file handle.  Renaming back preserves the fixture.
             database.rename(renamed)
             renamed.rename(database)
-
 
 
 if __name__ == "__main__":
@@ -225,10 +155,7 @@ class UsagePartialSnapshotV050Test(unittest.TestCase):
                         now, "gpu-203", "autodl-203-2", 0, "uuid0", "V100",
                         True, "mine", "何太急", "2026-08-09 11:00:00"
                     ),
-                    OccupancyRecord(
-                        now, "gpu-203", "autodl-203-2", 1, "uuid1", "V100",
-                        False, "", "", ""
-                    ),
+                    OccupancyRecord( now, "gpu-203", "autodl-203-2", 1, "uuid1", "V100", False, "", "", "" ),
                 ],
                 complete_snapshot=True,
                 snapshot_hosts={"gpu-203"},
@@ -236,12 +163,7 @@ class UsagePartialSnapshotV050Test(unittest.TestCase):
 
             later = now + timedelta(minutes=1)
             events = logger.record(
-                [
-                    OccupancyRecord(
-                        later, "gpu-203", "autodl-203-1", 0, "uuid0", "V100",
-                        False, "", "", ""
-                    )
-                ],
+                [ OccupancyRecord( later, "gpu-203", "autodl-203-1", 0, "uuid0", "V100", False, "", "", "" ) ],
                 complete_snapshot=False,
                 snapshot_hosts={"gpu-203"},
             )
@@ -268,12 +190,7 @@ class UsagePartialSnapshotV050Test(unittest.TestCase):
             )
             later = now + timedelta(minutes=1)
             events = logger.record(
-                [
-                    OccupancyRecord(
-                        later, "gpu-203", "autodl-203-2", 0, "uuid0", "V100",
-                        False, "", "", ""
-                    )
-                ],
+                [ OccupancyRecord( later, "gpu-203", "autodl-203-2", 0, "uuid0", "V100", False, "", "", "" ) ],
                 complete_snapshot=True,
                 snapshot_hosts={"gpu-203"},
             )

@@ -1,18 +1,4 @@
-"""
-旧版 CSV 数据迁移工具 — 将 v0.4.2 及之前版本的 CSV 占用日志导入 SQLite。
-
-用法：
-    python -m autodl_watcher.usage_import_legacy
-
-背景：
-    v0.4.3 起，占用日志从 CSV 切换为 SQLite 作为唯一事实源。
-    此脚本用于将旧版 CSV（occupancy_entry_snapshots.csv）中的历史
-    数据导入新版的 SQLite 数据库。
-
-注意事项：
-    - 如果 SQLite 数据库中已有 entry_snapshots 数据，跳过导入
-    - CSV 中的记录按 5 秒窗口分批次重建（因为 203-1/203-2 的采样相差约 1 秒）
-"""
+# 旧版 CSV 数据迁移工具 — 将 v0.4.2 及之前版本的 CSV 占用日志导入 SQLite。
 
 from __future__ import annotations
 
@@ -26,29 +12,11 @@ from .models import OccupancyRecord
 from .usage import UsageSqliteLogger
 
 
-def _parse_bool(value: str) -> bool:
-    """功能：
-        将旧 CSV 中的常见真假字符串解析为布尔值。
-
-    参数：
-        value (str)：待规范化、解析或转换的输入值。
-
-    返回：
-        bool：解析后的布尔值。
-    """
+def _parse_bool(value: str) -> bool:  # 将旧 CSV 中的常见真假字符串解析为布尔值。
     return value.strip().lower() in {"1", "true", "yes", "是"}
 
 
-def _record_from_row(row: dict[str, str]) -> OccupancyRecord:
-    """功能：
-        把旧版 CSV 的一行字段转换为 OccupancyRecord。
-
-    参数：
-        row (dict[str, str])：CSV 行字典或占用详情表中的单行数据。
-
-    返回：
-        OccupancyRecord：由旧 CSV 行构造的 OccupancyRecord。
-    """
+def _record_from_row(row: dict[str, str]) -> OccupancyRecord:  # 把旧版 CSV 的一行字段转换为 OccupancyRecord。
     return OccupancyRecord(
         observed_at=datetime.fromisoformat(row["observed_at"]),
         host=row["host"],
@@ -63,16 +31,7 @@ def _record_from_row(row: dict[str, str]) -> OccupancyRecord:
     )
 
 
-def main() -> None:
-    """功能：
-        把旧版实时 CSV 快照导入新版 SQLite 数据库，保留已有历史。
-
-    参数：
-        无。
-
-    返回：
-        None：函数通过副作用完成初始化、输出、持久化或资源管理。
-    """
+def main() -> None:  # 把旧版实时 CSV 快照导入新版 SQLite 数据库，保留已有历史。
     config = load_config(Path("config.yaml"))
     database = config.usage_tracking.database_path
     legacy = database.parent / "occupancy_entry_snapshots.csv"
@@ -90,10 +49,7 @@ def main() -> None:
         finally:
             conn.close()
         if count:
-            raise SystemExit(
-                f"数据库已有 {count} 条入口记录，为防止重复导入已停止。"
-                "请在首次运行 v0.4.3 主程序之前执行迁移。"
-            )
+            raise SystemExit( f"数据库已有 {count} 条入口记录，为防止重复导入已停止。" "请在首次运行 v0.4.3 主程序之前执行迁移。" )
 
     records: list[OccupancyRecord] = []
     with legacy.open(encoding="utf-8-sig", newline="") as handle:
@@ -106,9 +62,7 @@ def main() -> None:
     if not records:
         raise SystemExit("旧版 CSV 中没有可导入记录。")
 
-    # 203-1 / 203-2 are collected sequentially and usually differ by ~1 second.
-    # Group neighbouring rows within five seconds into one logical capture.
-    batches: list[list[OccupancyRecord]] = []
+    batches: list[list[OccupancyRecord]] = []  # 203-1 / 203-2 are collected sequentially and usually differ by ~1 second. Group neighbouring rows within five seconds into one logical capture.
     current: list[OccupancyRecord] = []
     batch_start: datetime | None = None
     for item in records:

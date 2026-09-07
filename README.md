@@ -1,17 +1,48 @@
-# AutoDL GPU Watcher v0.5.4
+# AutoDL GPU Watcher v0.6
 
 用于实验室 AutoDL 私有云 GPU 资源监控、占用统计和满足条件后的自动开机。
+
+## v0.6 桌面界面
+
+在 Git 仓库目录双击 `START_HERE.cmd`，默认打开桌面 UI。启动器优先加载本仓库的 `src/`，避免误用旧版本的可编辑安装。
+
+1. 点击“刷新服务器”，获取当前 AutoDL 账号的实际入口和空闲 GPU ID。尚未刷新时仅显示配置中的入口，不代表当前在线。
+2. 登录失效时点击“登录 / 更新会话”，在 Edge 完成验证码登录并关闭登录窗口，再点击“已登录并关闭浏览器”，随后重新刷新。
+3. 点击一个服务器入口，填写“本人用户名”。这是“查看占用”中的显示名，不会切换 AutoDL 登录账号，也不是 SSH 用户名。
+4. 设置采样间隔与占用采集间隔，支持有限正数和小数。占用采集在监控循环内调度；网络请求耗时或较长的采样间隔会使实际占用采集间隔变长，不会并发堆积请求。
+5. 点击“开始监控”。默认只读，不发送开机请求。运行日志和最近一次成功采样状态显示在窗口中。
+6. 需要自动开机时，先停止监控、勾选“启用真实自动开机”，再启动。所选入口必须在 `config.yaml` 的 `auto_start.targets` 中配置有效实例 UUID；新发现但未配置实例的入口仍可只读监控。
+7. 点击“停止监控”后等待当前网络请求结束，程序保存状态并关闭采集浏览器。切换服务器或配置需要先停止；关闭窗口也会等待安全停止。
+
+“保存设置”只写入本地 `.ui/preferences.json`，不会改写受 Git 管理的 `config.yaml`。记住入口、用户名和间隔，每次重新打开 UI 都默认只读。登录资料和占用数据库继续使用同级 `autodl_watcher_runtime/`。同一套浏览器资料应只运行一个监控程序。
+
+“导出占用报表”保留原来的 SQLite → CSV 导出流程。UI 登录失效时结束当前监控并提示登录；完成登录后重新开始，命令行仍保留原有交互式登录恢复。
+
+### 命令行与开发
+
+保留旧菜单：运行 `START_HERE.cmd --cli`。也可在安装项目的 Python 环境内直接运行：
+
+```powershell
+python -m autodl_watcher.gui
+python run_watcher.py --host 203 --entry 2 --user "你的占用用户名" --poll-seconds 5 --usage-seconds 30 --dry-run
+```
+
+需要安装时运行 `tools\install_update.cmd`；首次创建环境及依赖可执行 `python -m pip install -e .`，系统需有 Microsoft Edge 和 Python 的 Tkinter 支持。
+
+`main.main()` 负责配置和参数解析，`run_monitor()` 负责原有采集、评估、占用确认、通知、开机和持久化。`gui.py` 用独立子进程运行这些逻辑，通过消息队列把输出送回 Tk 主线程，通过停止文件请求安全退出。网络请求不阻塞 UI。
+
+v0.6 将 Python 中重复的多行说明改为简短行尾注释，并压缩可读的短调用；复杂条件、SQL 和浏览器脚本保留必要换行。
 
 ## 目录结构
 
 根目录只保留日常会直接接触的文件；辅助启动脚本统一放进 `tools/`：
 
 ```text
-autodl_gpu_watcher_v0.5.4/
+autodl_gpu_watcher_git/
 ├─ src/                  Python 主代码
 ├─ tests/                单元测试
 ├─ tools/                一键菜单使用的辅助脚本
-├─ START_HERE.cmd        日常唯一入口
+├─ START_HERE.cmd        桌面 UI 入口；--cli 打开旧菜单
 ├─ README.md             使用说明
 ├─ CHANGELOG.md          版本迭代记录
 ├─ config.yaml           配置文件
@@ -27,7 +58,7 @@ autodl_gpu_watcher_v0.5.4/
 START_HERE.cmd
 ```
 
-## 一键菜单
+## 兼容命令行菜单（START_HERE.cmd --cli）
 
 ```text
 1. Login / refresh session
@@ -165,7 +196,7 @@ Authorization + machine/list 请求体
 UNKNOWN
 ```
 
-开始。只有本进程实时“查看占用”明确看到 `何太急`，才会显示绿色：
+开始。只有本进程实时“查看占用”明确看到配置的本人用户名，才会显示绿色：
 
 ```text
 已占用 / 已开机
@@ -323,6 +354,8 @@ Ctrl+C
 python -m unittest discover -s tests -v
 ```
 
-v0.5.4 发布前回归测试：70 项通过。
+v0.6：86 项自动化测试通过，包括 Tk 窗口交互和 Windows CMD 入口测试。已实测读取 5 个入口，并对 203-1、202-4 各完成三轮只读监听；未实测发送真实开机请求或邮件。
+
+202 主机的占用表存在比平台 total 更多的空行。只有新鲜 Telemetry 索引与 total 一致、额外行没有占用/实例/用户证据时才排除这些行；其余不一致仍会拒绝，避免错误确认本人已下机。
 
 完整版本变化见同级 [`CHANGELOG.md`](CHANGELOG.md)。

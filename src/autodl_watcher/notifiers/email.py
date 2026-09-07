@@ -1,15 +1,4 @@
-"""
-邮件通知器 — 通过 SMTP_SSL 发送开机告警邮件。
-
-环境变量配置（必须全部设置）：
-    SMTP_HOST     — SMTP 服务器地址
-    SMTP_PORT     — SMTP 端口（通常 465）
-    SMTP_USERNAME — 登录用户名
-    SMTP_PASSWORD — 登录密码
-    SMTP_FROM     — 发件人地址
-    SMTP_TO       — 收件人地址
-"""
-from __future__ import annotations
+from __future__ import annotations  # 邮件通知器 — 通过 SMTP_SSL 发送开机告警邮件。
 
 import os
 import smtplib
@@ -20,33 +9,13 @@ from ..models import AvailabilityAlert
 from .formatting import format_alert
 
 
-class EmailNotifier:
-    """通过 SMTP_SSL 发送告警邮件。"""
+class EmailNotifier:  # 通过 SMTP_SSL 发送告警邮件。
 
-    def __init__(self, subject_prefix: str) -> None:
-        """功能：
-            初始化邮件通知器并保存邮件主题前缀。
-
-        参数：
-            subject_prefix (str)：邮件主题前缀。
-
-        返回：
-            None：函数通过副作用完成初始化、输出、持久化或资源管理。
-        """
+    def __init__(self, subject_prefix: str) -> None:  # 初始化邮件通知器并保存邮件主题前缀。
         self.subject_prefix = subject_prefix
 
-    def send(self, alert: AvailabilityAlert) -> None:
-        """功能：
-            发送一封开机达标通知邮件。
-
-        参数：
-            alert (AvailabilityAlert)：评估器生成的开机达标事件，包含目标主机、平台空位和达标 GPU。
-
-        返回：
-            None：函数通过副作用完成初始化、输出、持久化或资源管理。
-        """
-        # 检查必需的环境变量
-        required = [
+    def send(self, alert: AvailabilityAlert) -> None:  # 发送一封开机达标通知邮件。
+        required = [  # 检查必需的环境变量
             "SMTP_HOST",
             "SMTP_PORT",
             "SMTP_USERNAME",
@@ -58,15 +27,13 @@ class EmailNotifier:
         if missing:
             raise RuntimeError(f"Missing SMTP environment variables: {', '.join(missing)}")
 
-        # 构建邮件
-        message = EmailMessage()
+        message = EmailMessage()  # 构建邮件
         message["Subject"] = f"{self.subject_prefix} {alert.host} 开机达标 {alert.actionable_count} 张"
         message["From"] = os.environ["SMTP_FROM"]
         message["To"] = os.environ["SMTP_TO"]
         message.set_content(format_alert(alert))
 
-        # 发送（SSL 连接）
-        context = ssl.create_default_context()
+        context = ssl.create_default_context()  # 发送（SSL 连接）
         with smtplib.SMTP_SSL(
             os.environ["SMTP_HOST"],
             int(os.environ["SMTP_PORT"]),

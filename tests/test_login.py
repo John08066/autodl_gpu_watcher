@@ -1,5 +1,4 @@
-"""登录启动方式的单元测试。"""
-from __future__ import annotations
+from __future__ import annotations  # 登录启动方式的单元测试。
 
 import os
 import tempfile
@@ -12,11 +11,7 @@ from autodl_watcher.login import edge_executable_candidates, find_edge_executabl
 
 class LoginTest(unittest.TestCase):
     def test_candidates_include_standard_program_files_location(self) -> None:
-        with patch.dict(
-            os.environ,
-            {"PROGRAMFILES(X86)": r"C:\Program Files (x86)"},
-            clear=True,
-        ), patch("autodl_watcher.login.shutil.which", return_value=None):
+        with patch.dict( os.environ, {"PROGRAMFILES(X86)": r"C:\Program Files (x86)"}, clear=True, ), patch("autodl_watcher.login.shutil.which", return_value=None):
             candidates = edge_executable_candidates()
 
         self.assertIn(
@@ -80,9 +75,7 @@ class LoginV051Test(unittest.TestCase):
 
         with patch(
             "autodl_watcher.login.edge_process_command_lines",
-            return_value=[
-                r'"msedge.exe" --user-data-dir=D:\runtime\login_profile --new-window'
-            ],
+            return_value=[ r'"msedge.exe" --user-data-dir=D:\runtime\login_profile --new-window' ],
         ):
             self.assertFalse(automation_flags_present(Path(r"D:\runtime\login_profile")))
 

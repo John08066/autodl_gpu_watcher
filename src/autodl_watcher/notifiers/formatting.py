@@ -1,25 +1,9 @@
-"""
-告警格式化 — 将 AvailabilityAlert 转换为人类可读的文本。
-
-格式设计：
-    邮件和控制台通知复用同一格式化函数 format_alert()，
-    确保两种渠道的输出内容一致。
-"""
-from __future__ import annotations
+from __future__ import annotations  # 告警格式化 — 将 AvailabilityAlert 转换为人类可读的文本。
 
 from ..models import AvailabilityAlert
 
 
-def format_alert(alert: AvailabilityAlert) -> str:
-    """功能：
-        将 AvailabilityAlert 格式化为结构化的多行文本。
-
-    参数：
-        alert (AvailabilityAlert)：评估器生成的开机达标事件，包含目标主机、平台空位和达标 GPU。
-
-    返回：
-        str：用于控制台或邮件的多行告警文本。
-    """
+def format_alert(alert: AvailabilityAlert) -> str:  # 将 AvailabilityAlert 格式化为结构化的多行文本。
     lines = [
         "【AutoDL 开机达标】",
         "",

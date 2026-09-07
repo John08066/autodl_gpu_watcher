@@ -1,11 +1,4 @@
-"""
-通知格式化的单元测试。
-
-测试覆盖：
-    - format_alert() 输出包含正确的术语（GPU INDEX、开机达标等）
-    - format_start_result() 输出包含开机前后平台空位变化
-"""
-from __future__ import annotations
+from __future__ import annotations  # 通知格式化的单元测试。
 
 import unittest
 from datetime import datetime
@@ -21,16 +14,7 @@ from autodl_watcher.notifiers.formatting import format_alert
 
 
 class FormattingTest(unittest.TestCase):
-    def test_user_visible_terms_use_gpu_index_and_start_ready(self) -> None:
-        """功能：
-            验证测试场景 `user_visible_terms_use_gpu_index_and_start_ready` 的预期行为。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def test_user_visible_terms_use_gpu_index_and_start_ready(self) -> None:  # 验证测试场景 `user_visible_terms_use_gpu_index_and_start_ready` 的预期行为。
         gpu = ConfirmedGpu(
             host="gpu-203",
             gpu_index=0,
@@ -55,16 +39,7 @@ class FormattingTest(unittest.TestCase):
         self.assertIn("GPU INDEX：#0", text)
         self.assertNotIn("告警", text)
 
-    def test_start_result_displays_platform_gpu_ids(self) -> None:
-        """功能：
-            验证测试场景 `start_result_displays_platform_gpu_ids` 的预期行为。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def test_start_result_displays_platform_gpu_ids(self) -> None:  # 验证测试场景 `start_result_displays_platform_gpu_ids` 的预期行为。
         result = StartAttemptResult(
             status="request_accepted",
             host="gpu-202",
@@ -82,16 +57,7 @@ class FormattingTest(unittest.TestCase):
         self.assertIn("开机前 3/3，开机后 2/3", text)
 
 
-    def test_self_occupancy_uses_actual_entry_and_gpu_index(self) -> None:
-        """功能：
-            验证本人占用状态使用实际入口和 GPU INDEX，而不是等待平台空位。
-
-        参数：
-            无。
-
-        返回：
-            None：无返回值。
-        """
+    def test_self_occupancy_uses_actual_entry_and_gpu_index(self) -> None:  # 验证本人占用状态使用实际入口和 GPU INDEX，而不是等待平台空位。
         observed_at = datetime(2026, 7, 21, 19, 12, 58)
         records = [
             OccupancyRecord(
@@ -134,7 +100,6 @@ class FormattingTest(unittest.TestCase):
 
         self.assertEqual(_format_owned_entry(owned), "已占用203-1")
         self.assertEqual(_format_owned_indices(owned, samples), "#0(30000MB)")
-
 
 
 if __name__ == "__main__":

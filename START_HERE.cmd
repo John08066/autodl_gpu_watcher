@@ -1,11 +1,18 @@
 @echo off
 call "%~dp0tools\launcher.cmd"
-if errorlevel 1 pause & exit /b 1
+if errorlevel 1 (
+  pause
+  exit /b 1
+)
+if /i "%~1"=="--cli" goto menu
+"%PYTHON_EXE%" -m autodl_watcher.gui
+if errorlevel 1 pause
+exit /b
 
 :menu
 cls
 echo ========================================
-echo AutoDL GPU Watcher v0.5.4
+echo AutoDL GPU Watcher v0.6
 echo Python: %PYTHON_EXE%
 echo ========================================
 echo 1. Login / refresh session
