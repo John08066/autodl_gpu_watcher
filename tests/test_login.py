@@ -46,15 +46,34 @@ class LoginTest(unittest.TestCase):
             self.assertIsNone(find_edge_executable())
 
 
+class LoginProfileCleanupV051Test(unittest.TestCase):
+    def test_remove_stale_profile_locks(self) -> None:
+        from autodl_watcher.login import remove_stale_profile_locks
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = Path(temp_dir)
+            for name in ("SingletonLock", "SingletonCookie", "lockfile", "DevToolsActivePort"):
+                (profile / name).write_text("stale", encoding="utf-8")
+            (profile / "Cookies").write_text("keep", encoding="utf-8")
+
+            remove_stale_profile_locks(profile)
+
+            self.assertFalse((profile / "SingletonLock").exists())
+            self.assertFalse((profile / "SingletonCookie").exists())
+            self.assertFalse((profile / "lockfile").exists())
+            self.assertFalse((profile / "DevToolsActivePort").exists())
+            self.assertTrue((profile / "Cookies").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
 
-class LoginV050Test(unittest.TestCase):
+class LoginV051Test(unittest.TestCase):
     def test_login_profile_is_separate_from_browser_profile(self) -> None:
         from autodl_watcher.login import login_profile_dir
 
         browser = Path("runtime") / "browser_profile"
-        self.assertEqual(login_profile_dir(browser), Path("runtime") / "login_profile")
+        self.assertEqual(login_profile_dir(browser), Path("runtime") / "native_login_profile")
 
     def test_automation_flags_detected_from_edge_command_lines(self) -> None:
         from autodl_watcher.login import automation_flags_present
@@ -75,7 +94,7 @@ class LoginV050Test(unittest.TestCase):
         ):
             self.assertTrue(automation_flags_present(Path(r"D:\runtime\login_profile")))
 
-class LoginWorkflowV050Test(unittest.TestCase):
+class LoginWorkflowV051Test(unittest.TestCase):
     def test_interactive_login_uses_clean_profile_then_syncs(self) -> None:
         from types import SimpleNamespace
         from autodl_watcher.login import interactive_login
@@ -100,7 +119,7 @@ class LoginWorkflowV050Test(unittest.TestCase):
                  patch("builtins.input", return_value=""):
                 interactive_login(config, reason="manual")
 
-            clean_profile = browser_profile.parent / "login_profile"
+            clean_profile = browser_profile.parent / "native_login_profile"
             launch.assert_called_once_with(edge_path, clean_profile, config.platform.page_url)
             sync.assert_called_once_with(clean_profile, browser_profile)
             self.assertGreaterEqual(terminate.call_count, 3)

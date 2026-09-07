@@ -158,43 +158,6 @@ def _owned_instances_from_records(
     )
 
 
-def _owned_instances_from_rows(
-    rows,
-    self_user: str,
-    host: str,
-) -> list[_OwnedInstance]:
-    """功能：
-        从 SQLite 的 current_instances 行恢复本人当前占用状态。
-
-    参数：
-        rows (未显式标注)：UsageSqliteLogger.current_instances() 返回的字典行。
-        self_user (str)：当前账号在占用页面显示的用户标识。
-        host (str)：当前监控的物理主机，例如 `gpu-203`。
-
-    返回：
-        list[_OwnedInstance]：恢复出的本人活跃实例摘要。
-    """
-    if not self_user:
-        return []
-
-    result = []
-    for row in rows:
-        if str(row.get("host", "")) != host:
-            continue
-        if str(row.get("user", "")).strip() != self_user:
-            continue
-        result.append(
-            _OwnedInstance(
-                machine_name=str(row.get("machine_name", "")),
-                gpu_index=int(row.get("gpu_index", -1)),
-                instance_id=str(row.get("instance_id", "")),
-            )
-        )
-    return sorted(
-        result,
-        key=lambda item: (item.machine_name, item.gpu_index, item.instance_id),
-    )
-
 
 def _format_owned_entry(instances: list[_OwnedInstance]) -> str:
     """功能：
@@ -359,7 +322,7 @@ def _format_ready_indices(samples, thresholds) -> str:
 
 
 _STATE_RESTORE_MAX_AGE_SECONDS = 300
-_OWNERSHIP_HINT_MAX_AGE_SECONDS = 180
+_POWER_ON_CONFIRM_GRACE_SECONDS = 120
 
 
 def _parse_local_iso(value: object) -> datetime | None:
@@ -385,27 +348,24 @@ def _persisted_state_is_fresh(
     return -5 <= age <= max_age_seconds
 
 
-def _fresh_owned_instances_from_rows(
-    rows,
-    self_user: str,
-    host: str,
+def _restore_recent_evaluator_state(
+    evaluator: AvailabilityEvaluator,
+    persisted: dict,
+    capacity_fingerprint: str,
     now: datetime,
-    max_age_seconds: int = _OWNERSHIP_HINT_MAX_AGE_SECONDS,
-) -> list[_OwnedInstance]:
-    """SQLite 只能作为短时“启动保护提示”，不能直接证明本人现在仍在占用。"""
-    fresh_rows = []
-    for row in rows:
-        if str(row.get("host", "")) != host:
-            continue
-        if str(row.get("user", "")).strip() != self_user:
-            continue
-        last_seen = _parse_local_iso(row.get("last_seen_at"))
-        if last_seen is None:
-            continue
-        age = (now - last_seen).total_seconds()
-        if -5 <= age <= max_age_seconds:
-            fresh_rows.append(row)
-    return _owned_instances_from_rows(fresh_rows, self_user, host)
+    host: str,
+) -> tuple[bool, int]:
+    """恢复近期连续采样，但无条件清除跨进程 alerted 锁。
+
+    返回 ``(是否恢复, 清除的 alerted 数量)``。SQLite 占用历史不参与这里的任何判定。
+    """
+    if persisted.get("capacity_fingerprint") != capacity_fingerprint:
+        return False, 0
+    if not _persisted_state_is_fresh(persisted, now):
+        return False, 0
+    evaluator.import_state(persisted.get("evaluator", {}))
+    return True, evaluator.rearm_host(host)
+
 
 
 def main() -> None:
@@ -469,7 +429,7 @@ def main() -> None:
     target_signature = ",".join(item.machine_name for item in selected_targets)
     # capacity_fingerprint 是配置的哈希摘要，用于检测配置是否变更
     capacity_fingerprint = (
-        f"v5|host={selected_host}|targets={target_signature}|"
+        f"v5.1|host={selected_host}|targets={target_signature}|"
         f"util={config.idle_thresholds.gpu_util_check_enabled}:"
         f"{config.idle_thresholds.gpu_util_max_pct}|"
         f"free={config.idle_thresholds.memory_free_min_mb}:"
@@ -478,14 +438,20 @@ def main() -> None:
         f"{config.monitor.min_idle_samples}|dry_run={dry_run}"
     )
     state_now = datetime.now()
-    state_fresh = _persisted_state_is_fresh(persisted, state_now)
-    if (
-        persisted.get("capacity_fingerprint") == capacity_fingerprint
-        and state_fresh
-    ):
-        # 只恢复 5 分钟内的 evaluator 状态。旧版会把几天前的 alerted=True
-        # 一并恢复，造成“条件明明满足但永远不再开机”。
-        evaluator.import_state(persisted.get("evaluator", {}))
+    state_restored, restored_alerted = _restore_recent_evaluator_state(
+        evaluator,
+        persisted,
+        capacity_fingerprint,
+        state_now,
+        selected_host,
+    )
+    if state_restored:
+        if restored_alerted:
+            logger.info(
+                "restored evaluator continuity but reset stale alerted host=%s count=%d",
+                selected_host,
+                restored_alerted,
+            )
     elif persisted:
         logger.info(
             "skip stale evaluator state saved_at=%s fingerprint_match=%s",
@@ -502,23 +468,17 @@ def main() -> None:
     telemetry_collector = TelemetryApiCollector(config.telemetry)    # HTTP   → Telemetry API
     usage_logger = UsageSqliteLogger(config.usage_tracking.database_path)  # SQLite 占用日志
     self_user = config.usage_tracking.self_user.strip()
-    current_rows = usage_logger.current_instances()
-    # v0.5.0：SQLite current_instances 是“上次看见”，不是实时真值。
-    # 仅把 3 分钟内的记录当作短时启动保护提示，绝不直接显示绿色“已开机”。
-    restored_owned_hint = _fresh_owned_instances_from_rows(
-        current_rows,
-        self_user,
-        selected_host,
-        datetime.now(),
-    )
+
+    # v0.5.1：SQLite 只用于历史统计，绝不参与“本人现在是否已开机”的判定。
+    # 每次启动都从 UNKNOWN 开始，必须等本进程成功采集“查看占用”后，
+    # 才能进入 ACTIVE / ABSENT。这样彻底消除数据库陈旧记录导致的假绿色。
     owned_instances: list[_OwnedInstance] = []
     self_occupancy_known = False
-    startup_ownership_hold_until = (
-        time.monotonic() + _OWNERSHIP_HINT_MAX_AGE_SECONDS
-        if restored_owned_hint
-        else 0.0
-    )
-    startup_hint_rearmed = False
+
+    # power_on=Success 只代表请求被受理。给实例最多 120 秒启动并出现在
+    # “查看占用”中；这段时间不重复发开机请求，也绝不显示“已开机”。
+    pending_start_until = 0.0
+    pending_start_machine = ""
     usage_targets = sorted(
         (
             item
@@ -577,11 +537,6 @@ def main() -> None:
             f"CSV导出目录={config.usage_tracking.export_dir}；"
             f"本人用户={self_user or '未配置'}"
         )
-    if restored_owned_hint:
-        print(
-            "启动保护：SQLite 中存在近期本人占用记录，但仅视为待确认提示；"
-            "不会直接显示‘已开机’。"
-        )
 
     # ── 阶段 1：无限监控循环 ──
     try:
@@ -610,22 +565,6 @@ def main() -> None:
 
                 # ── Step 2: 评估 GPU 容量连续性 ──
                 now = datetime.now()
-                # 如果启动时只有“近期 SQLite 提示”但 3 分钟始终无法得到占用确认，
-                # 不允许旧 alerted 永久锁死自动开机；保护期到期后重新武装一次。
-                if (
-                    restored_owned_hint
-                    and not self_occupancy_known
-                    and not startup_hint_rearmed
-                    and time.monotonic() >= startup_ownership_hold_until
-                ):
-                    reset_count = evaluator.rearm_host(selected_host)
-                    startup_hint_rearmed = True
-                    logger.warning(
-                        "startup ownership hint expired; evaluator rearmed host=%s reset_alerted=%d",
-                        selected_host,
-                        reset_count,
-                    )
-
                 # evaluator 内部维护 idle_samples 队列，判断哪些 GPU 已连续达标
                 trigger_events = evaluator.evaluate(platform_hosts, gpu_samples, now)
 
@@ -640,20 +579,36 @@ def main() -> None:
                     else f"{platform_host.free_count}/{platform_host.total_count}"
                 )
 
-                # 只有“本进程中从占用页面明确确认”的实例才算本人已开机。
-                # SQLite 历史记录绝不直接进入绿色状态。
+                # 只有本进程“查看占用”的实时正向证据才算本人已开机。
+                # UNKNOWN 状态和 power_on 等待确认状态都必须抑制开机，避免重复开实例。
                 self_active = self_occupancy_known and bool(owned_instances)
-                ownership_hold = bool(
-                    restored_owned_hint
+                occupancy_unknown = (
+                    config.usage_tracking.enabled
+                    and bool(usage_targets)
                     and not self_occupancy_known
-                    and time.monotonic() < startup_ownership_hold_until
                 )
-                if self_active or ownership_hold:
+                pending_start = (
+                    pending_start_until > 0
+                    and time.monotonic() < pending_start_until
+                )
+                if pending_start_until > 0 and not pending_start:
+                    # 超过确认宽限期仍未看到本人实例：认为开机没有真正落地，重新武装。
+                    reset_count = evaluator.rearm_host(selected_host)
+                    logger.warning(
+                        "power_on confirmation expired; rearmed host=%s machine=%s reset_alerted=%d",
+                        selected_host,
+                        pending_start_machine or "unknown",
+                        reset_count,
+                    )
+                    pending_start_until = 0.0
+                    pending_start_machine = ""
+
+                if self_active or occupancy_unknown or pending_start:
                     trigger_events = []
 
-                # 根据实时空位，预判会被选中的入口。
+                # 根据实时空位预判入口。UNKNOWN 时仍显示预选入口，但不会真正开机。
                 planned_target = None
-                if platform_host is not None and not self_active and not ownership_hold:
+                if platform_host is not None and not self_active:
                     planned_target = select_target(
                         selected_auto_start,
                         selected_host,
@@ -676,10 +631,22 @@ def main() -> None:
                     planned_text = _format_owned_entry(owned_instances)
                     start_ready_text = "已开机"
                     action_text = "已开机，继续监控"
-                elif ownership_hold:
-                    planned_text = "历史占用待确认"
-                    start_ready_text = "待确认"
-                    action_text = "暂缓开机，等待占用确认"
+                elif pending_start:
+                    planned_text = (
+                        pending_start_machine.removeprefix("autodl-")
+                        if pending_start_machine
+                        else (planned_target.machine_name.removeprefix("autodl-") if planned_target else "等待确认")
+                    )
+                    start_ready_text = "请求已受理"
+                    action_text = "等待实例出现在占用详情"
+                elif occupancy_unknown:
+                    planned_text = (
+                        planned_target.machine_name.removeprefix("autodl-")
+                        if planned_target is not None
+                        else "待确认"
+                    )
+                    start_ready_text = "本人状态未知"
+                    action_text = "暂缓开机，先确认本人占用"
                 else:
                     start_ready_text = "是" if start_ready else "否"
                     if trigger_events and selected_auto_start.enabled:
@@ -780,26 +747,29 @@ def main() -> None:
                             self_user,
                             selected_host,
                         )
+                        previous_known = self_occupancy_known
                         previous_active = self_occupancy_known and bool(owned_instances)
-                        had_startup_hint = bool(restored_owned_hint)
 
                         if captured_owned:
                             # 正向证据即使来自部分入口也可信：明确看到了本人实例。
                             owned_instances = captured_owned
                             self_occupancy_known = True
-                            restored_owned_hint = []
-                            startup_ownership_hold_until = 0.0
-                            startup_hint_rearmed = False
+                            pending_start_until = 0.0
+                            pending_start_machine = ""
                         elif complete_occupancy_snapshot:
-                            # 只有“所有入口都成功且均未看到本人”才确认本人不再占用。
+                            # 只有所有入口都成功且均未看到本人，才确认“本人当前不占用”。
                             owned_instances = []
                             self_occupancy_known = True
-                            restored_owned_hint = []
-                            startup_ownership_hold_until = 0.0
-                            startup_hint_rearmed = False
 
-                            if previous_active or had_startup_hint:
+                            pending_still_valid = (
+                                pending_start_until > 0
+                                and time.monotonic() < pending_start_until
+                            )
+                            if previous_active:
+                                # ACTIVE -> ABSENT：立即重新武装，这是被 K / 关机自恢复的核心。
                                 rearmed_gpu_count = evaluator.rearm_host(selected_host)
+                                pending_start_until = 0.0
+                                pending_start_machine = ""
                                 rearm_line = (
                                     f"[{datetime.now():%H:%M:%S}] 本人占用已确认结束 | "
                                     f"主机={selected_host} | "
@@ -808,11 +778,15 @@ def main() -> None:
                                 )
                                 print(rearm_line, flush=True)
                                 logger.warning(
-                                    "self occupancy ended/cleared; evaluator rearmed host=%s reset_alerted=%d user=%s",
+                                    "self occupancy ended; evaluator rearmed host=%s reset_alerted=%d user=%s",
                                     selected_host,
                                     rearmed_gpu_count,
                                     self_user,
                                 )
+                            elif not previous_known and not pending_still_valid:
+                                # 仅在本进程第一次把 UNKNOWN 确认为 ABSENT 时再武装一次。
+                                # 后续持续 ABSENT 不反复清 alerted，避免 dry-run/失败请求刷屏。
+                                evaluator.rearm_host(selected_host)
                         instance_text = ",".join(
                             f"#{item.gpu_index}:{item.user or '-'}({item.instance_id})"
                             for item in instance_records
@@ -854,9 +828,17 @@ def main() -> None:
                             time.monotonic() + config.usage_tracking.interval_seconds
                         )
 
-                # 若本轮占用快照确认本人已经开机，则取消本轮残留触发事件，
-                # 防止同一账号在另一入口重复开机。
-                if self_occupancy_known and owned_instances:
+                # 占用状态发生变化后再次做安全门控。首次 UNKNOWN、本人 ACTIVE、
+                # 或 power_on 等待确认期间都不允许发送新的开机请求。
+                pending_start = (
+                    pending_start_until > 0
+                    and time.monotonic() < pending_start_until
+                )
+                if (
+                    (config.usage_tracking.enabled and usage_targets and not self_occupancy_known)
+                    or (self_occupancy_known and owned_instances)
+                    or pending_start
+                ):
                     trigger_events = []
 
                 # ── Step 6: 发送邮件通知（若配置了 SMTP） ──
@@ -870,16 +852,27 @@ def main() -> None:
                         result = starter.attempt(event)
                         result_text = format_start_result(result)
                         if result.status == "request_accepted":
-                            # 红色表示“正在触发”，绿色表示“平台已受理成功”。
+                            # 受理成功 != 已开机。进入 120 秒“等待占用确认”状态，
+                            # 只有占用详情实时看到 self_user 后才会变成绿色。
                             result_text = _green_terminal_text(result_text)
-                            # power_on=Success 只表示“请求被平台受理”，不等于实例已经
-                            # 真正占用 GPU。必须等占用快照看到 self_user 后才进入绿色状态。
+                            pending_start_until = (
+                                time.monotonic() + _POWER_ON_CONFIRM_GRACE_SECONDS
+                            )
+                            pending_start_machine = result.machine_name or ""
+                            next_usage_capture = 0.0
                             logger.info(
-                                "power_on accepted; waiting occupancy confirmation host=%s machine=%s instance=%s",
+                                "power_on accepted; waiting occupancy confirmation host=%s machine=%s instance=%s grace=%ss",
                                 result.host,
                                 result.machine_name,
                                 result.instance_uuid,
+                                _POWER_ON_CONFIRM_GRACE_SECONDS,
                             )
+                        elif (
+                            not selected_auto_start.dry_run
+                            and result.status in {"request_failed", "recheck_failed", "no_target"}
+                        ):
+                            # 请求根本没有成功落地时，不能让 evaluator 的 alerted 锁住后续重试。
+                            evaluator.rearm_host(selected_host)
                         print(result_text, flush=True)
                         logger.info(
                             "auto_start status=%s host=%s machine=%s instance=%s before=%s/%s after=%s/%s code=%s msg=%s",
@@ -904,7 +897,7 @@ def main() -> None:
                     }
                 )
             except PlatformAuthenticationError as exc:
-                # v0.5.0：会话过期时不再每 10 秒刷 /login 错误。关闭 Playwright，
+                # v0.5.1：会话过期时不再每 10 秒刷 /login 错误。关闭 Playwright，
                 # 自动弹出普通 Edge；用户完成验证码后，当前监控进程直接恢复。
                 now = datetime.now()
                 print(f"[{now:%H:%M:%S}] 登录会话失效：{exc}", flush=True)
@@ -918,9 +911,9 @@ def main() -> None:
                     )
                     self_occupancy_known = False
                     owned_instances = []
-                    restored_owned_hint = []
-                    startup_ownership_hold_until = 0.0
-                    startup_hint_rearmed = False
+                    pending_start_until = 0.0
+                    pending_start_machine = ""
+                    evaluator.rearm_host(selected_host)
                     next_usage_capture = 0.0
                 except Exception as login_exc:
                     print(

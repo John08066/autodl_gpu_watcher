@@ -1,5 +1,65 @@
 # Version History / 版本迭代记录
 
+## v0.5.1 — 目录整理、状态机收口与登录/清理修复
+
+发布日期：2026-08-09
+
+### 目录整理
+
+- 根目录只保留 `START_HERE.cmd` 一个日常启动脚本。
+- `launcher/install/export/log/Edge cleanup` 等辅助脚本统一移动到 `tools/`。
+- 不再把空的 `runtime/` 打进发布包；所有版本继续共用项目同级 `autodl_watcher_runtime/`。
+- `README.md` 与 `CHANGELOG.md` 保持同级。
+
+### 修复：SQLite 历史状态导致假绿色
+
+- 完全取消 SQLite `current_instances` 对启动时本人占用状态的影响。
+- 每个新进程都从 `UNKNOWN` 开始，只接受本进程实时占用快照作为 ACTIVE/ABSENT 事实源。
+- 近期 evaluator 状态可以恢复连续采样，但恢复后无条件清除跨进程 `alerted` 锁。
+
+### 修复：启动/会话恢复后先确认本人状态
+
+- 本人占用状态未确认时，自动开机暂缓。
+- 首个完整占用快照确认本人不在后才允许开机，避免重复启动第二个实例。
+- 部分入口采集失败仍保持 UNKNOWN，不会误判 ACTIVE 或 ABSENT。
+
+### 修复：power_on 受理与真实开机分离
+
+- `request_accepted` 不再改变本人状态。
+- 新增 120 秒占用确认宽限期。
+- 宽限期内不重复发送开机请求。
+- 超时仍未看到本人实例时自动重新武装。
+- 请求未真正受理时清除本轮 evaluator 去重锁，允许后续重试。
+
+### 修复：被 K / 关机后的重新武装
+
+- 实时状态明确从 ACTIVE 变为 ABSENT 时立即执行 `rearm_host()`。
+- 旧数据库记录、旧 `alerted=True`、旧 request 状态均不能阻塞后续自动开机。
+
+### 修复：PC 人工登录验证码环境
+
+- 人工登录 profile 改名为全新的 `native_login_profile`，主动避开旧版可能污染的 `login_profile`。
+- 普通 Edge 登录前后都会等待专用 Edge 完全退出。
+- 自动清理 `Singleton*`、`lockfile`、`DevToolsActivePort` 等 profile 锁。
+- 检测到人工登录 Edge 带 `--no-sandbox` / `--headless` / `--remote-debugging-pipe` 时主动停止，而不是让用户继续在高风险环境里反复验证。
+
+### 修复：后台 Playwright profile 锁
+
+- `PlatformBrowserCollector.start()` 启动前主动释放 `browser_profile` 的残留 Edge/锁文件。
+- 保留 v0.5.0 的异常安全 Playwright 清理，避免首次启动失败后永久刷 `Sync API inside the asyncio loop`。
+
+### 修复：菜单 7
+
+- 删除 v0.5.0 `CLEAN_WATCHER_EDGE.cmd` 中错误的 CMD `^|` → PowerShell 管道转义。
+- 清理逻辑改为独立 `tools/clean_watcher_edge.ps1`。
+- PID 已提前退出时静默忽略；最后重新检查是否仍存在 watcher Edge。
+
+### 回归测试
+
+- 57 项单元测试通过；覆盖状态恢复、登录 profile 隔离、Playwright 启动失败清理、SQLite 部分快照、发布目录与菜单脚本。
+
+---
+
 ## v0.5.0 — 状态可信度与登录隔离重构
 
 发布日期：2026-08-09
