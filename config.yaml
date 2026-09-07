@@ -1,0 +1,108 @@
+# ═══════════════════════════════════════════════════════════════
+# AutoDL GPU Watcher — 配置文件
+# ═══════════════════════════════════════════════════════════════
+
+# ── 监控循环参数 ──
+# poll_seconds:       每轮循环间隔（秒）
+# confirmation_seconds: GPU 需连续达标多少秒后才触发（0=立即触发）
+# min_idle_samples:    最少需要的连续空闲采样数
+# max_sample_gap_seconds: 连续采样之间允许的最大时间间隔（超出则重置）
+# stale_after_seconds: 采样超过此秒数视为过期
+# reset_busy_samples:  连续忙碌多少次后重置告警状态
+monitor:
+  poll_seconds: 10
+  confirmation_seconds: 0
+  min_idle_samples: 1
+  max_sample_gap_seconds: 20
+  stale_after_seconds: 90
+  reset_busy_samples: 1
+
+# ── GPU 空闲判定阈值 ──
+# gpu_util_check_enabled: 是否启用 GPU Util 硬门控（false=仅记录）
+# gpu_util_max_pct:       GPU Util 上限（启用时生效）
+# memory_free_min_mb:     最低可用显存（MB）
+# memory_free_min_ratio:  最低可用显存比例（相对于总显存）
+# 最终门槛 = max(memory_free_min_mb, 总显存 x memory_free_min_ratio)
+idle_thresholds:
+  # GPU Util 只记录，不参与拦截。
+  gpu_util_check_enabled: false
+  gpu_util_max_pct: 100
+  # 可用显存 >= max(8192 MB, 总显存的 25%)。
+  memory_free_min_mb: 8192
+  memory_free_min_ratio: 0.25
+
+platform:
+  page_url: "https://private.autodl.com/console/machine"
+  api_path_contains: "/api/v2/machine/list"
+  api_base_url: "https://private.autodl.com"
+  browser_channel: "msedge"
+  user_data_dir: "../autodl_watcher_runtime/browser_profile"
+  headless: true
+  response_timeout_seconds: 20
+  # 同一物理主机可能有多个登录入口；取各入口 idle 的最大值，不相加。
+  # gpu.idle/gpu.total 表示平台视角下可分配 GPU ID 数/总 GPU ID 数。
+  # 直接 SSH 任务可能未被平台计入，所以最终仍以资源监控页的 GPU INDEX 显存为准。
+  aggregation: "max"
+
+telemetry:
+  endpoint: "https://watchgpu.vpms-lab.com/api/latest"
+  # 单次最多等 20 秒；第一次超时/断连/429/5xx 后，隔 2 秒重试一次。
+  timeout_seconds: 20
+  max_attempts: 2
+  retry_delay_seconds: 2
+  only_online: true
+
+auto_start:
+  enabled: true
+  # 不传 --host 时默认监控 203。默认 --entry auto，会按实时空位自动选择 203-1/203-2。
+  default_host: "gpu-203"
+  # 已验证 power_on 可用，默认进入真实开机模式；调试时可加 --dry-run。
+  dry_run: false
+  verify_before_start: true
+  recheck_delay_seconds: 1
+  post_start_check_seconds: 5
+  max_starts_per_event: 1
+  targets:
+    - host: "gpu-203"
+      machine_name: "autodl-203-1"
+      instance_uuid: "24a444b2d9-c69a6bf8"
+      start_mode: "gpu"
+      priority: 10
+      enabled: true
+    - host: "gpu-203"
+      machine_name: "autodl-203-2"
+      instance_uuid: "c40e4fac65-7a6997fa"
+      start_mode: "gpu"
+      priority: 20
+      enabled: true
+    - host: "gpu-202"
+      machine_name: "autodl-202-2"
+      instance_uuid: "3ed243ad9c-d028a55d"
+      start_mode: "gpu"
+      priority: 10
+      enabled: true
+    - host: "gpu-201"
+      machine_name: "autodl-201-1"
+      instance_uuid: "455740ad7e-6e39976d"
+      start_mode: "gpu"
+      priority: 10
+      enabled: true
+
+usage_tracking:
+  enabled: true
+  interval_seconds: 60
+  # 本人在“查看占用”弹窗中的用户标识；用于识别“已经成功开机”状态。
+  self_user: "何太急"
+  # SQLite 是实时写入的唯一事实源。WPS/Excel 打开 CSV 不会再阻塞监控。
+  database_path: "../autodl_watcher_runtime/usage/occupancy.db"
+  # python -m autodl_watcher.usage_report 每次导出到独立时间戳目录。
+  export_dir: "../autodl_watcher_runtime/usage/exports"
+
+notification:
+  console_enabled: true
+  email_enabled: false
+  subject_prefix: "[AutoDL 开机达标]"
+
+runtime:
+  state_file: "../autodl_watcher_runtime/state.json"
+  log_file: "../autodl_watcher_runtime/logs/watcher.log"

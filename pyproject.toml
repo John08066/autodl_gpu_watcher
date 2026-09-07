@@ -1,0 +1,22 @@
+# AutoDL GPU Watcher 项目配置
+# 构建系统：setuptools
+# Python 要求：>= 3.10
+# 依赖：PyYAML（配置解析）、python-dotenv（环境变量）、playwright（浏览器自动化）、requests（HTTP）
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autodl-gpu-watcher"
+version = "0.5.0"
+description = "AutoDL private-cloud GPU availability watcher"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=6.0,<7",
+  "python-dotenv>=1.0,<2",
+  "playwright>=1.45,<2",
+  "requests>=2.32,<3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

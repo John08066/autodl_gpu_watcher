@@ -1,0 +1,705 @@
+"""
+GPU 占用日志模块 — SQLite 数据库记录各入口的 GPU 占用情况。
+
+数据流：
+    PlatformBrowserCollector.collect_occupancy()
+        → parse_occupancy_cells() → OccupancyRecord
+        → UsageSqliteLogger.record()
+            → entry_snapshots 表（原始每行数据）
+            → instance_snapshots 表（按 instance_id 去重后的数据）
+            → gpu_snapshots 表（每张物理 GPU 的并发占用统计）
+            → occupancy_events 表（实例开始/结束事件）
+            → current_instances 表（当前活跃的实例快照）
+
+设计原则：
+    - SQLite 是唯一的事实源，CSV 只是导出产物
+    - Windows 上使用 WAL 模式和 busy_timeout 避免文件锁定
+    - 每次 record() 后立即关闭数据库连接，释放文件句柄
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from collections import defaultdict
+from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterable, Iterator
+
+from .models import OccupancyRecord
+
+
+ENTRY_FIELDS = (
+    "observed_at",
+    "host",
+    "machine_name",
+    "gpu_index",
+    "gpu_uuid",
+    "gpu_name",
+    "occupied",
+    "instance_id",
+    "user",
+    "started_at",
+)
+
+EVENT_FIELDS = (
+    "event_time",
+    "event",
+    "host",
+    "machine_name",
+    "gpu_index",
+    "gpu_name",
+    "user",
+    "instance_id",
+    "started_at",
+    "ended_at",
+    "duration_seconds",
+)
+
+
+def _parse_started_at(text: str) -> datetime | None:
+    """功能：
+        解析 AutoDL 页面上的"启动时间"字符串。
+
+    参数：
+        text (str)：待解析或转换的文本。
+
+    返回：
+        datetime | None：解析成功的 datetime；空值或无效值返回 `None`。
+
+    补充说明：
+        支持多种格式：
+            - "2026-07-20 18:29:58"
+            - "2026/07/20 18:29:58"
+            - ISO 格式
+    """
+    value = text.strip()
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _duration_seconds(started_at: str, fallback: str, ended_at: datetime) -> int:
+    """功能：
+        计算从 started_at 到 ended_at 的持续秒数。
+
+    参数：
+        started_at (str)：平台记录的实例占用开始时间字符串。
+        fallback (str)：主时间字段不可用时采用的备用时间字符串。
+        ended_at (datetime)：占用结束或当前统计截止时间。
+
+    返回：
+        int：起止时间之间的非负秒数。
+
+    补充说明：
+        如果 started_at 无法解析，使用 fallback（first_seen_at）作为后备。
+    """
+    start = _parse_started_at(started_at)
+    if start is None:
+        try:
+            start = datetime.fromisoformat(fallback)
+        except (TypeError, ValueError):
+            return 0
+    return max(0, int((ended_at - start).total_seconds()))
+
+
+def merge_duplicate_instances(records: list[OccupancyRecord]) -> list[OccupancyRecord]:
+    """功能：
+        按 (host, instance_id) 去重，保留同一实例的最新记录。
+
+    参数：
+        records (list[OccupancyRecord])：一轮或多轮 GPU 占用记录列表。
+
+    返回：
+        list[OccupancyRecord]：按 `(host, instance_id)` 去重后的实例占用列表。
+
+    补充说明：
+        不同 AutoDL 入口可能暴露同一张物理 GPU INDEX，并报告不同的 instance_id/user。
+        这些是不同的分配，必须全部保留。
+
+        去重规则：
+            - 仅对 occupied=True 且 instance_id 非空的记录去重
+            - 去重键为 (host, instance_id)
+            - 同键的多条记录取 observed_at 最新的那条
+            - machine_name 合并为 "entry1|entry2" 形式
+    """
+
+    grouped: dict[tuple[str, str], list[OccupancyRecord]] = defaultdict(list)
+    for item in records:
+        if not item.occupied or not item.instance_id:
+            continue
+        grouped[(item.host, item.instance_id)].append(item)
+
+    merged: list[OccupancyRecord] = []
+    for (_host, _instance_id), items in sorted(grouped.items()):
+        chosen = max(items, key=lambda item: item.observed_at)
+        source_entries = "|".join(sorted({item.machine_name for item in items}))
+        merged.append(
+            OccupancyRecord(
+                observed_at=max(item.observed_at for item in items),
+                host=chosen.host,
+                machine_name=source_entries,
+                gpu_index=chosen.gpu_index,
+                gpu_uuid=chosen.gpu_uuid,
+                gpu_name=chosen.gpu_name,
+                occupied=True,
+                instance_id=chosen.instance_id,
+                user=chosen.user,
+                started_at_text=chosen.started_at_text,
+            )
+        )
+    return merged
+
+
+def aggregate_gpu_occupants(records: list[OccupancyRecord]) -> list[dict[str, Any]]:
+    """功能：
+        统计每张物理 GPU INDEX 上的并发占用情况。
+
+    参数：
+        records (list[OccupancyRecord])：一轮或多轮 GPU 占用记录列表。
+
+    返回：
+        list[dict[str, Any]]：按物理 GPU INDEX 聚合的并发用户统计行。
+
+    补充说明：
+        与旧实现不同：不选择"胜者"。
+        一张物理 GPU 上可能有多个平台实例/用户同时运行，
+        尤其是当两个 AutoDL 入口对应同一张物理 INDEX 时。
+
+        返回每张 GPU 的：
+            - occupant_count: 并发占用数
+            - active_users: 活跃用户列表（JSON）
+            - active_instance_ids: 活跃实例 ID 列表（JSON）
+            - active_entries: 对应的入口名列表（JSON）
+    """
+
+    instances = merge_duplicate_instances(records)
+    all_gpu_rows: dict[tuple[str, int], list[OccupancyRecord]] = defaultdict(list)
+    metadata: dict[tuple[str, int], OccupancyRecord] = {}
+
+    for item in records:
+        key = (item.host, item.gpu_index)
+        metadata[key] = max(
+            (metadata.get(key), item),
+            key=lambda value: value.observed_at if value is not None else datetime.min,
+        )
+    for item in instances:
+        all_gpu_rows[(item.host, item.gpu_index)].append(item)
+
+    result: list[dict[str, Any]] = []
+    for key in sorted(metadata):
+        host, gpu_index = key
+        meta = metadata[key]
+        occupants = sorted(
+            all_gpu_rows.get(key, []),
+            key=lambda item: (item.user, item.instance_id, item.machine_name),
+        )
+        result.append(
+            {
+                "observed_at": max(
+                    [meta.observed_at, *(item.observed_at for item in occupants)]
+                ).isoformat(timespec="seconds"),
+                "host": host,
+                "gpu_index": gpu_index,
+                "gpu_uuid": meta.gpu_uuid,
+                "gpu_name": meta.gpu_name,
+                "occupant_count": len(occupants),
+                "active_users": json.dumps(
+                    sorted({item.user for item in occupants if item.user}),
+                    ensure_ascii=False,
+                ),
+                "active_instance_ids": json.dumps(
+                    sorted({item.instance_id for item in occupants if item.instance_id}),
+                    ensure_ascii=False,
+                ),
+                "active_entries": json.dumps(
+                    sorted(
+                        {
+                            entry
+                            for item in occupants
+                            for entry in item.machine_name.split("|")
+                            if entry
+                        }
+                    ),
+                    ensure_ascii=False,
+                ),
+            }
+        )
+    return result
+
+
+class UsageSqliteLogger:
+    """SQLite 占用日志记录器。
+
+    SQLite 是唯一的事实源（source of truth）。CSV 只是导出产物，
+    因此 WPS/Excel 打开 CSV 不会阻塞实时监控。
+
+    数据库包含 5 张表：
+        - entry_snapshots:  原始每行数据（来自页面弹窗）
+        - instance_snapshots: 按 instance_id 去重后的实例数据
+        - gpu_snapshots:    每张物理 GPU 的并发占用统计
+        - occupancy_events: 实例开始/结束事件
+        - current_instances: 当前活跃的实例（用于计算事件）
+    """
+
+    def __init__(self, database_path: Path) -> None:
+        """功能：
+            初始化 SQLite 占用日志器，创建父目录并建立所需数据表。
+
+        参数：
+            database_path (Path)：SQLite 占用数据库文件路径。
+
+        返回：
+            None：函数通过副作用完成初始化、输出、持久化或资源管理。
+        """
+        self.database_path = database_path
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        """功能：
+            创建并配置一个 SQLite 连接。
+
+        参数：
+            无。
+
+        返回：
+            sqlite3.Connection：已配置 WAL、超时和行工厂的 SQLite Connection。
+
+        补充说明：
+            WAL 模式：允许并发读，提升写入性能。
+            busy_timeout=30000：等待 30 秒而非立即失败。
+        """
+        connection = sqlite3.connect(self.database_path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA busy_timeout=30000")
+        return connection
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """功能：
+            上下文管理器：确保数据库连接在使用后关闭。
+
+        参数：
+            无。
+
+        返回：
+            Iterator[sqlite3.Connection]：上下文管理器迭代产出的 SQLite Connection。
+
+        补充说明：
+            Windows 上 sqlite3.Connection 作为上下文管理器只会 commit/rollback
+            而不会关闭连接，这会导致文件句柄泄漏和 TemporaryDirectory 清理失败。
+            因此我们在 finally 中显式调用 close()。
+        """
+
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def _init_schema(self) -> None:
+        """功能：
+            创建占用快照、实例状态、GPU 并发和上下机事件等 SQLite 表与索引。
+
+        参数：
+            无。
+
+        返回：
+            None：无返回值。
+        """
+        with self._connection() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS entry_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    capture_id TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    machine_name TEXT NOT NULL,
+                    gpu_index INTEGER NOT NULL,
+                    gpu_uuid TEXT NOT NULL,
+                    gpu_name TEXT NOT NULL,
+                    occupied INTEGER NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    user TEXT NOT NULL,
+                    started_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_entry_snapshots_capture
+                    ON entry_snapshots(capture_id);
+                CREATE INDEX IF NOT EXISTS idx_entry_snapshots_user
+                    ON entry_snapshots(user, observed_at);
+
+                CREATE TABLE IF NOT EXISTS instance_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    capture_id TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    machine_name TEXT NOT NULL,
+                    gpu_index INTEGER NOT NULL,
+                    gpu_uuid TEXT NOT NULL,
+                    gpu_name TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    user TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    UNIQUE(capture_id, host, instance_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_instance_snapshots_instance
+                    ON instance_snapshots(host, instance_id, observed_at);
+                CREATE INDEX IF NOT EXISTS idx_instance_snapshots_gpu
+                    ON instance_snapshots(host, gpu_index, observed_at);
+
+                CREATE TABLE IF NOT EXISTS gpu_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    capture_id TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    gpu_index INTEGER NOT NULL,
+                    gpu_uuid TEXT NOT NULL,
+                    gpu_name TEXT NOT NULL,
+                    occupant_count INTEGER NOT NULL,
+                    active_users TEXT NOT NULL,
+                    active_instance_ids TEXT NOT NULL,
+                    active_entries TEXT NOT NULL,
+                    UNIQUE(capture_id, host, gpu_index)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_gpu_snapshots_gpu
+                    ON gpu_snapshots(host, gpu_index, observed_at);
+
+                CREATE TABLE IF NOT EXISTS occupancy_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_time TEXT NOT NULL,
+                    event TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    machine_name TEXT NOT NULL,
+                    gpu_index INTEGER NOT NULL,
+                    gpu_name TEXT NOT NULL,
+                    user TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT NOT NULL,
+                    duration_seconds INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS current_instances (
+                    state_key TEXT PRIMARY KEY,
+                    host TEXT NOT NULL,
+                    machine_name TEXT NOT NULL,
+                    gpu_index INTEGER NOT NULL,
+                    gpu_name TEXT NOT NULL,
+                    user TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL
+                );
+                """
+            )
+
+    @staticmethod
+    def _capture_id(records: list[OccupancyRecord]) -> tuple[str, datetime]:
+        """功能：
+            根据一批占用记录生成本轮采集批次 ID 和统一采集时间。
+
+        参数：
+            records (list[OccupancyRecord])：同一次采集获得的全部入口占用记录；可为空列表。
+
+        返回：
+            tuple[str, datetime]：二元组：批次 ID 与该批次统一 observed_at。
+        """
+        observed_at = max(item.observed_at for item in records)
+        # Microseconds make consecutive captures unique without external UUIDs.
+        return observed_at.isoformat(timespec="microseconds"), observed_at
+
+    def record(
+        self,
+        records: list[OccupancyRecord],
+        *,
+        complete_snapshot: bool = True,
+        snapshot_hosts: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """功能：
+            将一轮所有入口的占用事实写入 SQLite，并根据实例变化生成上下机事件。
+
+        参数：
+            records (list[OccupancyRecord])：一轮或多轮 GPU 占用记录列表。
+            complete_snapshot (bool)：本轮目标入口是否全部采集成功。False 时只写快照，
+                不更新 current_instances，也不生成 END_SEEN。
+            snapshot_hosts (set[str] | None)：完整快照覆盖的物理主机范围。
+
+        返回：
+            list[dict[str, Any]]：本轮新增的 start、switch 或 end 事件字典列表。
+        """
+        if not records:
+            # 没有原始行时无法生成快照时间。主流程正常情况下每个 GPU 都会有一行，
+            # 因此这里保持无操作；“完整/不完整”判定由调用方负责。
+            return []
+
+        capture_id, capture_at = self._capture_id(records)
+        instance_records = merge_duplicate_instances(records)
+        gpu_rows = aggregate_gpu_occupants(records)
+        events: list[dict[str, Any]] = []
+
+        with self._connection() as conn:
+            conn.executemany(
+                """
+                INSERT INTO entry_snapshots (
+                    capture_id, observed_at, host, machine_name, gpu_index,
+                    gpu_uuid, gpu_name, occupied, instance_id, user, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        capture_id,
+                        item.observed_at.isoformat(timespec="seconds"),
+                        item.host,
+                        item.machine_name,
+                        item.gpu_index,
+                        item.gpu_uuid,
+                        item.gpu_name,
+                        int(item.occupied),
+                        item.instance_id,
+                        item.user,
+                        item.started_at_text,
+                    )
+                    for item in records
+                ],
+            )
+
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO instance_snapshots (
+                    capture_id, observed_at, host, machine_name, gpu_index,
+                    gpu_uuid, gpu_name, instance_id, user, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        capture_id,
+                        item.observed_at.isoformat(timespec="seconds"),
+                        item.host,
+                        item.machine_name,
+                        item.gpu_index,
+                        item.gpu_uuid,
+                        item.gpu_name,
+                        item.instance_id,
+                        item.user,
+                        item.started_at_text,
+                    )
+                    for item in instance_records
+                ],
+            )
+
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO gpu_snapshots (
+                    capture_id, observed_at, host, gpu_index, gpu_uuid, gpu_name,
+                    occupant_count, active_users, active_instance_ids, active_entries
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        capture_id,
+                        row["observed_at"],
+                        row["host"],
+                        row["gpu_index"],
+                        row["gpu_uuid"],
+                        row["gpu_name"],
+                        row["occupant_count"],
+                        row["active_users"],
+                        row["active_instance_ids"],
+                        row["active_entries"],
+                    )
+                    for row in gpu_rows
+                ],
+            )
+
+            # v0.5.0：部分入口采集失败时，只记录“看见了什么”，绝不据此推断
+            # “没看见的实例已经结束”。旧版会在部分失败时制造伪 END_SEEN，
+            # 并污染 current_instances。
+            if not complete_snapshot:
+                return []
+
+            scoped_hosts = set(snapshot_hosts or {item.host for item in records})
+            if not scoped_hosts:
+                return []
+            placeholders = ",".join("?" for _ in scoped_hosts)
+            previous_rows = conn.execute(
+                f"SELECT * FROM current_instances WHERE host IN ({placeholders})",
+                tuple(sorted(scoped_hosts)),
+            ).fetchall()
+            previous = {str(row["state_key"]): dict(row) for row in previous_rows}
+            current: dict[str, OccupancyRecord] = {
+                f"{item.host}|{item.instance_id}": item
+                for item in instance_records
+                if item.host in scoped_hosts
+            }
+            now_text = capture_at.isoformat(timespec="seconds")
+
+            for key, item in current.items():
+                prior = previous.get(key)
+                signature_changed = bool(
+                    prior
+                    and (
+                        prior["user"] != item.user
+                        or int(prior["gpu_index"]) != item.gpu_index
+                        or prior["machine_name"] != item.machine_name
+                    )
+                )
+
+                if prior is None or signature_changed:
+                    if signature_changed and prior is not None:
+                        end_event = {
+                            "event_time": now_text,
+                            "event": "END_SEEN",
+                            "host": prior["host"],
+                            "machine_name": prior["machine_name"],
+                            "gpu_index": int(prior["gpu_index"]),
+                            "gpu_name": prior["gpu_name"],
+                            "user": prior["user"],
+                            "instance_id": prior["instance_id"],
+                            "started_at": prior["started_at"],
+                            "ended_at": now_text,
+                            "duration_seconds": _duration_seconds(
+                                prior["started_at"], prior["first_seen_at"], capture_at
+                            ),
+                        }
+                        events.append(end_event)
+                    events.append(
+                        {
+                            "event_time": now_text,
+                            "event": "ACTIVE_SEEN",
+                            "host": item.host,
+                            "machine_name": item.machine_name,
+                            "gpu_index": item.gpu_index,
+                            "gpu_name": item.gpu_name,
+                            "user": item.user,
+                            "instance_id": item.instance_id,
+                            "started_at": item.started_at_text,
+                            "ended_at": "",
+                            "duration_seconds": 0,
+                        }
+                    )
+
+                first_seen_at = (
+                    prior["first_seen_at"]
+                    if prior is not None and not signature_changed
+                    else now_text
+                )
+                conn.execute(
+                    """
+                    INSERT INTO current_instances (
+                        state_key, host, machine_name, gpu_index, gpu_name, user,
+                        instance_id, started_at, first_seen_at, last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(state_key) DO UPDATE SET
+                        host=excluded.host,
+                        machine_name=excluded.machine_name,
+                        gpu_index=excluded.gpu_index,
+                        gpu_name=excluded.gpu_name,
+                        user=excluded.user,
+                        instance_id=excluded.instance_id,
+                        started_at=excluded.started_at,
+                        first_seen_at=excluded.first_seen_at,
+                        last_seen_at=excluded.last_seen_at
+                    """,
+                    (
+                        key,
+                        item.host,
+                        item.machine_name,
+                        item.gpu_index,
+                        item.gpu_name,
+                        item.user,
+                        item.instance_id,
+                        item.started_at_text,
+                        first_seen_at,
+                        now_text,
+                    ),
+                )
+
+            ended_keys = sorted(set(previous) - set(current))
+            for key in ended_keys:
+                prior = previous[key]
+                events.append(
+                    {
+                        "event_time": now_text,
+                        "event": "END_SEEN",
+                        "host": prior["host"],
+                        "machine_name": prior["machine_name"],
+                        "gpu_index": int(prior["gpu_index"]),
+                        "gpu_name": prior["gpu_name"],
+                        "user": prior["user"],
+                        "instance_id": prior["instance_id"],
+                        "started_at": prior["started_at"],
+                        "ended_at": now_text,
+                        "duration_seconds": _duration_seconds(
+                            prior["started_at"], prior["first_seen_at"], capture_at
+                        ),
+                    }
+                )
+                conn.execute("DELETE FROM current_instances WHERE state_key = ?", (key,))
+
+            if events:
+                conn.executemany(
+                    """
+                    INSERT INTO occupancy_events (
+                        event_time, event, host, machine_name, gpu_index, gpu_name,
+                        user, instance_id, started_at, ended_at, duration_seconds
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        tuple(event[field] for field in EVENT_FIELDS)
+                        for event in events
+                    ],
+                )
+
+        return events
+
+    def current_instances(self) -> list[dict[str, Any]]:
+        """功能：
+            读取数据库中当前仍处于占用状态的实例快照。
+
+        参数：
+            无。
+
+        返回：
+            list[dict[str, Any]]：当前活跃实例的字典列表。
+        """
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM current_instances ORDER BY host, gpu_index, user, instance_id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+
+# Compatibility aliases for older imports/tests.
+def merge_occupancy_records(records: list[OccupancyRecord]) -> list[OccupancyRecord]:
+    """功能：
+        兼容旧调用名称，将相同实例的重复入口记录合并。
+
+    参数：
+        records (list[OccupancyRecord])：一轮或多轮 GPU 占用记录列表。
+
+    返回：
+        list[OccupancyRecord]：按实例去重后的 OccupancyRecord 列表。
+    """
+    return merge_duplicate_instances(records)
+
+
+UsageCsvLogger = UsageSqliteLogger
