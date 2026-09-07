@@ -1,4 +1,4 @@
-# AutoDL GPU Watcher v0.5.2
+# AutoDL GPU Watcher v0.5.3
 
 用于实验室 AutoDL 私有云 GPU 资源监控、占用统计和满足条件后的自动开机。
 
@@ -7,7 +7,7 @@
 根目录只保留日常会直接接触的文件；辅助启动脚本统一放进 `tools/`：
 
 ```text
-autodl_gpu_watcher_v0.5.2/
+autodl_gpu_watcher_v0.5.3/
 ├─ src/                  Python 主代码
 ├─ tests/                单元测试
 ├─ tools/                一键菜单使用的辅助脚本
@@ -51,7 +51,7 @@ START_HERE.cmd
 
 以后通常直接按 `2` 或 `3`。
 
-## v0.5.2 关键修复
+## v0.5.3 关键修复
 
 
 ### 0. 修复“已登录却反复判定登录失效”
@@ -59,7 +59,7 @@ START_HERE.cmd
 v0.5.1 把“20 秒内没有捕获到 `/api/v2/machine/list` 响应”直接当成登录失效。
 这会在 AutoDL 页面/API 很慢时反复弹登录窗口。
 
-v0.5.2 改为明确区分：
+v0.5.3 改为明确区分：
 
 ```text
 /login 或 HTTP 401/403
@@ -268,6 +268,6 @@ Ctrl+C
 python -m unittest discover -s tests -v
 ```
 
-v0.5.2 发布前回归测试：61 项通过。
+v0.5.3 发布前回归测试：63 项通过。
 
 完整版本变化见同级 [`CHANGELOG.md`](CHANGELOG.md)。
