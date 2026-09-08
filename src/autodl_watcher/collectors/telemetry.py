@@ -57,16 +57,6 @@ def filter_samples_to_platform_candidates(
     no_slot = tuple(sorted(visible - candidates))  # 区分平台可见但没空位，与平台根本不可见这两种排除原因。
     unauthorized = tuple(sorted({sample.host for sample in samples if sample.host not in visible}))
     return accepted, no_slot, unauthorized
-
-
-def filter_samples_to_authorized_hosts(
-    samples: list[GpuSample],
-    platform_hosts: list[PlatformHost],
-) -> tuple[list[GpuSample], tuple[str, ...]]:  # 向后兼容的封装。新代码请直接使用 filter_samples_to_platform_candidates。
-    accepted, _no_slot, unauthorized = filter_samples_to_platform_candidates( samples, platform_hosts )
-    return accepted, unauthorized
-
-
 class TelemetryApiCollector:  # Telemetry API 采集器 — 通过 HTTP GET 拉取物理 GPU 实时数据。
 
     def __init__(self, config: TelemetryConfig) -> None:  # 初始化 Telemetry API 采集器和可复用的 HTTP 会话。

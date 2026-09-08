@@ -49,11 +49,3 @@ def select_cli_targets(
     return tuple(
         sorted( candidates, key=lambda item: (item.priority, item.machine_name, item.instance_uuid), )
     )
-
-
-def select_cli_target(
-    config: AutoStartConfig,
-    host: str,
-    machine_name: str | None = None,
-) -> AutoStartTarget:  # select_cli_targets 的便捷封装，只返回第一个结果。
-    return select_cli_targets(config, host, machine_name)[0]

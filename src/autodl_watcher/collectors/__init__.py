@@ -6,7 +6,6 @@ from .platform import (  # 数据采集器 — 从两个数据源采集原始数
 )
 from .telemetry import (
     TelemetryApiCollector,
-    filter_samples_to_authorized_hosts,
     filter_samples_to_platform_candidates,
     parse_telemetry_payload,
 )
@@ -16,7 +15,6 @@ __all__ = [
     "PlatformBrowserCollector",
     "PlatformTransientError",
     "TelemetryApiCollector",
-    "filter_samples_to_authorized_hosts",
     "filter_samples_to_platform_candidates",
     "parse_platform_payload",
     "parse_telemetry_payload",

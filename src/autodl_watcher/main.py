@@ -468,9 +468,9 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                 selected_gpu_samples = [
                     item for item in all_gpu_samples if item.host == selected_host
                 ]
-                gpu_samples, _blocked_hosts, _unauthorized_hosts = (  # 1c. 两层门控过滤：平台 free>0 + 已在平台可见 → 才进入评估
-                    filter_samples_to_platform_candidates( selected_gpu_samples, platform_hosts, )
-                )
+                gpu_samples = filter_samples_to_platform_candidates(  # 1c. 平台有入口空位且当前账号可见的物理 GPU 才进入评估。
+                    selected_gpu_samples, platform_hosts,
+                )[0]
 
                 now = datetime.now()
                 trigger_events = evaluator.evaluate(platform_hosts, gpu_samples, now)  # evaluator 内部维护 idle_samples 队列，判断哪些 GPU 已连续达标
