@@ -17,16 +17,16 @@ class _GpuRuntime:  # 每张 GPU 的运行时状态。
 
 
 def required_free_memory_mb(sample: GpuSample, thresholds: IdleThresholds) -> int:  # 计算该 GPU 需要的最低可用显存。
-    ratio_requirement = int(sample.memory_total_mb * thresholds.memory_free_min_ratio)
+    ratio_requirement = int(sample.memory_total_mb * thresholds.memory_free_min_ratio)  # 按该卡总显存计算比例门槛，随后与固定 MB 门槛取更严格者。
     return max(thresholds.memory_free_min_mb, ratio_requirement)
 
 
 def sample_meets_capacity(sample: GpuSample, thresholds: IdleThresholds) -> bool:  # 判断一张 GPU 当前快照是否满足显存容量条件。
 
-    memory_ok = sample.memory_free_mb >= required_free_memory_mb(sample, thresholds)
+    memory_ok = sample.memory_free_mb >= required_free_memory_mb(sample, thresholds)  # 显存判定使用剩余量，而不是利用率或已用显存。
     if not memory_ok:
         return False
-    if thresholds.gpu_util_check_enabled:
+    if thresholds.gpu_util_check_enabled:  # GPU Util 只有显式开启硬门槛时才参与阻止开机。
         return sample.util_pct <= thresholds.gpu_util_max_pct
     return True
 
@@ -41,18 +41,18 @@ class AvailabilityEvaluator:  # 容量评估器 — 结合平台 GPU ID 空位�
         )
 
     def _record(self, sample: GpuSample) -> None:  # 记录一条 GPU 采样到运行时状态中。
-        key = (sample.host, sample.gpu_index)
-        runtime = self._runtime[key]
+        key = (sample.host, sample.gpu_index)  # 以物理主机和 GPU INDEX 联合标识一张卡，不能只用入口名或索引。
+        runtime = self._runtime[key]  # 首次遇到该卡时 defaultdict 自动创建空队列和未告警状态。
 
         if sample_meets_capacity(sample, self.thresholds):
             if runtime.idle_samples:  # 满足条件 → 追加到空闲队列
                 gap = (sample.observed_at - runtime.idle_samples[-1].observed_at).total_seconds()
                 if gap > self.monitor.max_sample_gap_seconds:
                     runtime.idle_samples.clear()  # 间隔过大 → 重置（说明中间有数据缺失）
-            runtime.idle_samples.append(sample)
+            runtime.idle_samples.append(sample)  # 保存达标样本的时间信息，后续同时检查样本数与持续时间。
             while len(runtime.idle_samples) > max(self.monitor.min_idle_samples + 2, 8):  # 限制队列长度，避免内存无限增长
                 runtime.idle_samples.popleft()
-            runtime.consecutive_busy = 0
+            runtime.consecutive_busy = 0  # 新的达标状态或显式重新武装会清除连续忙碌计数。
         else:
             runtime.idle_samples.clear()  # 不满足条件 → 清空空闲记录
             runtime.consecutive_busy += 1
@@ -60,18 +60,18 @@ class AvailabilityEvaluator:  # 容量评估器 — 结合平台 GPU ID 空位�
                 runtime.alerted = False  # 连续忙碌足够多次 → 重置告警状态，允许再次触发
 
     def _confirmed(self, sample: GpuSample, now: datetime) -> ConfirmedGpu | None:  # 检查一张 GPU 是否已确认连续满足容量条件。
-        key = (sample.host, sample.gpu_index)
-        runtime = self._runtime[key]
+        key = (sample.host, sample.gpu_index)  # 以物理主机和 GPU INDEX 联合标识一张卡，不能只用入口名或索引。
+        runtime = self._runtime[key]  # 首次遇到该卡时 defaultdict 自动创建空队列和未告警状态。
 
-        age = (now - sample.observed_at).total_seconds()
+        age = (now - sample.observed_at).total_seconds()  # 比较采样时间与当前本地时间，拒绝陈旧或明显来自未来的数据。
         if age < -5 or age > self.monitor.stale_after_seconds:
             return None
-        if len(runtime.idle_samples) < self.monitor.min_idle_samples:
+        if len(runtime.idle_samples) < self.monitor.min_idle_samples:  # 即使显存达标，也必须积累足够多的连续采样。
             return None
 
         first = runtime.idle_samples[0]
         last = runtime.idle_samples[-1]
-        available_seconds = int((last.observed_at - first.observed_at).total_seconds())
+        available_seconds = int((last.observed_at - first.observed_at).total_seconds())  # 持续时间来自队列两端的采样时间差，不是轮数乘设定间隔。
         if available_seconds < self.monitor.confirmation_seconds:
             return None
 
@@ -92,8 +92,8 @@ class AvailabilityEvaluator:  # 容量评估器 — 结合平台 GPU ID 空位�
         gpu_samples: list[GpuSample],
         now: datetime,
     ) -> list[AvailabilityAlert]:  # 评估当前所有 GPU 的状态，生成开机事件列表。
-        platform_by_host = {item.host: item for item in platform_hosts}
-        latest_by_gpu: dict[tuple[str, int], GpuSample] = {}
+        platform_by_host = {item.host: item for item in platform_hosts}  # 把平台的可分配数量索引到物理主机，供后面与显存条件交叉核对。
+        latest_by_gpu: dict[tuple[str, int], GpuSample] = {}  # 本轮每张卡保留最后遇到的样本；并不在此按时间重新排序。
 
         for sample in gpu_samples:  # Step 1: 记录所有采样
             self._record(sample)
@@ -123,7 +123,7 @@ class AvailabilityEvaluator:  # 容量评估器 — 结合平台 GPU ID 空位�
             if not unalerted:
                 continue
 
-            actionable_count = len(unalerted)
+            actionable_count = len(unalerted)  # 记录本次新达标的卡数；它不是要启动的实例数量。
             if actionable_count <= 0:
                 continue
 
@@ -151,14 +151,14 @@ class AvailabilityEvaluator:  # 容量评估器 — 结合平台 GPU ID 空位�
                 continue
             if runtime.alerted:
                 reset_count += 1
-            runtime.alerted = False
-            runtime.consecutive_busy = 0
+            runtime.alerted = False  # 只解除该卡的告警去重，不删除已有的连续采样队列。
+            runtime.consecutive_busy = 0  # 新的达标状态或显式重新武装会清除连续忙碌计数。
         return reset_count
 
     def export_state(self) -> dict[str, Any]:  # 将运行时状态导出为可序列化的字典（用于 state.json 持久化）。
         result: dict[str, Any] = {}
         for (host, gpu_index), runtime in self._runtime.items():
-            result[f"{host}|{gpu_index}"] = {
+            result[f"{host}|{gpu_index}"] = {  # JSON 的键必须是字符串，因此把联合键编码为 host|index。
                 "consecutive_busy": runtime.consecutive_busy,
                 "alerted": runtime.alerted,
                 "idle_samples": [
@@ -169,7 +169,7 @@ class AvailabilityEvaluator:  # 容量评估器 — 结合平台 GPU ID 空位�
                         "util_pct": sample.util_pct,
                         "memory_used_mb": sample.memory_used_mb,
                         "memory_total_mb": sample.memory_total_mb,
-                        "observed_at": sample.observed_at.isoformat(),
+                        "observed_at": sample.observed_at.isoformat(),  # datetime 转为 ISO 文本后才能直接序列化为 JSON。
                     }
                     for sample in runtime.idle_samples
                 ],
@@ -179,7 +179,7 @@ class AvailabilityEvaluator:  # 容量评估器 — 结合平台 GPU ID 空位�
     def import_state(self, state: dict[str, Any]) -> None:  # 从字典恢复运行时状态（进程重启后恢复连续采样上下文）。
         for key, raw in state.items():
             try:
-                host, gpu_index_text = key.rsplit("|", 1)
+                host, gpu_index_text = key.rsplit("|", 1)  # 恢复持久化联合键，并在创建运行状态时把索引转回整数。
                 runtime = _GpuRuntime(
                     idle_samples=deque(
                         GpuSample(

@@ -1,10 +1,12 @@
-# AutoDL GPU Watcher v0.6
+# AutoDL GPU Watcher v0.6.1
 
 用于实验室 AutoDL 私有云 GPU 资源监控、占用统计和满足条件后的自动开机。
 
 ## v0.6 桌面界面
 
-在 Git 仓库目录双击 `START_HERE.cmd`，默认打开桌面 UI。启动器优先加载本仓库的 `src/`，避免误用旧版本的可编辑安装。
+在 Git 仓库目录双击 **`START_HERE.vbs`**，只打开桌面 UI，不显示额外 CMD/PowerShell 黑框。刷新、监控、登录和导出任务的输出仍显示在主界面底部日志区。启动失败会弹出错误提示，详细信息保存在 `.ui/startup.log`。
+
+`START_HERE.cmd` 默认转交无控制台入口并退出，但双击 CMD 本身仍可能瞬间闪出终端，因此日常请使用 `.vbs`。`START_HERE.cmd --cli` 保留需要终端交互的旧菜单。启动器仍优先加载本仓库的 `src/`。
 
 1. 点击“刷新服务器”，获取当前 AutoDL 账号的实际入口和空闲 GPU ID。尚未刷新时仅显示配置中的入口，不代表当前在线。
 2. 登录失效时点击“登录 / 更新会话”，在 Edge 完成验证码登录并关闭登录窗口，再点击“已登录并关闭浏览器”，随后重新刷新。
@@ -42,7 +44,8 @@ autodl_gpu_watcher_git/
 ├─ src/                  Python 主代码
 ├─ tests/                单元测试
 ├─ tools/                一键菜单使用的辅助脚本
-├─ START_HERE.cmd        桌面 UI 入口；--cli 打开旧菜单
+├─ START_HERE.vbs        日常双击入口，无额外控制台窗口
+├─ START_HERE.cmd        兼容入口；--cli 打开旧菜单
 ├─ README.md             使用说明
 ├─ CHANGELOG.md          版本迭代记录
 ├─ config.yaml           配置文件
@@ -55,7 +58,7 @@ autodl_gpu_watcher_git/
 正常使用时只需要双击：
 
 ```text
-START_HERE.cmd
+START_HERE.vbs
 ```
 
 ## 兼容命令行菜单（START_HERE.cmd --cli）
@@ -349,6 +352,10 @@ Ctrl+C
 会话过期时，主程序会停止后台 Playwright并弹出普通 Edge；完成验证码和登录后按 Enter，原监控进程继续运行。
 
 ## 测试
+
+v0.6.1：合并原误标为 0.61 的无控制台启动更新与代码注释更新，保留用户调整的 `1000x800` 窗口尺寸。无控制台功能此前通过 88 项测试及实际服务器刷新、底部日志和只读监控启停验证。
+
+阅读源码时可按以下顺序理解：`tools/gui_entry.py` 启动窗口 → `gui.py` 读取设置并管理后台进程 → `main.py` 加载配置、组织每轮监控 → `collectors/platform.py` 与 `collectors/telemetry.py` 分别采集平台空位和物理 GPU 数据 → `evaluator.py` 判断连续达标 → `autostart.py` 复核并请求开机。占用详情同时交给 `usage.py` 记录，`usage_report.py` 导出统计，`state_store.py` 保存连续采样状态。各模块的关键状态、时间基准和数据含义已补充中文行尾注释。
 
 ```powershell
 python -m unittest discover -s tests -v

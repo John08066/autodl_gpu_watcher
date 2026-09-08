@@ -12,7 +12,7 @@ class PlatformHost:  # AutoDL 平台视角的一台物理主机。
     source_names: tuple[str, ...] = ()                          # 所有入口名
     source_slots: tuple[tuple[str, int, int], ...] = ()         # 各入口 (name, idle, total)
 
-    def __post_init__(self) -> None:  # 校验平台主机统计字段，并将入口列表规范化为不可变元组。
+    def __post_init__(self) -> None:  # 构造后检查平台计数范围；入口元组由采集器组装。
         if self.free_count < 0 or self.total_count <= 0:
             raise ValueError("GPU count must be non-negative and total_count > 0")
         if self.free_count > self.total_count:
@@ -37,7 +37,7 @@ class GpuSample:  # Telemetry API 回报的一张物理 GPU 的实时快照（�
 
     @property
     def memory_free_mb(self) -> int:  # 当前可用显存（MB）。
-        return max(0, self.memory_total_mb - self.memory_used_mb)
+        return max(0, self.memory_total_mb - self.memory_used_mb)  # 对异常负差值按零处理，不能凭空得到可用容量。
 
     @property
     def memory_free_ratio(self) -> float:  # 当前可用显存占比。

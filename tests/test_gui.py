@@ -6,11 +6,16 @@ import unittest
 from unittest.mock import patch
 
 from autodl_watcher.config import load_config
-from autodl_watcher.gui import ROOT, monitor_command
+from autodl_watcher.gui import ROOT, monitor_command, worker_python
 from autodl_watcher.main import _build_parser, apply_monitor_options, main, positive_seconds
 
 
 class GuiOptionsTest(unittest.TestCase):
+    def test_pythonw_gui_uses_console_interpreter_for_piped_workers(self):
+        executable = str(Path("runtime") / "pythonw.exe")
+        with patch("sys.executable", executable):
+            self.assertEqual(worker_python(), str(Path("runtime") / "python.exe"))
+
     def setUp(self):
         self.config = load_config(ROOT / "config.yaml")
 

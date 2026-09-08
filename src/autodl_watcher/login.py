@@ -32,7 +32,7 @@ def edge_executable_candidates() -> tuple[Path, ...]:  # 返回 Windows 上常�
     unique: list[Path] = []
     seen: set[str] = set()
     for item in candidates:
-        key = str(item).lower()
+        key = str(item).lower()  # Windows 路径大小写通常不区分，按小写去掉重复候选。
         if key not in seen:
             unique.append(item)
             seen.add(key)
@@ -84,9 +84,10 @@ def edge_process_command_lines(user_data_dir: Path) -> list[str]:  # 读取使�
             "-Command",
             _edge_process_query_script(user_data_dir, kill=False),
         ],
-        capture_output=True,
+        capture_output=True,  # 辅助进程输出交给 Python 读取，不单独弹终端供用户查看。
         text=True,
         check=False,
+        creationflags=subprocess.CREATE_NO_WINDOW,  # 只隐藏 PowerShell 辅助进程，人工登录的 Edge 窗口仍然可见。
     )
     if completed.returncode != 0:
         return []
@@ -109,6 +110,7 @@ def terminate_profile_edge_processes(user_data_dir: Path) -> None:  # 静默关�
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
+        creationflags=subprocess.CREATE_NO_WINDOW,  # 只隐藏 PowerShell 辅助进程，人工登录的 Edge 窗口仍然可见。
     )
 
 
