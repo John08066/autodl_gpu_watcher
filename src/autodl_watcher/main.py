@@ -79,7 +79,7 @@ def _owned_instances_from_records(
     if not self_user:
         return []
 
-    latest_by_instance = {}
+    latest_by_instance = {}  # 同一实例可能出现在多个入口，按实例 ID 保留最新观察。
     for item in records:
         if (
             not item.occupied or item.host != host or item.user.strip() != self_user or not item.instance_id
@@ -114,13 +114,13 @@ def _advance_absence_confirmation(
     required = max(1, int(required))
     if captured_owned:
         return 0, False, False
-    if not complete_snapshot:
+    if not complete_snapshot:  # 缺入口或采集失败不能作为本人下机的证据，并打断连续确认。
         return 0, False, False
     if previous_known and not previous_active:
         return max(current_streak, required), True, False
     streak = current_streak + 1
     confirmed = streak >= required
-    return streak, confirmed, not confirmed
+    return streak, confirmed, not confirmed  # 返回连续次数、是否确认缺席、是否需要加快复核。
 
 def _format_owned_entry(instances: list[_OwnedInstance]) -> str:  # 格式化本人已占用入口，例如 `已占用203-1`。
     names = []
@@ -197,12 +197,12 @@ def apply_monitor_options(config, args):  # UI 与 CLI 共用配置转换。
     usage = args.usage_seconds if args.usage_seconds is not None else config.usage_tracking.interval_seconds
     positive_seconds(str(poll))
     positive_seconds(str(usage))
-    config = replace(config,
+    config = replace(config,  # 配置对象不可变；用副本承接本次 UI/CLI 覆盖值。
         monitor=replace(config.monitor, poll_seconds=poll,
                         max_sample_gap_seconds=max(config.monitor.max_sample_gap_seconds, poll * 2)),
         usage_tracking=replace(config.usage_tracking, interval_seconds=usage,
             self_user=args.user.strip() if args.user is not None else config.usage_tracking.self_user))
-    if args.runtime_dir:
+    if args.runtime_dir:  # 测试可隔离日志、状态与数据库，避免混入日常监控数据。
         root = args.runtime_dir.resolve()
         config = replace(config, runtime=replace(config.runtime,
             state_file=root / "state.json", log_file=root / "watcher.log"),
@@ -234,7 +234,7 @@ def _fresh_gpu_indices(samples, now, stale_after_seconds):  # 只有本轮全部
     if not samples or any(not -5 <= (now - item.observed_at).total_seconds() <= stale_after_seconds for item in samples):
         return None
     indices = {item.gpu_index for item in samples}
-    return indices if len(indices) == len(samples) else None
+    return indices if len(indices) == len(samples) else None  # 重复 INDEX 表明快照不可靠，不能据此删掉占用表的额外行。
 
 
 def _format_ready_indices(samples, thresholds) -> str:  # 格式化达标 GPU 索引，用于控制台展示，如 '#0(21728MB),#1(21736MB)'。
@@ -244,8 +244,8 @@ def _format_ready_indices(samples, thresholds) -> str:  # 格式化达标 GPU �
     return ",".join( f"#{sample.gpu_index}({sample.memory_free_mb}MB)" for sample in ready )
 
 
-_STATE_RESTORE_MAX_AGE_SECONDS = 300
-_POWER_ON_CONFIRM_GRACE_SECONDS = 120
+_STATE_RESTORE_MAX_AGE_SECONDS = 300  # 只续接五分钟内的采样历史，过旧记录重新积累。
+_POWER_ON_CONFIRM_GRACE_SECONDS = 120  # 请求受理后等待实时占用证据的最长宽限期。
 
 
 def _parse_local_iso(value: object) -> datetime | None:  # 解析 state/SQLite 中的本地 ISO 时间；无效值返回 None。
@@ -276,12 +276,12 @@ def _restore_recent_evaluator_state(
     now: datetime,
     host: str,
 ) -> tuple[bool, int]:  # 恢复近期连续采样，但无条件清除跨进程 alerted 锁。
-    if persisted.get("capacity_fingerprint") != capacity_fingerprint:
+    if persisted.get("capacity_fingerprint") != capacity_fingerprint:  # 用户、目标或阈值变了，旧连续达标记录就不能沿用。
         return False, 0
     if not _persisted_state_is_fresh(persisted, now):
         return False, 0
     evaluator.import_state(persisted.get("evaluator", {}))
-    return True, evaluator.rearm_host(host)
+    return True, evaluator.rearm_host(host)  # 保留近期采样连续性，但清除上次进程的已触发锁。
 
 
 def main(argv=None) -> None:  # 主入口：初始化各组件后进入无限监控循环。
@@ -289,7 +289,7 @@ def main(argv=None) -> None:  # 主入口：初始化各组件后进入无限监
     load_dotenv()
     preliminary = argparse.ArgumentParser(add_help=False)
     preliminary.add_argument("--config", default="config.yaml")
-    config_path = Path(preliminary.parse_known_args(argv)[0].config).resolve()
+    config_path = Path(preliminary.parse_known_args(argv)[0].config).resolve()  # 先取配置路径，再用文件内容构造完整参数默认值。
     config = load_config(config_path)
     parser = _build_parser(config.auto_start.default_host)
     args = parser.parse_args(argv)
@@ -298,7 +298,7 @@ def main(argv=None) -> None:  # 主入口：初始化各组件后进入无限监
     except (ValueError, argparse.ArgumentTypeError) as exc:
         parser.error(str(exc))
 
-    run_monitor(config, args, config_path, parser)
+    run_monitor(config, args, config_path, parser)  # 所有启动方式最终复用这一条监控业务链。
 
 
 def run_monitor(config, args, config_path, parser):  # 独立监控入口，保留 CLI 和 UI 共用的业务链路。
@@ -337,7 +337,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
     state_store = JsonStateStore(config.runtime.state_file)
     persisted = state_store.load()
     target_signature = ",".join(item.machine_name for item in selected_targets)
-    capacity_fingerprint = (  # capacity_fingerprint 是配置的哈希摘要，用于检测配置是否变更
+    capacity_fingerprint = (  # 拼接关键配置形成签名字符串，用于判断历史状态是否仍适用；不是哈希值。
         f"v0.6|user={config.usage_tracking.self_user}|host={selected_host}|targets={target_signature}|"
         f"util={config.idle_thresholds.gpu_util_check_enabled}:"
         f"{config.idle_thresholds.gpu_util_max_pct}|"
@@ -378,11 +378,11 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
     self_user = config.usage_tracking.self_user.strip()
 
     owned_instances: list[_OwnedInstance] = []  # v0.5.1：SQLite 只用于历史统计，绝不参与“本人现在是否已开机”的判定。 每次启动都从 UNKNOWN 开始，必须等本进程成功采集“查看占用”后， 才能进入 ACTIVE / ABSENT。这样彻底消除数据库陈旧记录导致的假绿色。
-    self_occupancy_known = False
+    self_occupancy_known = False  # 新进程从未知状态开始，不能用历史数据库推断当前已开机。
 
     pending_start_until = 0.0  # power_on=Success 只代表请求被受理。给实例最多 120 秒启动并出现在 “查看占用”中；这段时间不重复发开机请求，也绝不显示“已开机”。
     pending_start_machine = ""
-    usage_targets = sorted(
+    usage_targets = sorted(  # 占用核验覆盖该物理主机的所有已启用入口，避免漏掉本人实例。
         (
             item
             for item in config.auto_start.targets
@@ -503,7 +503,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     pending_start_until = 0.0
                     pending_start_machine = ""
 
-                if self_active or occupancy_unknown or pending_start:
+                if self_active or occupancy_unknown or pending_start:  # 本人已占用、尚未查清或正在启动时，都阻止重复开机。
                     trigger_events = []
 
                 planned_target = None  # 根据实时空位预判入口。UNKNOWN 时仍显示预选入口，但不会真正开机。
@@ -603,7 +603,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                 if (
                     config.usage_tracking.enabled and time.monotonic() >= next_usage_capture and usage_targets
                 ):
-                    raw_occupancy = []
+                    raw_occupancy = []  # 每轮重新收集原始入口视图，不把上一轮记录当作本轮证据。
                     entry_summaries: list[str] = []
                     failed_entries: list[str] = []
                     fast_absence_recheck = False
@@ -648,7 +648,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     if stop_requested():
                         break  # 停止时丢弃不完整快照，不写入伪下机事件。
                     try:  # 先判定本人状态，再决定该轮是否允许 SQLite 生成 END_SEEN。 第一次可靠空快照只是“疑似结束”，不会立即关掉 current_instances。
-                        complete_occupancy_snapshot = not failed_entries
+                        complete_occupancy_snapshot = not failed_entries  # 只有所有目标入口成功读取，本轮才具备确认消失的资格。
                         captured_owned = _owned_instances_from_records(
                             raw_occupancy,
                             self_user,
@@ -668,7 +668,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                         )
 
                         if captured_owned:
-                            owned_instances = captured_owned
+                            owned_instances = captured_owned  # 实时看到本人实例就是正向证据，无需等待多轮缺席确认。
                             self_occupancy_known = True
                             pending_start_until = 0.0
                             pending_start_machine = ""
@@ -679,7 +679,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                                     f"{config.usage_tracking.absent_confirmations_required}，待复核]"
                                 )
 
-                            if confirmed_absence:
+                            if confirmed_absence:  # 连续可靠空快照达到门槛后，才能解除本人占用状态。
                                 owned_instances = []
                                 self_occupancy_known = True
                                 pending_still_valid = (
@@ -718,7 +718,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                         usage_events = usage_logger.record(
                             raw_occupancy,
                             complete_snapshot=complete_for_db,
-                            snapshot_hosts={selected_host},
+                            snapshot_hosts={selected_host},  # 数据库结束事件仅作用于本轮覆盖的主机，其他主机历史不受影响。
                         )
                         instance_records = merge_duplicate_instances(raw_occupancy)
                         gpu_rows = aggregate_gpu_occupants(raw_occupancy)
@@ -782,7 +782,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
 
                 if selected_auto_start.enabled and not stop_requested():
                     for event in trigger_events[: selected_auto_start.max_starts_per_event]:
-                        result = starter.attempt(event)
+                        result = starter.attempt(event)  # 协调器负责选择实例、开机前复核及实际请求；主循环处理后续确认。
                         result_text = format_start_result(result)
                         if result.status == "request_accepted":
                             result_text = _green_terminal_text(result_text)  # 受理成功 != 已开机。进入 120 秒“等待占用确认”状态， 只有占用详情实时看到 self_user 后才会变成绿色。
@@ -790,7 +790,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                                 time.monotonic() + _POWER_ON_CONFIRM_GRACE_SECONDS
                             )
                             pending_start_machine = result.machine_name or ""
-                            next_usage_capture = 0.0
+                            next_usage_capture = 0.0  # 开机请求受理后尽快读取占用详情，核实是否真正出现实例。
                             logger.info(
                                 "power_on accepted; waiting occupancy confirmation host=%s machine=%s instance=%s grace=%ss",
                                 result.host,
@@ -839,12 +839,12 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     interactive_login(config, reason="expired")
                     print( f"[{datetime.now():%H:%M:%S}] 登录资料已更新；下一轮将验证主机接口，验证成功后再恢复监控。", flush=True, )
                     login_validation_pending = True
-                    self_occupancy_known = False
+                    self_occupancy_known = False  # 登录会话更新后重新确认本人占用，不沿用更新前的判断。
                     owned_instances = []
                     pending_start_until = 0.0
                     pending_start_machine = ""
                     evaluator.rearm_host(selected_host)
-                    next_usage_capture = 0.0
+                    next_usage_capture = 0.0  # 登录恢复后的下一轮尽快重采占用，解除未知状态。
                 except Exception as login_exc:
                     print( f"[{datetime.now():%H:%M:%S}] 登录恢复失败：{login_exc}", flush=True, )
                     logger.exception("interactive login recovery failed")
@@ -862,9 +862,9 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
             cycles += 1  # 控制循环间隔：睡眠到距离上次开始正好 poll_seconds
             if args.max_cycles and cycles >= args.max_cycles:
                 break
-            deadline = cycle_start + config.monitor.poll_seconds
+            deadline = cycle_start + config.monitor.poll_seconds  # 采集耗时计入周期，避免每轮额外叠加完整等待时间。
             while not stop_requested() and time.monotonic() < deadline:
-                time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+                time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))  # 分段等待以便及时响应 GUI 停止文件。
     except KeyboardInterrupt:
         print("\n收到 Ctrl+C，正在保存状态并退出……")  # Ctrl+C → 保存状态后优雅退出
         state_store.save(
@@ -883,7 +883,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
             platform_collector.close()
             for handler in list(logger.handlers):
                 handler.close()
-                logger.removeHandler(handler)
+                logger.removeHandler(handler)  # 释放处理器引用，后续同进程启动可重新绑定日志文件。
         print("监控已安全停止。")
 
 

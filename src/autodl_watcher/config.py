@@ -101,14 +101,14 @@ class RuntimeConfig:  # 运行时文件路径。
 
 @dataclass(frozen=True, slots=True)
 class AppConfig:  # 顶层应用配置，包含所有子配置。
-    monitor: MonitorConfig
-    idle_thresholds: IdleThresholds
-    platform: PlatformConfig
-    telemetry: TelemetryConfig
-    notification: NotificationConfig
-    auto_start: AutoStartConfig
-    usage_tracking: UsageTrackingConfig
-    runtime: RuntimeConfig
+    monitor: MonitorConfig  # 采样节奏、连续确认和过期判定。
+    idle_thresholds: IdleThresholds  # 一张物理 GPU 是否满足空闲容量要求。
+    platform: PlatformConfig  # 平台浏览器会话、入口空位来源及重试策略。
+    telemetry: TelemetryConfig  # 物理 GPU 实时利用率与显存来源。
+    notification: NotificationConfig  # 达标事件的通知开关。
+    auto_start: AutoStartConfig  # 固定实例映射与真实开机策略。
+    usage_tracking: UsageTrackingConfig  # 本人识别、占用复核及统计存储。
+    runtime: RuntimeConfig  # 连续采样状态与运行日志的落盘位置。
 
 
 def _required(mapping: dict[str, Any], key: str) -> Any:  # 从配置字典读取必填字段；字段缺失时立即给出明确错误。
@@ -118,7 +118,7 @@ def _required(mapping: dict[str, Any], key: str) -> Any:  # 从配置字典读�
 
 
 def _resolve_path(base_dir: Path, value: str | Path) -> Path:  # 将配置中的相对路径解析为相对于配置文件目录的绝对路径。
-    path = Path(value).expanduser()
+    path = Path(value).expanduser()  # 先展开用户目录符号，再判断绝对或相对路径。
     if path.is_absolute():
         return path
     return (base_dir / path).resolve()
@@ -126,8 +126,8 @@ def _resolve_path(base_dir: Path, value: str | Path) -> Path:  # 将配置中的
 
 def load_config(path: str | Path = "config.yaml") -> AppConfig:  # 读取 YAML 配置，完成类型转换、路径解析与 dataclass 配置对象组装。
     config_path = Path(path).resolve()
-    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    base_dir = config_path.parent
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))  # 只解析 YAML 数据，不实例化任意 Python 对象。
+    base_dir = config_path.parent  # 相对路径以 YAML 所在目录为基准，与启动时所在目录无关。
 
     monitor = _required(raw, "monitor")
     thresholds = _required(raw, "idle_thresholds")
@@ -144,7 +144,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:  # 读取 YAML �
     if aggregation not in {"max", "min", "sum"}:
         raise ValueError("platform.aggregation must be one of: max, min, sum")
 
-    targets = tuple(
+    targets = tuple(  # 配置中的入口名用于匹配空位，实例 UUID 用于发送开机请求。
         AutoStartTarget(
             host=str(item["host"]),
             machine_name=str(item.get("machine_name", "")),
@@ -178,7 +178,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:  # 读取 YAML �
         raise ValueError("telemetry.retry_delay_seconds must be >= 0")
 
     return AppConfig(
-        monitor=MonitorConfig(**monitor),
+        monitor=MonitorConfig(**monitor),  # 把 YAML 字段展开为具名配置属性，供各模块统一读取。
         idle_thresholds=idle_thresholds,
         platform=PlatformConfig(
             page_url=str(platform["page_url"]),

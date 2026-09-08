@@ -21,7 +21,7 @@ def _parse_received_at(value: str) -> datetime:  # 解析 Telemetry API 返回�
     aware = datetime.fromisoformat(text)
     if aware.tzinfo is None:
         return aware
-    return aware.astimezone().replace(tzinfo=None)
+    return aware.astimezone().replace(tzinfo=None)  # 统一为本地无时区时间，与主循环 datetime.now() 比较新鲜度。
 
 
 def parse_telemetry_payload(payload: dict[str, Any], only_online: bool = True) -> list[GpuSample]:  # 解析 Telemetry API 的 JSON 响应，返回 GpuSample 列表。
@@ -39,7 +39,7 @@ def parse_telemetry_payload(payload: dict[str, Any], only_online: bool = True) -
                     util_pct=float(item["util_gpu"]),
                     memory_used_mb=int(round(float(item["mem_used_mb"]))),
                     memory_total_mb=int(round(float(item["mem_total_mb"]))),
-                    observed_at=_parse_received_at(str(item["received_at"])),
+                    observed_at=_parse_received_at(str(item["received_at"])),  # 采用服务端记录的接收时间，不能用本次拉取时间掩盖旧数据。
                 )
             )
         except (KeyError, TypeError, ValueError):
@@ -51,10 +51,10 @@ def filter_samples_to_platform_candidates(
     samples: list[GpuSample],
     platform_hosts: list[PlatformHost],
 ) -> tuple[list[GpuSample], tuple[str, ...], tuple[str, ...]]:  # 两层门控过滤 — 这是整个系统最关键的交叉验证步骤。
-    visible = {item.host for item in platform_hosts}
-    candidates = {item.host for item in platform_hosts if item.free_count > 0}
+    visible = {item.host for item in platform_hosts}  # 以当前账号平台实际可见的主机作为访问范围。
+    candidates = {item.host for item in platform_hosts if item.free_count > 0}  # 物理显存空闲还不够，平台必须同时存在可分配入口空位。
     accepted = [sample for sample in samples if sample.host in candidates]
-    no_slot = tuple(sorted(visible - candidates))
+    no_slot = tuple(sorted(visible - candidates))  # 区分平台可见但没空位，与平台根本不可见这两种排除原因。
     unauthorized = tuple(sorted({sample.host for sample in samples if sample.host not in visible}))
     return accepted, no_slot, unauthorized
 
@@ -71,7 +71,7 @@ class TelemetryApiCollector:  # Telemetry API 采集器 — 通过 HTTP GET 拉�
 
     def __init__(self, config: TelemetryConfig) -> None:  # 初始化 Telemetry API 采集器和可复用的 HTTP 会话。
         self.config = config
-        self._session = requests.Session()
+        self._session = requests.Session()  # 复用 HTTP 连接；默认仍遵循此进程的代理环境。
         self._session.headers.update(
             {
                 "Accept": "application/json",
@@ -86,7 +86,7 @@ class TelemetryApiCollector:  # Telemetry API 采集器 — 通过 HTTP GET 拉�
             return True
         if isinstance(exc, requests.HTTPError) and exc.response is not None:
             status = int(exc.response.status_code)
-            return status == 429 or status >= 500
+            return status == 429 or status >= 500  # 限流和服务端故障可重试，其他 HTTP 错误交回主循环处理。
         return False
 
     def collect(self) -> list[GpuSample]:  # 拉取 Telemetry GPU 快照，并对瞬时网络故障进行有限重试。
@@ -99,7 +99,7 @@ class TelemetryApiCollector:  # Telemetry API 采集器 — 通过 HTTP GET 拉�
                     params={"_t": int(time.time() * 1000)},  # 时间戳参数防止缓存
                     timeout=self.config.timeout_seconds,
                 )
-                response.raise_for_status()
+                response.raise_for_status()  # 先检查 HTTP 状态，再解析 JSON，避免把错误页当作空快照。
                 samples = parse_telemetry_payload( response.json(), only_online=self.config.only_online, )
                 if attempt > 1:
                     _LOGGER.info(
@@ -114,7 +114,7 @@ class TelemetryApiCollector:  # Telemetry API 采集器 — 通过 HTTP GET 拉�
                 can_retry = (
                     attempt < self.config.max_attempts and self._is_retryable(exc)
                 )
-                if not can_retry:
+                if not can_retry:  # 次数耗尽或错误不可重试时抛出，不能返回伪造的空闲结果。
                     raise
 
                 _LOGGER.warning(

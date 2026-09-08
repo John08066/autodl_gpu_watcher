@@ -31,7 +31,7 @@ class StartAttemptResult:  # 一次开机尝试的结果。
 
     @property
     def accepted(self) -> bool:  # 是否被系统接受（dry-run 或请求成功都算"接受"）。
-        return self.status in {"dry_run", "request_accepted"}
+        return self.status in {"dry_run", "request_accepted"}  # 这是流程结果分类，不代表已经在占用详情看到本人实例。
 
 
 def _slot_map(
@@ -47,12 +47,12 @@ def rank_targets_for_slots(
     machine_name: str | None = None,
 ) -> list[AutoStartTarget]:  # 根据 AutoDL 入口实时空位排序可开机的固定实例。
 
-    candidates = [item for item in config.targets if item.enabled and item.host == host]
-    if machine_name is not None:
+    candidates = [item for item in config.targets if item.enabled and item.host == host]  # 配置决定允许操作的实例范围，实时平台数据只在此范围内筛选。
+    if machine_name is not None:  # 固定入口模式进一步缩小候选集，不能借其他入口的空位开机。
         candidates = [item for item in candidates if item.machine_name == machine_name]
 
-    slots = _slot_map(platform_slots)
-    if slots:
+    slots = _slot_map(platform_slots)  # 平台空位按入口统计，同一物理主机的入口不能直接相加。
+    if slots:  # 有实时空位信息时，必须剔除不可见或无空位的配置入口。
         candidates = [
             item
             for item in candidates
@@ -78,7 +78,7 @@ def select_target(
     platform_slots: Iterable[tuple[str, int, int]] = (),
 ) -> AutoStartTarget | None:  # 从 rank_targets_for_slots 的排序结果中取第一个，即最优入口。
     candidates = rank_targets_for_slots( config, host, platform_slots, machine_name=machine_name, )
-    return candidates[0] if candidates else None
+    return candidates[0] if candidates else None  # 未找到可用实例时返回 None，由调用方暂缓操作。
 
 
 def is_instant_idle(
@@ -124,7 +124,7 @@ class AutoStartCoordinator:  # 自动开机协调器。
                 message="已配置入口中没有当前可开机的固定实例。",
             )
 
-        if self.config.dry_run:
+        if self.config.dry_run:  # 只读模式在任何 power_on 请求之前返回，仍可展示计划选中的实例。
             return StartAttemptResult(
                 status="dry_run",
                 host=alert.host,
@@ -135,9 +135,9 @@ class AutoStartCoordinator:  # 自动开机协调器。
                 platform_total_before=alert.platform_total_count,
             )
 
-        platform_free_before = alert.platform_free_count
+        platform_free_before = alert.platform_free_count  # 先使用事件内快照；开启二次确认时会被更近的读数替换。
         platform_total_before = alert.platform_total_count
-        if self.config.verify_before_start:
+        if self.config.verify_before_start:  # 显存和平台空位可能在通知后变化，因此发送请求前再次确认。
             if self.config.recheck_delay_seconds > 0:
                 time.sleep(self.config.recheck_delay_seconds)
 
@@ -181,7 +181,7 @@ class AutoStartCoordinator:  # 自动开机协调器。
                 )
 
             all_samples = self.telemetry.collect()  # 重新采集物理显存数据，检查是否仍有 GPU 满足条件
-            candidate_samples, _, _ = filter_samples_to_platform_candidates( all_samples, platform_hosts, )
+            candidate_samples, _, _ = filter_samples_to_platform_candidates( all_samples, platform_hosts, )  # 二次确认仍使用平台可见性和空位过滤，不能仅凭显存余量。
             now = datetime.now()
             still_ready = [
                 sample
@@ -200,11 +200,11 @@ class AutoStartCoordinator:  # 自动开机协调器。
                     platform_total_before=host_state.total_count,
                 )
 
-        response = self.platform.post_api_json(
+        response = self.platform.post_api_json(  # 这里才是真正改变平台状态的开机请求，前面均为选择或只读检查。
             "/api/v2/instance/power_on",
             { "instance_uuid": target.instance_uuid, "start_mode": target.start_mode, },
         )
-        code = str(response.get("code", ""))
+        code = str(response.get("code", ""))  # HTTP 成功不等于业务成功，还要检查 AutoDL 的业务 code。
         msg = str(response.get("msg", ""))
         if code != "Success":
             return StartAttemptResult(  # AutoDL 拒绝了请求（可能是并发冲突或权限不足）
@@ -221,7 +221,7 @@ class AutoStartCoordinator:  # 自动开机协调器。
 
         platform_free_after: int | None = None
         platform_total_after: int | None = None
-        if self.config.post_start_check_seconds >= 0:
+        if self.config.post_start_check_seconds >= 0:  # 非负数启用请求后的平台观察；观察失败不会推翻已受理的响应。
             if self.config.post_start_check_seconds > 0:
                 time.sleep(self.config.post_start_check_seconds)
             try:
@@ -235,7 +235,7 @@ class AutoStartCoordinator:  # 自动开机协调器。
                 platform_total_after = None
 
         return StartAttemptResult(
-            status="request_accepted",
+            status="request_accepted",  # 主循环随后等待实时占用确认，并在宽限期内抑制重复开机。
             host=alert.host,
             instance_uuid=target.instance_uuid,
             machine_name=target.machine_name,
@@ -272,7 +272,7 @@ def format_start_result(result: StartAttemptResult) -> str:  # 将开机尝试�
     if result.instance_uuid:
         lines.append(f"实例：{result.instance_uuid}")
 
-    before = _slot_text(result.platform_free_before, result.platform_total_before)
+    before = _slot_text(result.platform_free_before, result.platform_total_before)  # 把可选读数转成文本；缺失值表示未观测到，不应当作零空位。
     after = _slot_text(result.platform_free_after, result.platform_total_after)
     if before is not None:
         lines.append(f"平台可分配 GPU ID：开机前 {before}")

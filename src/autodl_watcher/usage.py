@@ -14,7 +14,7 @@ from typing import Any, Iterable, Iterator
 from .models import OccupancyRecord
 
 
-ENTRY_FIELDS = (
+ENTRY_FIELDS = (  # 原始入口快照的字段顺序，保留平台逐入口展示的信息。
     "observed_at",
     "host",
     "machine_name",
@@ -27,7 +27,7 @@ ENTRY_FIELDS = (
     "started_at",
 )
 
-EVENT_FIELDS = (
+EVENT_FIELDS = (  # 事件写库参数必须与 INSERT 的列顺序对应。
     "event_time",
     "event",
     "host",
@@ -61,10 +61,10 @@ def _duration_seconds(started_at: str, fallback: str, ended_at: datetime) -> int
     start = _parse_started_at(started_at)
     if start is None:
         try:
-            start = datetime.fromisoformat(fallback)
+            start = datetime.fromisoformat(fallback)  # 页面启动时间无法解析时，退回本地第一次观察到的时间。
         except (TypeError, ValueError):
             return 0
-    return max(0, int((ended_at - start).total_seconds()))
+    return max(0, int((ended_at - start).total_seconds()))  # 时钟差或异常时间不生成负使用时长；结果是观察估计而非计费账单。
 
 
 def merge_duplicate_instances(records: list[OccupancyRecord]) -> list[OccupancyRecord]:  # 按 (host, instance_id) 去重，保留同一实例的最新记录。
@@ -73,12 +73,12 @@ def merge_duplicate_instances(records: list[OccupancyRecord]) -> list[OccupancyR
     for item in records:
         if not item.occupied or not item.instance_id:
             continue
-        grouped[(item.host, item.instance_id)].append(item)
+        grouped[(item.host, item.instance_id)].append(item)  # 同一实例可能由多个入口重复展示，先按实例身份去重。
 
     merged: list[OccupancyRecord] = []
     for (_host, _instance_id), items in sorted(grouped.items()):
-        chosen = max(items, key=lambda item: item.observed_at)
-        source_entries = "|".join(sorted({item.machine_name for item in items}))
+        chosen = max(items, key=lambda item: item.observed_at)  # 多条重复实例记录中选最新一条作为字段来源。
+        source_entries = "|".join(sorted({item.machine_name for item in items}))  # 仍保留实例出现过的全部入口，避免去重后失去来源信息。
         merged.append(
             OccupancyRecord(
                 observed_at=max(item.observed_at for item in items),
@@ -98,7 +98,7 @@ def merge_duplicate_instances(records: list[OccupancyRecord]) -> list[OccupancyR
 
 def aggregate_gpu_occupants(records: list[OccupancyRecord]) -> list[dict[str, Any]]:  # 统计每张物理 GPU INDEX 上的并发占用情况。
 
-    instances = merge_duplicate_instances(records)
+    instances = merge_duplicate_instances(records)  # 并发统计先去除跨入口重复实例，不能把重复展示算成多个人。
     all_gpu_rows: dict[tuple[str, int], list[OccupancyRecord]] = defaultdict(list)
     metadata: dict[tuple[str, int], OccupancyRecord] = {}
 
@@ -112,7 +112,7 @@ def aggregate_gpu_occupants(records: list[OccupancyRecord]) -> list[dict[str, An
         all_gpu_rows[(item.host, item.gpu_index)].append(item)
 
     result: list[dict[str, Any]] = []
-    for key in sorted(metadata):
+    for key in sorted(metadata):  # 也遍历无人占用的卡，使空闲 GPU 仍有快照记录。
         host, gpu_index = key
         meta = metadata[key]
         occupants = sorted(
@@ -126,7 +126,7 @@ def aggregate_gpu_occupants(records: list[OccupancyRecord]) -> list[dict[str, An
                 "gpu_index": gpu_index,
                 "gpu_uuid": meta.gpu_uuid,
                 "gpu_name": meta.gpu_name,
-                "occupant_count": len(occupants),
+                "occupant_count": len(occupants),  # 这里统计去重后的实例数，未必等于唯一用户名数量。
                 "active_users": json.dumps(
                     sorted({item.user for item in occupants if item.user}),
                     ensure_ascii=False,
@@ -160,10 +160,10 @@ class UsageSqliteLogger:  # SQLite 占用日志记录器。
 
     def _connect(self) -> sqlite3.Connection:  # 创建并配置一个 SQLite 连接。
         connection = sqlite3.connect(self.database_path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=NORMAL")
-        connection.execute("PRAGMA busy_timeout=30000")
+        connection.row_factory = sqlite3.Row  # 查询结果既能按列名访问，也便于转换为导出所需的字典。
+        connection.execute("PRAGMA journal_mode=WAL")  # 使用 WAL 日志，让写入监控与只读报表更容易并存。
+        connection.execute("PRAGMA synchronous=NORMAL")  # 采用 SQLite 的 NORMAL 同步策略，兼顾写入开销；不是每次都完整同步数据库文件。
+        connection.execute("PRAGMA busy_timeout=30000")  # 发生锁竞争时最多等 30 秒，超时仍会报错而不是无限阻塞。
         return connection
 
     @contextmanager
@@ -171,14 +171,14 @@ class UsageSqliteLogger:  # SQLite 占用日志记录器。
 
         connection = self._connect()
         try:
-            with connection:
+            with connection:  # 正常离开时提交事务，异常离开时回滚；外层 finally 再负责关闭连接。
                 yield connection
         finally:
             connection.close()
 
     def _init_schema(self) -> None:  # 创建占用快照、实例状态、GPU 并发和上下机事件等 SQLite 表与索引。
         with self._connection() as conn:
-            conn.executescript(
+            conn.executescript(  # 五类表分别保存入口快照、去重实例、物理卡汇总、事件和最近观察状态。
                 """
                 CREATE TABLE IF NOT EXISTS entry_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,9 +283,9 @@ class UsageSqliteLogger:  # SQLite 占用日志记录器。
         if not records:
             return []  # 没有原始行时无法生成快照时间。主流程正常情况下每个 GPU 都会有一行， 因此这里保持无操作；“完整/不完整”判定由调用方负责。
 
-        capture_id, capture_at = self._capture_id(records)
-        instance_records = merge_duplicate_instances(records)
-        gpu_rows = aggregate_gpu_occupants(records)
+        capture_id, capture_at = self._capture_id(records)  # 同批次多入口记录共用批次 ID，后续可以还原一次完整观察。
+        instance_records = merge_duplicate_instances(records)  # 原始视图与去重实例视图分开保存，服务不同的统计口径。
+        gpu_rows = aggregate_gpu_occupants(records)  # 把实例视图再次按物理卡聚合，用于共享 GPU 的占用统计。
         events: list[dict[str, Any]] = []
 
         with self._connection() as conn:
@@ -365,15 +365,15 @@ class UsageSqliteLogger:  # SQLite 占用日志记录器。
             if not complete_snapshot:  # v0.5.0：部分入口采集失败时，只记录“看见了什么”，绝不据此推断 “没看见的实例已经结束”。旧版会在部分失败时制造伪 END_SEEN， 并污染 current_instances。
                 return []
 
-            scoped_hosts = set(snapshot_hosts or {item.host for item in records})
+            scoped_hosts = set(snapshot_hosts or {item.host for item in records})  # 只更新此次实际观察的主机，不能把其他服务器上的实例判为结束。
             if not scoped_hosts:
                 return []
-            placeholders = ",".join("?" for _ in scoped_hosts)
+            placeholders = ",".join("?" for _ in scoped_hosts)  # 主机值通过 SQL 参数传入，不直接拼接到查询文本中。
             previous_rows = conn.execute(
                 f"SELECT * FROM current_instances WHERE host IN ({placeholders})",
                 tuple(sorted(scoped_hosts)),
             ).fetchall()
-            previous = {str(row["state_key"]): dict(row) for row in previous_rows}
+            previous = {str(row["state_key"]): dict(row) for row in previous_rows}  # 这份历史状态仅用于推导统计事件，不是本轮实时占用事实。
             current: dict[str, OccupancyRecord] = {
                 f"{item.host}|{item.instance_id}": item
                 for item in instance_records
@@ -383,7 +383,7 @@ class UsageSqliteLogger:  # SQLite 占用日志记录器。
 
             for key, item in current.items():
                 prior = previous.get(key)
-                signature_changed = bool(
+                signature_changed = bool(  # 同一实例 ID 的用户、GPU 或来源发生变化时，结束旧记录并建立新记录。
                     prior
                     and (
                         prior["user"] != item.user
@@ -392,7 +392,7 @@ class UsageSqliteLogger:  # SQLite 占用日志记录器。
                     )
                 )
 
-                if prior is None or signature_changed:
+                if prior is None or signature_changed:  # 首次观察或身份变化才产生 ACTIVE_SEEN，持续存在只更新最近观察时间。
                     if signature_changed and prior is not None:
                         end_event = {
                             "event_time": now_text,
@@ -462,7 +462,7 @@ class UsageSqliteLogger:  # SQLite 占用日志记录器。
                     ),
                 )
 
-            ended_keys = sorted(set(previous) - set(current))
+            ended_keys = sorted(set(previous) - set(current))  # 只有完整快照才执行集合差：上次存在、本次未见的实例记录为 END_SEEN。
             for key in ended_keys:
                 prior = previous[key]
                 events.append(
@@ -482,7 +482,7 @@ class UsageSqliteLogger:  # SQLite 占用日志记录器。
                         ),
                     }
                 )
-                conn.execute("DELETE FROM current_instances WHERE state_key = ?", (key,))
+                conn.execute("DELETE FROM current_instances WHERE state_key = ?", (key,))  # 删除统计状态表中的旧行，不是在 AutoDL 上删除或关闭实例。
 
             if events:
                 conn.executemany(
@@ -498,7 +498,7 @@ class UsageSqliteLogger:  # SQLite 占用日志记录器。
                     ],
                 )
 
-        return events
+        return events  # 快照与事件已在事务中保存，返回值只供主循环汇总显示。
 
     def current_instances(self) -> list[dict[str, Any]]:  # 读取数据库中当前仍处于占用状态的实例快照。
         with self._connection() as conn:
@@ -513,4 +513,4 @@ def merge_occupancy_records(records: list[OccupancyRecord]) -> list[OccupancyRec
     return merge_duplicate_instances(records)
 
 
-UsageCsvLogger = UsageSqliteLogger
+UsageCsvLogger = UsageSqliteLogger  # 保留旧导入名；实际存储已经使用 SQLite，不再实时写 CSV。

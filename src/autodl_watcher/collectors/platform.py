@@ -39,7 +39,7 @@ def canonical_host(machine_name: str) -> str:  # 将 AutoDL 入口名映射到�
 
 def parse_platform_payload(payload: dict[str, Any], aggregation: str = "max") -> list[PlatformHost]:  # 解析 AutoDL 控制台 machine/list API 的响应。
     rows = payload.get("data", {}).get("list", [])
-    grouped: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
+    grouped: dict[str, list[tuple[str, int, int]]] = defaultdict(list)  # 物理主机名映射到多个入口的 (入口名, 空闲数, 总数)。
 
     for row in rows:
         gpu = row.get("gpu") or {}
@@ -48,7 +48,7 @@ def parse_platform_payload(payload: dict[str, Any], aggregation: str = "max") ->
         idle = int(gpu.get("idle", 0))
         if not machine_name or total <= 0 or idle < 0:
             continue
-        idle = min(idle, total)
+        idle = min(idle, total)  # 平台空闲数异常偏大时限制到总数，保证模型计数合法。
         grouped[canonical_host(machine_name)].append((machine_name, idle, total))
 
     aggregation = aggregation.lower()
@@ -66,7 +66,7 @@ def parse_platform_payload(payload: dict[str, Any], aggregation: str = "max") ->
             free_count = min(idle_values)
             total_count = max(total_values)
         else:
-            free_count = max(idle_values)
+            free_count = max(idle_values)  # 默认按最宽松入口判断是否有空位，避免把共享入口直接累加。
             total_count = max(total_values)
 
         result.append(
@@ -75,7 +75,7 @@ def parse_platform_payload(payload: dict[str, Any], aggregation: str = "max") ->
                 free_count=min(free_count, total_count),
                 total_count=total_count,
                 source_names=tuple(entry[0] for entry in sorted(entries)),
-                source_slots=tuple(sorted(entries)),
+                source_slots=tuple(sorted(entries)),  # 保留入口级原始空位，后续选实例不能只看主机聚合值。
             )
         )
     return result
@@ -89,13 +89,13 @@ def parse_occupancy_cells(
     machine_name: str,
 ) -> OccupancyRecord | None:  # 解析 AutoDL "查看占用"弹窗中的一行表格数据。
     values = [str(item).strip() for item in cells]
-    if len(values) < 7:
+    if len(values) < 7:  # 表头、加载占位或不完整行都不能生成占用记录。
         return None
     try:
         gpu_index = int(values[0])
     except ValueError:
         return None
-    occupied_text = values[3]
+    occupied_text = values[3]  # 表格列顺序为 INDEX、UUID、名称、占用、实例、用户、开始时间。
     if occupied_text not in {"是", "否"}:
         return None
     return OccupancyRecord(
@@ -106,7 +106,7 @@ def parse_occupancy_cells(
         gpu_uuid=values[1],
         gpu_name=values[2],
         occupied=occupied_text == "是",
-        instance_id="" if values[4] == "-" else values[4],
+        instance_id="" if values[4] == "-" else values[4],  # 把网页占位符转为空值，避免被误当作真实实例 ID。
         user="" if values[5] == "-" else values[5],
         started_at_text="" if values[6] == "-" else values[6],
     )
@@ -126,7 +126,7 @@ def validate_occupancy_snapshot(
         raise OccupancySnapshotMismatchError( f"{machine_name} 占用记录混入了其他入口" )
 
     indexes = [item.gpu_index for item in records]
-    if len(indexes) != len(set(indexes)):
+    if len(indexes) != len(set(indexes)):  # 同一入口出现重复物理索引说明读取结果有歧义。
         raise OccupancySnapshotMismatchError( f"{machine_name} 占用弹窗出现重复 GPU INDEX：{indexes}" )
 
     if expected_total is not None and len(records) > expected_total and expected_gpu_indices is not None:
@@ -149,7 +149,7 @@ def validate_occupancy_snapshot(
                 f"{machine_name} 平台 idle/total={expected_idle}/{expected_total} 无效"
             )
         actual_occupied = sum(1 for item in records if item.occupied)
-        expected_occupied = expected_total - expected_idle
+        expected_occupied = expected_total - expected_idle  # 用主机列表的计数交叉验证弹窗，防止读取到旧弹窗或半加载内容。
         if actual_occupied != expected_occupied:
             raise OccupancySnapshotMismatchError(
                 f"{machine_name} 占用弹窗显示 {actual_occupied} 张被占用，"
@@ -171,7 +171,7 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
         self._machine_list_payload: dict[str, Any] | None = None
 
     def start(self) -> None:  # 启动（或复用）Playwright 浏览器实例。
-        if self._context is not None:
+        if self._context is not None:  # 复用同一持久化会话，不为每次采样重新启动浏览器。
             return
         self.config.user_data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -199,7 +199,7 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
                         if item
                     )
                     launch_kwargs["proxy"] = { "server": proxy_server, "bypass": bypass, }
-            context = playwright.chromium.launch_persistent_context(**launch_kwargs)
+            context = playwright.chromium.launch_persistent_context(**launch_kwargs)  # 专用用户目录持久保存登录状态，供后续采集请求复用。
             self._playwright = playwright
             self._context = context
             self._page = context.pages[0] if context.pages else context.new_page()
