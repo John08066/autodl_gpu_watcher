@@ -13,7 +13,7 @@ if errorlevel 1 (
 :menu
 cls
 echo ========================================
-echo AutoDL GPU Watcher v0.6.1
+echo AutoDL GPU Watcher v0.6.2
 echo Python: %PYTHON_EXE%
 echo ========================================
 echo 1. Login / refresh session

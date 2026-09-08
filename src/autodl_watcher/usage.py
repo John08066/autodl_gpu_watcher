@@ -6,10 +6,9 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from collections import defaultdict
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterator
 
 from .models import OccupancyRecord
 
@@ -506,11 +505,3 @@ class UsageSqliteLogger:  # SQLite 占用日志记录器。
                 "SELECT * FROM current_instances ORDER BY host, gpu_index, user, instance_id"
             ).fetchall()
             return [dict(row) for row in rows]
-
-
-# Compatibility aliases for older imports/tests.
-def merge_occupancy_records(records: list[OccupancyRecord]) -> list[OccupancyRecord]:  # 兼容旧调用名称，将相同实例的重复入口记录合并。
-    return merge_duplicate_instances(records)
-
-
-UsageCsvLogger = UsageSqliteLogger  # 保留旧导入名；实际存储已经使用 SQLite，不再实时写 CSV。

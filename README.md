@@ -1,4 +1,4 @@
-# AutoDL GPU Watcher v0.6.1
+# AutoDL GPU Watcher v0.6.2
 
 用于实验室 AutoDL 私有云 GPU 资源监控、占用统计和满足条件后的自动开机。
 
@@ -41,9 +41,9 @@ v0.6 将 Python 中重复的多行说明改为简短行尾注释，并压缩可�
 
 ```text
 autodl_gpu_watcher_git/
-├─ src/                  Python 主代码
+├─ src/                  Python 主代码（仅保留 UI、监控、采集、开机、统计和通知链路）
 ├─ tests/                单元测试
-├─ tools/                一键菜单使用的辅助脚本
+├─ tools/                当前 UI/命令行会调用的辅助脚本
 ├─ START_HERE.vbs        日常双击入口，无额外控制台窗口
 ├─ START_HERE.cmd        兼容入口；--cli 打开旧菜单
 ├─ README.md             使用说明
@@ -54,6 +54,8 @@ autodl_gpu_watcher_git/
 ├─ .env.example
 └─ .gitignore
 ```
+
+`src/autodl_watcher/` 已移除早期的模拟演示、单独的手动开机演示、旧 CSV 导入器和独立冒烟脚本；实时刷新、只读/真实监控、登录、报表与 Edge 清理均保留在日常入口中。旧版本源码和迁移工具仍可从 Git 的历史标签查看。
 
 正常使用时只需要双击：
 

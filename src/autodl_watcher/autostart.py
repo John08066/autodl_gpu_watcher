@@ -29,11 +29,6 @@ class StartAttemptResult:  # 一次开机尝试的结果。
     platform_free_after: int | None = None    # 开机后平台空闲 GPU ID 数
     platform_total_after: int | None = None
 
-    @property
-    def accepted(self) -> bool:  # 是否被系统接受（dry-run 或请求成功都算"接受"）。
-        return self.status in {"dry_run", "request_accepted"}  # 这是流程结果分类，不代表已经在占用详情看到本人实例。
-
-
 def _slot_map(
     platform_slots: Iterable[tuple[str, int, int]],
 ) -> dict[str, tuple[int, int]]:  # 将 source_slots 转换为 {入口名: (空闲数, 总数)} 的字典。
