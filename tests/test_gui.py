@@ -19,6 +19,11 @@ class GuiOptionsTest(unittest.TestCase):
     def setUp(self):
         self.config = load_config(ROOT / "config.yaml")
 
+    def test_project_local_runtime_paths(self):
+        self.assertEqual(self.config.platform.user_data_dir, ROOT / "runtime" / "browser_profile")
+        self.assertEqual(self.config.runtime.state_file, ROOT / "runtime" / "state.json")
+        self.assertEqual(self.config.usage_tracking.database_path, ROOT / "runtime" / "usage" / "occupancy.db")
+
     def test_invalid_intervals_are_rejected(self):
         for value in ("0", "-1", "nan", "inf", "-inf", "", "abc"):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):

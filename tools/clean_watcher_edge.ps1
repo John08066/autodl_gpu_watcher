@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'SilentlyContinue'
 
 $projectDir = Split-Path -Parent $PSScriptRoot
-$runtimeDir = Join-Path (Split-Path -Parent $projectDir) 'autodl_watcher_runtime'
+$runtimeDir = Join-Path $projectDir 'runtime'
 $profiles = @(
     (Join-Path $runtimeDir 'browser_profile'),
     (Join-Path $runtimeDir 'native_login_profile'),

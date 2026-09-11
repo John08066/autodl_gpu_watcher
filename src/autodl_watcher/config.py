@@ -219,11 +219,11 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:  # 读取 YAML �
             interval_seconds=float(usage_tracking.get("interval_seconds", 60)),
             database_path=_resolve_path(
                 base_dir,
-                usage_tracking.get( "database_path", "../autodl_watcher_runtime/usage/occupancy.db", ),
+                usage_tracking.get( "database_path", "runtime/usage/occupancy.db", ),
             ),
             export_dir=_resolve_path(
                 base_dir,
-                usage_tracking.get( "export_dir", "../autodl_watcher_runtime/usage/exports", ),
+                usage_tracking.get( "export_dir", "runtime/usage/exports", ),
             ),
             self_user=str(usage_tracking.get("self_user", "")).strip(),
             absent_confirmations_required=max(

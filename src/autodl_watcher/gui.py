@@ -57,6 +57,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         self.poll = tk.StringVar(value=str(self.config.monitor.poll_seconds))
         self.usage = tk.StringVar(value=str(self.config.usage_tracking.interval_seconds))
         self.live = tk.BooleanVar(value=False)  # 每次开窗都默认只读，不从历史偏好恢复付费开机开关。
+        self.auxiliary = tk.BooleanVar(value=False)  # 日志面板与报表默认隐藏，需要时由用户显式展开。
         self.status = tk.StringVar(value="未运行 · 选择入口后开始监控")
         self.saved_entry = ""
         preferences = self.local / "preferences.json"
@@ -117,6 +118,9 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
             self.inputs.append(entry)
         self.live_check = ttk.Checkbutton(options, text="启用真实自动开机（会产生 AutoDL 费用）", variable=self.live)
         self.live_check.grid(row=2, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+        self.auxiliary_check = ttk.Checkbutton(options, text="显示辅助工具（运行日志与占用报表）",
+                                                variable=self.auxiliary, command=self._toggle_auxiliary)
+        self.auxiliary_check.grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=5)
         controls = ttk.Frame(frame)
         controls.pack(fill="x", pady=8)
         self.start_button = ttk.Button(controls, text="开始监控", command=self.start)
@@ -126,11 +130,18 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         self.save_button = ttk.Button(controls, text="保存设置", command=self.save)
         self.save_button.pack(side="left")
         self.export_button = ttk.Button(controls, text="导出占用报表", command=self.export)
-        self.export_button.pack(side="right")
         ttk.Label(frame, textvariable=self.status, foreground="#245cc4").pack(anchor="w", pady=6)
         self.log = ScrolledText(frame, height=12, wrap="word", state="disabled", font=("Microsoft YaHei UI", 10),
                                 background="#17202e", foreground="#e2e8f0", padx=10, pady=10)
-        self.log.pack(fill="both", expand=True)  # 窗口增高时优先把多出的空间分配给日志。
+        self._toggle_auxiliary()
+
+    def _toggle_auxiliary(self):  # 辅助入口默认不占界面；核心文件日志不受此开关影响。
+        if self.auxiliary.get():
+            self.export_button.pack(side="right")
+            self.log.pack(fill="both", expand=True)
+        else:
+            self.export_button.pack_forget()
+            self.log.pack_forget()
 
     def _populate(self, rows):  # rows 中每项为 (入口名, 空闲/总数文本, 开机配置状态)。
         selected = self.selected_entry() or self.saved_entry  # 刷新时优先保留本次选择，其次恢复上次保存的入口。
@@ -165,7 +176,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
 
     def _busy(self, value):  # 统一切换操作权限；监控时能停止，登录时能确认同步。
         for button in [self.refresh_button, self.login_button, self.start_button, self.save_button,
-                       self.export_button, self.live_check, *self.inputs]:
+                       self.export_button, self.live_check, self.auxiliary_check, *self.inputs]:
             button.configure(state="disabled" if value else "normal")
         self.stop_button.configure(state="normal" if value and self.job == "monitor" else "disabled")
         self.login_done.configure(state="normal" if value and self.job == "login" else "disabled")
@@ -216,13 +227,14 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
             else:
                 if value.startswith("WATCHER_STATUS "):
                     value = value.removeprefix("WATCHER_STATUS ")
-                    self.status.set(value.strip())  # 核心监控的状态行同时更新摘要，并继续保留在日志区。
-                self.log.configure(state="normal")
-                self.log.insert("end", value)
-                if int(self.log.index("end-1c").split(".")[0]) > 2000:
-                    self.log.delete("1.0", "201.0")  # 仅裁剪控件中的早期文本；监控文件日志仍由核心独立写入。
-                self.log.see("end")
-                self.log.configure(state="disabled")
+                    self.status.set(value.strip())  # 状态摘要始终可见，不依赖辅助日志面板。
+                if self.auxiliary.get():
+                    self.log.configure(state="normal")
+                    self.log.insert("end", value)
+                    if int(self.log.index("end-1c").split(".")[0]) > 2000:
+                        self.log.delete("1.0", "201.0")  # 仅裁剪控件中的早期文本；监控文件日志仍由核心独立写入。
+                    self.log.see("end")
+                    self.log.configure(state="disabled")
         self.root.after(100, self._drain)  # 当前批次结束后重新预约，避免 busy-loop 占满 CPU。
 
     def start(self):  # 每次监控使用当前设置启动新进程，状态与上一轮任务隔离。
