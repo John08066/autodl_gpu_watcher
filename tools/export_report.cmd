@@ -3,7 +3,7 @@ call "%~dp0launcher.cmd"
 if errorlevel 1 exit /b 1
 "%PYTHON_EXE%" -m autodl_watcher.usage_report
 if errorlevel 1 exit /b 1
-set "LATEST_FILE=%PROJECT_DIR%..\autodl_watcher_runtime\usage\exports\LATEST_EXPORT.txt"
+set "LATEST_FILE=%PROJECT_DIR%runtime\usage\exports\LATEST_EXPORT.txt"
 if not exist "%LATEST_FILE%" (
   echo ERROR: report was not generated:
   echo %LATEST_FILE%

@@ -1,7 +1,5 @@
 .env
-runtime/browser_profile/
-runtime/state.json
-runtime/logs/*.log
+runtime/
 __pycache__/
 *.pyc
 .venv/

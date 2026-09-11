@@ -1,7 +1,7 @@
 @echo off
 call "%~dp0launcher.cmd"
 if errorlevel 1 exit /b 1
-set "LOG_FILE=%PROJECT_DIR%..\autodl_watcher_runtime\logs\watcher.log"
+set "LOG_FILE=%PROJECT_DIR%runtime\logs\watcher.log"
 if not exist "%LOG_FILE%" (
   echo ERROR: log file not found:
   echo %LOG_FILE%

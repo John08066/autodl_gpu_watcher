@@ -36,7 +36,7 @@ platform:
   api_path_contains: "/api/v2/machine/list"
   api_base_url: "https://private.autodl.com"
   browser_channel: "msedge"
-  user_data_dir: "../autodl_watcher_runtime/browser_profile"
+  user_data_dir: "runtime/browser_profile"
   headless: true
   response_timeout_seconds: 20
   # v0.5.2：主机列表 API 瞬时超时只重试，不再误判为登录失效。
@@ -105,9 +105,9 @@ usage_tracking:
   # 第一次疑似下机后下一轮立即复核，而不是再等完整 60 秒。
   absence_recheck_seconds: 5
   # SQLite 是实时写入的唯一事实源。WPS/Excel 打开 CSV 不会再阻塞监控。
-  database_path: "../autodl_watcher_runtime/usage/occupancy.db"
+  database_path: "runtime/usage/occupancy.db"
   # python -m autodl_watcher.usage_report 每次导出到独立时间戳目录。
-  export_dir: "../autodl_watcher_runtime/usage/exports"
+  export_dir: "runtime/usage/exports"
 
 notification:
   console_enabled: true
@@ -115,5 +115,5 @@ notification:
   subject_prefix: "[AutoDL 开机达标]"
 
 runtime:
-  state_file: "../autodl_watcher_runtime/state.json"
-  log_file: "../autodl_watcher_runtime/logs/watcher.log"
+  state_file: "runtime/state.json"
+  log_file: "runtime/logs/watcher.log"
