@@ -169,6 +169,7 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
         self._page: Page | None = None                # 当前页面
         self._authorization: str | None = None        # 内存中的 API 令牌
         self._machine_list_payload: dict[str, Any] | None = None
+        self._instance_tenant_uuid: str | None = None  # 仅在本次浏览器会话内缓存实例列表页面的租户标识。
 
     def start(self) -> None:  # 启动（或复用）Playwright 浏览器实例。
         if self._context is not None:  # 复用同一持久化会话，不为每次采样重新启动浏览器。
@@ -220,6 +221,7 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
             self._playwright = None
             self._authorization = None
             self._machine_list_payload = None
+            self._instance_tenant_uuid = None
             raise
 
     def close(self) -> None:  # 关闭浏览器并释放所有资源。
@@ -230,6 +232,7 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
         self._playwright = None
         self._authorization = None
         self._machine_list_payload = None
+        self._instance_tenant_uuid = None
         if context is not None:
             try:
                 context.close()
@@ -399,6 +402,77 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
         if not isinstance(payload_json, dict):
             raise RuntimeError(f"AutoDL API {path} returned non-object JSON")
         return payload_json
+
+    def get_instance_state(self, instance_uuid: str, machine_name: str) -> dict[str, str]:  # 双重匹配实例 UUID 与入口名。
+        if not instance_uuid.strip() or not machine_name.strip():
+            raise ValueError("instance_uuid 和 machine_name 不能为空")
+        self.start()
+        assert self._context is not None
+        if self._instance_tenant_uuid is None:
+            page = self._context.new_page()  # 独立页面采集真实租户请求体，不影响主机占用弹窗。
+            try:
+                def is_instance_list(request: Any) -> bool:
+                    return request.url.startswith(f"{self.config.api_base_url.rstrip('/')}/api/v2/instance/list") and request.method.upper() == "POST"
+
+                try:
+                    with page.expect_request(
+                        is_instance_list,
+                        timeout=self.config.response_timeout_seconds * 1000,
+                    ) as request_info:
+                        page.goto(
+                            f"{self.config.api_base_url.rstrip('/')}/console/instance",
+                            wait_until="domcontentloaded",
+                        )
+                    request_payload = request_info.value.post_data_json
+                except PlaywrightTimeoutError as exc:
+                    if self._url_is_login(page.url):
+                        raise PlatformAuthenticationError("AutoDL 实例列表已跳转登录页") from exc
+                    raise PlatformTransientError("未捕获到 AutoDL 实例列表请求") from exc
+            finally:
+                page.close()
+
+            tenant_uuid = request_payload.get("tenant_uuid") if isinstance(request_payload, dict) else None
+            if not isinstance(tenant_uuid, str) or not tenant_uuid.strip():
+                raise PlatformTransientError("实例列表请求缺少 tenant_uuid")
+            self._instance_tenant_uuid = tenant_uuid
+
+        page_size = 10  # 与官网实例列表默认分页一致；逐页核对后才允许认定目标状态。
+        total: int | None = None
+        matches: list[dict[str, Any]] = []
+        page_index = 1
+        while total is None or (page_index - 1) * page_size < total:
+            response = self.post_api_json(
+                "/api/v2/instance/list",
+                {"tenant_uuid": self._instance_tenant_uuid, "page_index": page_index, "page_size": page_size},
+            )
+            data = response.get("data")
+            if response.get("code") != "Success" or not isinstance(data, dict):
+                raise PlatformTransientError("实例列表 API 未返回成功数据")
+            rows = data.get("list")
+            count = data.get("result_total")
+            if not isinstance(rows, list) or type(count) is not int or count < 0:
+                raise PlatformTransientError("实例列表缺少可靠的 list/result_total")
+            if total is None:
+                total = count
+            expected_rows = min(page_size, max(0, total - (page_index - 1) * page_size))
+            if count != total or len(rows) != expected_rows:
+                raise PlatformTransientError("实例列表分页结果不完整或发生变化")
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get("instance_uuid"), str):
+                    raise PlatformTransientError("实例列表包含无法识别的实例")
+                if row["instance_uuid"] == instance_uuid:
+                    matches.append(row)
+            page_index += 1
+
+        if len(matches) != 1:
+            raise PlatformTransientError("实例列表中目标 UUID 缺失或重复")
+        if matches[0].get("machine_name") != machine_name:
+            raise PlatformTransientError("目标实例 UUID 与配置入口名不匹配")
+        status = matches[0].get("status")
+        start_mode = matches[0].get("start_mode")
+        if not isinstance(status, str) or not status.strip() or not isinstance(start_mode, str):
+            raise PlatformTransientError("目标实例缺少 status/start_mode")
+        return {"status": status, "start_mode": start_mode}
 
     def _find_occupancy_action(self, machine_name: str):  # 兼容表格/卡片两种页面结构，定位指定入口的“查看占用”。
         assert self._page is not None

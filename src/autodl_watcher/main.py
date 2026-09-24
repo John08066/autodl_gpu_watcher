@@ -178,6 +178,7 @@ def _build_parser(default_host: str) -> argparse.ArgumentParser:  # 构建 CLI �
     parser.add_argument("--stop-file", type=Path, help="UI 的安全停止信号文件")
     parser.add_argument("--max-cycles", type=int, default=0, help="限定轮数，0 为持续运行")
     parser.add_argument("--no-login", action="store_true", help="登录失效时退出，由 UI 完成登录")
+    parser.add_argument("--convert-no-gpu", action="store_true", help="固定入口显式允许无卡关机后有卡开机；需同时指定 --live。")
     parser.add_argument("--runtime-dir", type=Path, help="独立运行数据目录")
     return parser
 
@@ -318,6 +319,11 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
     except ValueError as exc:
         parser.error(str(exc))
 
+    if args.convert_no_gpu and (selected_entry is None or not args.live):
+        parser.error("无卡转有卡须同时指定固定 --entry 和 --live")
+    if args.convert_no_gpu and (len(selected_targets) != 1 or selected_targets[0].start_mode != "gpu"
+                                or not config.auto_start.verify_before_start):
+        parser.error("无卡转有卡仅支持一个有卡固定实例，并须启用开机前二次确认")
     dry_run = config.auto_start.dry_run
     if args.dry_run:
         dry_run = True
@@ -400,11 +406,14 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
         config.idle_thresholds,
         platform_collector,
         telemetry_collector,
+        convert_no_gpu=args.convert_no_gpu,
     )
 
     auto_mode = "关闭"
     if selected_auto_start.enabled:
         auto_mode = "DRY-RUN" if selected_auto_start.dry_run else "真实开机"
+        if args.convert_no_gpu:
+            auto_mode += "；所选实例无卡转有卡"
 
     entry_mode = (
         "自动选择[" + ", ".join(item.machine_name for item in selected_targets) + "]"
@@ -503,7 +512,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     pending_start_until = 0.0
                     pending_start_machine = ""
 
-                if self_active or occupancy_unknown or pending_start:  # 本人已占用、尚未查清或正在启动时，都阻止重复开机。
+                if self_active or occupancy_unknown or pending_start or starter.pending_switch:  # 本人占用、状态未知、正在启动或无卡关机中均阻止重复开机。
                     trigger_events = []
 
                 planned_target = None  # 根据实时空位预判入口。UNKNOWN 时仍显示预选入口，但不会真正开机。
@@ -541,6 +550,10 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     )
                     start_ready_text = "请求已受理"
                     action_text = "等待实例出现在占用详情"
+                elif starter.pending_switch:
+                    planned_text = starter.pending_switch.machine_name.removeprefix("autodl-")
+                    start_ready_text = "等待无卡关机"
+                    action_text = "确认关机后复核 GPU 再开机"
                 elif occupancy_unknown:
                     planned_text = (
                         planned_target.machine_name.removeprefix("autodl-")
@@ -773,6 +786,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     (config.usage_tracking.enabled and usage_targets and not self_occupancy_known)
                     or (self_occupancy_known and owned_instances)
                     or pending_start
+                    or starter.pending_switch
                 ):
                     trigger_events = []
 
@@ -781,26 +795,35 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                         email_notifier.send(event)
 
                 if selected_auto_start.enabled and not stop_requested():
-                    for event in trigger_events[: selected_auto_start.max_starts_per_event]:
-                        result = starter.attempt(event)  # 协调器负责选择实例、开机前复核及实际请求；主循环处理后续确认。
+                    results = []
+                    if starter.pending_switch:  # 关机后的状态推进不依赖 evaluator 再次触发。
+                        if not (config.usage_tracking.enabled and usage_targets and not self_occupancy_known) and not owned_instances and not pending_start:
+                            result = starter.continue_switch(stop_requested)
+                            if result is not None:
+                                results.append(result)
+                    else:
+                        results = [starter.attempt(event, stop_requested) for event in
+                                   trigger_events[: selected_auto_start.max_starts_per_event]]
+                    for result in results:
                         result_text = format_start_result(result)
-                        if result.status == "request_accepted":
-                            result_text = _green_terminal_text(result_text)  # 受理成功 != 已开机。进入 120 秒“等待占用确认”状态， 只有占用详情实时看到 self_user 后才会变成绿色。
+                        if result.status in {"request_accepted", "gpu_start_observed"}:
+                            result_text = _green_terminal_text(result_text)  # 请求受理或实例启动已观测；仍需占用详情确认。
                             pending_start_until = (
                                 time.monotonic() + _POWER_ON_CONFIRM_GRACE_SECONDS
                             )
                             pending_start_machine = result.machine_name or ""
                             next_usage_capture = 0.0  # 开机请求受理后尽快读取占用详情，核实是否真正出现实例。
                             logger.info(
-                                "power_on accepted; waiting occupancy confirmation host=%s machine=%s instance=%s grace=%ss",
+                                "gpu start pending occupancy confirmation status=%s host=%s machine=%s instance=%s grace=%ss",
+                                result.status,
                                 result.host,
                                 result.machine_name,
                                 result.instance_uuid,
                                 _POWER_ON_CONFIRM_GRACE_SECONDS,
                             )
                         elif (
-                            not selected_auto_start.dry_run
-                            and result.status in {"request_failed", "recheck_failed", "no_target"}
+                            not selected_auto_start.dry_run and not starter.pending_switch
+                            and result.status in {"request_failed", "recheck_failed", "no_target", "shutdown_failed", "instance_state_blocked"}
                         ):
                             evaluator.rearm_host(selected_host)  # 请求根本没有成功落地时，不能让 evaluator 的 alerted 锁住后续重试。
                         print(result_text, flush=True)
