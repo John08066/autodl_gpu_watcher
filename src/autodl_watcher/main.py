@@ -4,6 +4,7 @@ import argparse
 import logging
 import math
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, replace
@@ -61,6 +62,26 @@ def _green_terminal_text(text: str) -> str:  # 仅在交互式终端中为文本
     if not sys.stdout.isatty():
         return text
     return f"{_ANSI_BRIGHT_GREEN}{text}{_ANSI_RESET}"
+
+
+_INSTANCE_UUID = re.compile(r"[0-9a-fA-F]{10}-[0-9a-fA-F]{8}")
+_OCCUPANCY_ID_LINE = re.compile(r"([0-9a-fA-F]{10}-[0-9a-fA-F]{8})(?:[ \t]*\([^()\r\n]*\))?")
+
+
+def _instance_ids_from_cell(value: str) -> tuple[list[str], bool]:  # 每行必须是完整 ID，可附括号标签；畸形片段不能证明本人缺席。
+    if not isinstance(value, str):
+        return [], False
+    ids: list[str] = []
+    complete = True
+    for line in value.splitlines():
+        if not line.strip():
+            continue
+        match = _OCCUPANCY_ID_LINE.fullmatch(line.strip())
+        if match is None:
+            complete = False
+        else:
+            ids.append(match.group(1).lower())
+    return ids, complete and bool(ids)
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,6 +423,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
     previous_account_clear = False  # 实例列表确认状态变化时重新武装 GPU 空闲事件。
     account_occupancy_conflict = False  # 新鲜弹窗有卡却被列表判无卡时，保持阻断直到可靠空快照。
     last_occupancy_failed = False  # 将弹窗采集故障与实例状态分别显示。
+    occupancy_identity_unresolved = False  # 无用户名占用行未获账号实例列表核实时持续阻断开机。
 
     starter = AutoStartCoordinator(
         selected_auto_start,
@@ -476,6 +498,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     raise PlatformTransientError("所选主机或入口不在当前账号的实时主机列表中")
                 selected_instance_state = None
                 selected_instance_error = False
+                selected_instance_missing = False
                 if args.convert_no_gpu:  # 占用弹窗失败也要独立查询完整实例列表，确认所选无卡实例及同账号其他入口。
                     target = selected_targets[0]
                     try:
@@ -485,6 +508,10 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                         raise
                     except Exception as exc:
                         selected_instance_error = True
+                        selected_instance_missing = (
+                            isinstance(exc, PlatformTransientError)
+                            and str(exc) == "实例列表中目标 UUID 缺失或重复"
+                        )
                         logger.warning("selected instance state query failed host=%s entry=%s: %s",
                                        selected_host, target.machine_name, exc)
                 selected_account_clear = bool(
@@ -498,7 +525,9 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     evaluator.rearm_host(selected_host)  # 先前被未知占用抑制的达标事件可再次触发。
                 previous_account_clear = selected_account_clear
                 if selected_instance_error:
-                    selected_instance_text = "查询失败"
+                    selected_instance_text = (
+                        "配置实例不存在或ID已过期" if selected_instance_missing else "查询失败"
+                    )
                 elif selected_instance_state is None:
                     selected_instance_text = "未查询"
                 else:
@@ -535,7 +564,10 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                 occupancy_unknown = (
                     config.usage_tracking.enabled and bool(usage_targets) and not self_occupancy_known
                 )
-                occupancy_blocked = (occupancy_unknown and not selected_account_clear) or account_occupancy_conflict  # 旧记录可覆盖，新鲜证据冲突不可覆盖。
+                occupancy_blocked = (
+                    (occupancy_unknown and not selected_account_clear)
+                    or account_occupancy_conflict or occupancy_identity_unresolved
+                )  # 未核实身份的有卡占用行不允许被实例列表的旧判断覆盖。
                 pending_start = (
                     pending_start_until > 0 and time.monotonic() < pending_start_until
                 )
@@ -592,6 +624,10 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     planned_text = starter.pending_switch.machine_name.removeprefix("autodl-")
                     start_ready_text = "等待无卡关机"
                     action_text = "确认关机后复核 GPU 再开机"
+                elif occupancy_identity_unresolved:
+                    planned_text = selected_targets[0].machine_name.removeprefix("autodl-")
+                    start_ready_text = "占用身份未确认"
+                    action_text = "暂缓切换，等待账号实例列表核实占用"
                 elif account_occupancy_conflict:
                     planned_text = selected_targets[0].machine_name.removeprefix("autodl-")
                     start_ready_text = "占用证据冲突"
@@ -713,11 +749,48 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     if stop_requested():
                         break  # 停止时丢弃不完整快照，不写入伪下机事件。
                     last_occupancy_failed = bool(failed_entries)
+                    unknown_rows = [item for item in raw_occupancy if item.occupied and not item.user.strip()]
+                    identity_unresolved_now = False
+                    if unknown_rows:  # 新版六列弹窗无用户名，只能用完整账号实例列表的精确 UUID 归属。
+                        try:
+                            account_rows = platform_collector.get_account_instances()
+                            if not isinstance(account_rows, list):
+                                raise PlatformTransientError("账号实例列表不完整")
+                            account_ids: set[str] = set()
+                            for row in account_rows:
+                                instance_id = row.get("instance_uuid") if isinstance(row, dict) else None
+                                if not isinstance(instance_id, str) or not _INSTANCE_UUID.fullmatch(instance_id):
+                                    raise PlatformTransientError("账号实例列表含无法识别的 UUID")
+                                if instance_id.lower() in account_ids:
+                                    raise PlatformTransientError("账号实例列表有重复 UUID")
+                                account_ids.add(instance_id.lower())
+                            identity_label = self_user or "当前账号"
+                            resolved_occupancy = []
+                            for item in raw_occupancy:
+                                if not item.occupied or item.user.strip():  # 旧版七列的明确用户名继续沿用。
+                                    resolved_occupancy.append(item)
+                                    continue
+                                instance_ids, complete_ids = _instance_ids_from_cell(item.instance_id)
+                                for instance_id in instance_ids:
+                                    resolved_occupancy.append(replace(
+                                        item, instance_id=instance_id,
+                                        user=identity_label if instance_id in account_ids else ""))
+                                if not complete_ids:  # 保留原始畸形单元格供日志审计，并阻断缺席判定。
+                                    identity_unresolved_now = True
+                                    resolved_occupancy.append(item)
+                            raw_occupancy = resolved_occupancy
+                        except PlatformAuthenticationError:
+                            raise
+                        except Exception as exc:
+                            identity_unresolved_now = True
+                            logger.warning("occupancy identity query failed host=%s: %s", selected_host, exc)
+                    if identity_unresolved_now:
+                        occupancy_identity_unresolved = True
                     try:  # 先判定本人状态，再决定该轮是否允许 SQLite 生成 END_SEEN。 第一次可靠空快照只是“疑似结束”，不会立即关掉 current_instances。
-                        complete_occupancy_snapshot = not failed_entries  # 只有所有目标入口成功读取，本轮才具备确认消失的资格。
+                        complete_occupancy_snapshot = not failed_entries and not identity_unresolved_now
                         captured_owned = _owned_instances_from_records(
                             raw_occupancy,
-                            self_user,
+                            self_user or "当前账号",
                             selected_host,
                         )
                         previous_known = self_occupancy_known
@@ -733,6 +806,10 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                             )
                         )
 
+                        if complete_occupancy_snapshot and (captured_owned or confirmed_absence):
+                            if occupancy_identity_unresolved:
+                                evaluator.rearm_host(selected_host)
+                            occupancy_identity_unresolved = False
                         if captured_owned:
                             fresh_occupancy_positive = True
                             if selected_account_clear:
@@ -846,6 +923,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                      and not selected_account_clear)
                     or fresh_occupancy_positive
                     or account_occupancy_conflict
+                    or occupancy_identity_unresolved
                     or (self_occupancy_known and owned_instances and not selected_account_clear)
                     or pending_start
                     or starter.pending_switch
@@ -859,7 +937,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                 if selected_auto_start.enabled and not stop_requested():
                     results = []
                     if starter.pending_switch:  # 关机后的状态推进不依赖 evaluator 再次触发。
-                        if not account_occupancy_conflict and not fresh_occupancy_positive and not (owned_instances and not selected_account_clear) and not pending_start:  # 旧记录可覆盖，证据冲突仍阻断。
+                        if not account_occupancy_conflict and not occupancy_identity_unresolved and not fresh_occupancy_positive and not (owned_instances and not selected_account_clear) and not pending_start:  # 旧记录可覆盖，证据冲突仍阻断。
                             result = starter.continue_switch(stop_requested)
                             if result is not None:
                                 results.append(result)
@@ -912,6 +990,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                 )
                 self_gpu_text = ('有（本轮弹窗）' if fresh_occupancy_positive
                                  else '待复核（占用证据冲突）' if account_occupancy_conflict
+                                 else '待确认（占用身份未确认）' if occupancy_identity_unresolved
                                  else '无（实例列表）' if selected_account_clear
                                  else '有' if owned_instances else '无' if self_occupancy_known else '待确认')
                 detail = (f" · 所选实例 {selected_instance_text}" if args.convert_no_gpu else "")
@@ -932,6 +1011,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     login_validation_pending = True
                     self_occupancy_known = False  # 登录会话更新后重新确认本人占用，不沿用更新前的判断。
                     owned_instances = []
+                    occupancy_identity_unresolved = False
                     pending_start_until = 0.0
                     pending_start_machine = ""
                     evaluator.rearm_host(selected_host)

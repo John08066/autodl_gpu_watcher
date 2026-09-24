@@ -72,7 +72,7 @@ auto_start:
   targets:
     - host: "gpu-203"
       machine_name: "autodl-203-1"
-      instance_uuid: "24a444b2d9-c69a6bf8"
+      instance_uuid: "24a444b2d9-cd2fbe9a"
       start_mode: "gpu"
       priority: 10
       enabled: true
