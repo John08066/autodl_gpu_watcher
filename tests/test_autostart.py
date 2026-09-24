@@ -1,6 +1,8 @@
 from __future__ import annotations  # 自动开机模块的单元测试。
 
 import unittest
+from dataclasses import replace
+from unittest.mock import Mock, call
 from datetime import datetime, timedelta
 
 from autodl_watcher.autostart import AutoStartCoordinator, is_instant_idle, select_target
@@ -10,7 +12,7 @@ from autodl_watcher.config import (
     IdleThresholds,
     MonitorConfig,
 )
-from autodl_watcher.models import AvailabilityAlert, ConfirmedGpu, GpuSample
+from autodl_watcher.models import AvailabilityAlert, ConfirmedGpu, GpuSample, PlatformHost
 
 
 class AutoStartTest(unittest.TestCase):
@@ -132,6 +134,165 @@ class AutoStartTest(unittest.TestCase):
         config = AutoStartConfig(True, "gpu-203", True, True, 0, 0, 1, (target_203_2, target_203_1))
         slots = (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2))
         self.assertEqual(select_target(config, "gpu-203", platform_slots=slots), target_203_1)
+
+
+class NoGpuConversionTest(unittest.TestCase):
+    def setUp(self):
+        self.first = AutoStartTarget("gpu-203", "autodl-203-1", "instance-1", "gpu", 10, True)
+        self.second = AutoStartTarget("gpu-203", "autodl-203-2", "instance-2", "gpu", 20, True)
+        self.config = AutoStartConfig(True, "gpu-203", False, True, 0, -1, 1, (self.first, self.second))
+        self.monitor = MonitorConfig(1, 0, 1, 2, 90, 1)
+        self.thresholds = IdleThresholds(False, 100, 8192, 0.25)
+        self.platform = Mock()
+        self.telemetry = Mock()
+        self.telemetry.collect.return_value = [
+            GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())
+        ]
+        self.before = PlatformHost("gpu-203", 2, 2,
+            ("autodl-203-1", "autodl-203-2"),
+            (("autodl-203-1", 2, 2), ("autodl-203-2", 1, 2)))
+        self.after = PlatformHost("gpu-203", 2, 2,
+            ("autodl-203-1", "autodl-203-2"),
+            (("autodl-203-1", 1, 2), ("autodl-203-2", 2, 2)))
+        self.alert = AvailabilityAlert("gpu-203", 2, 2, 2, 1, (),
+            ("autodl-203-1", "autodl-203-2"), self.before.source_slots)
+
+    def _starter(self):
+        return AutoStartCoordinator(self.config, self.monitor, self.thresholds,
+                                    self.platform, self.telemetry, convert_no_gpu=True)
+
+    def test_shutdown_then_confirm_same_uuid_and_power_on_gpu(self):
+        self.platform.collect.side_effect = [[self.before], [self.after]]
+        self.platform.get_instance_state.side_effect = [
+            {"status": "running", "start_mode": "non_gpu"},
+            {"status": "shutting_down", "start_mode": "non_gpu"},
+            {"status": "shutdown", "start_mode": "non_gpu"},
+            {"status": "shutdown", "start_mode": "non_gpu"},
+        ]
+        self.platform.post_api_json.return_value = {"code": "Success"}
+        starter = self._starter()
+        self.assertEqual(starter.attempt(self.alert).status, "shutdown_requested")
+        self.assertEqual(starter.pending_switch, self.first)
+        self.assertEqual(starter.continue_switch().status, "shutdown_pending")
+        self.assertEqual(self.platform.post_api_json.call_count, 1)
+        self.assertEqual(starter.continue_switch().status, "request_accepted")
+        self.assertIsNone(starter.pending_switch)
+        self.assertEqual(self.platform.post_api_json.call_args_list, [
+            call("/api/v2/instance/power_off", {"instance_uuid": "instance-1", "release": "now"}),
+            call("/api/v2/instance/power_on", {"instance_uuid": "instance-1", "start_mode": "gpu"}),
+        ])
+
+    def test_target_slot_lost_after_shutdown_never_uses_other_instance(self):
+        lost = replace(self.after, source_slots=(("autodl-203-1", 0, 2), ("autodl-203-2", 2, 2)))
+        self.platform.collect.side_effect = [[self.before], [lost]]
+        self.platform.get_instance_state.side_effect = [
+            {"status": "running", "start_mode": "non_gpu"},
+            {"status": "shutdown", "start_mode": "non_gpu"},
+        ]
+        self.platform.post_api_json.return_value = {"code": "Success"}
+        starter = self._starter()
+        self.assertEqual(starter.attempt(self.alert).status, "shutdown_requested")
+        self.assertEqual(starter.continue_switch().status, "recheck_failed")
+        self.assertEqual(self.platform.post_api_json.call_count, 1)
+        self.assertEqual(starter.pending_switch, self.first)
+
+    def test_running_gpu_or_shutting_down_blocks_power_off_and_power_on(self):
+        for status, mode in (("running", "gpu"), ("shutting_down", "non_gpu"), ("starting", "gpu")):
+            with self.subTest(status=status):
+                self.platform.reset_mock()
+                self.platform.collect.return_value = [self.before]
+                self.platform.get_instance_state.return_value = {"status": status, "start_mode": mode}
+                starter = self._starter()
+                self.assertEqual(starter.attempt(self.alert).status, "instance_state_blocked")
+                self.platform.post_api_json.assert_not_called()
+
+    def test_rejected_shutdown_and_stop_signal_fail_closed(self):
+        self.platform.collect.return_value = [self.before]
+        self.platform.get_instance_state.return_value = {"status": "running", "start_mode": "non_gpu"}
+        self.platform.post_api_json.return_value = {"code": "Failure", "msg": "busy"}
+        starter = self._starter()
+        self.assertEqual(starter.attempt(self.alert).status, "shutdown_failed")
+        self.assertIsNone(starter.pending_switch)
+        self.platform.post_api_json.reset_mock()
+        self.assertEqual(starter.attempt(self.alert, stop_requested=lambda: True).status, "cancelled")
+        self.platform.post_api_json.assert_not_called()
+
+    def test_conflicting_status_after_shutdown_never_repeats_power_off(self):
+        self.platform.collect.side_effect = [[self.before], [self.after]]
+        self.platform.get_instance_state.side_effect = [
+            {"status": "running", "start_mode": "non_gpu"},
+            {"status": "shutdown", "start_mode": "non_gpu"},
+            {"status": "running", "start_mode": "non_gpu"},
+        ]
+        self.platform.post_api_json.return_value = {"code": "Success"}
+        starter = self._starter()
+        self.assertEqual(starter.attempt(self.alert).status, "shutdown_requested")
+        self.assertEqual(starter.continue_switch().status, "instance_state_blocked")
+        self.assertEqual(starter.pending_switch, self.first)
+        self.assertEqual(self.platform.post_api_json.call_count, 1)
+
+    def test_existing_gpu_start_clears_pending_without_second_power_on(self):
+        self.platform.collect.return_value = [self.before]
+        self.platform.get_instance_state.side_effect = [
+            {"status": "running", "start_mode": "non_gpu"},
+            {"status": "starting", "start_mode": "gpu"},
+        ]
+        self.platform.post_api_json.return_value = {"code": "Success"}
+        starter = self._starter()
+        self.assertEqual(starter.attempt(self.alert).status, "shutdown_requested")
+        self.assertEqual(starter.continue_switch().status, "gpu_start_observed")
+        self.assertIsNone(starter.pending_switch)
+        self.assertEqual(self.platform.post_api_json.call_count, 1)
+
+    def test_lost_shutdown_response_still_tracks_same_uuid(self):
+        self.platform.collect.side_effect = [[self.before], [self.after]]
+        self.platform.get_instance_state.side_effect = [
+            {"status": "running", "start_mode": "non_gpu"},
+            {"status": "shutdown", "start_mode": "non_gpu"},
+            {"status": "shutdown", "start_mode": "non_gpu"},
+        ]
+        self.platform.post_api_json.side_effect = [TimeoutError("response lost"), {"code": "Success"}]
+        starter = self._starter()
+        self.assertEqual(starter.attempt(self.alert).status, "shutdown_uncertain")
+        self.assertEqual(starter.pending_switch, self.first)
+        self.assertEqual(starter.continue_switch().status, "request_accepted")
+        self.assertEqual(self.platform.post_api_json.call_args_list, [
+            call("/api/v2/instance/power_off", {"instance_uuid": "instance-1", "release": "now"}),
+            call("/api/v2/instance/power_on", {"instance_uuid": "instance-1", "start_mode": "gpu"}),
+        ])
+
+    def test_lost_gpu_start_response_does_not_repeat_power_on(self):
+        self.platform.collect.side_effect = [[self.before], [self.after]]
+        self.platform.get_instance_state.side_effect = [
+            {"status": "running", "start_mode": "non_gpu"},
+            {"status": "shutdown", "start_mode": "non_gpu"},
+            {"status": "shutdown", "start_mode": "non_gpu"},
+            {"status": "shutdown", "start_mode": "non_gpu"},
+        ]
+        self.platform.post_api_json.side_effect = [{"code": "Success"}, TimeoutError("response lost")]
+        starter = self._starter()
+        self.assertEqual(starter.attempt(self.alert).status, "shutdown_requested")
+        with self.assertRaises(TimeoutError):
+            starter.continue_switch()
+        self.assertEqual(starter.continue_switch().status, "gpu_start_uncertain")
+        self.assertEqual(self.platform.post_api_json.call_count, 2)
+        self.assertEqual(starter.pending_switch, self.first)
+
+    def test_restart_after_shutdown_can_start_fixed_instance(self):
+        self.platform.collect.return_value = [self.before]
+        self.platform.get_instance_state.return_value = {"status": "shutdown", "start_mode": "non_gpu"}
+        self.platform.post_api_json.return_value = {"code": "Success"}
+        starter = self._starter()
+        self.assertEqual(starter.attempt(self.alert).status, "request_accepted")
+        self.platform.post_api_json.assert_called_once_with(
+            "/api/v2/instance/power_on", {"instance_uuid": "instance-1", "start_mode": "gpu"})
+
+    def test_dry_run_does_not_query_instance_or_send_state_change(self):
+        starter = AutoStartCoordinator(replace(self.config, dry_run=True), self.monitor,
+            self.thresholds, self.platform, self.telemetry, convert_no_gpu=True)
+        self.assertEqual(starter.attempt(self.alert).status, "dry_run")
+        self.platform.get_instance_state.assert_not_called()
+        self.platform.post_api_json.assert_not_called()
 
 
 if __name__ == "__main__":

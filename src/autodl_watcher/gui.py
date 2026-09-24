@@ -25,7 +25,7 @@ def worker_python():  # GUI 用 pythonw，后台任务用带管道且无窗口�
     return str(executable.with_name("python.exe")) if executable.name.lower() == "pythonw.exe" else sys.executable
 
 
-def monitor_command(config, entry, user, poll, usage, live, stop_file):  # 构造与 CLI 相同的监控命令。
+def monitor_command(config, entry, user, poll, usage, live, stop_file, convert_no_gpu=False):  # 构造与 CLI 相同的监控命令。
     from .cli import normalize_host
     if not entry:  # 没选入口就拒绝启动，避免误用命令行默认主机。
         raise ValueError("请先选择服务器入口")
@@ -36,10 +36,13 @@ def monitor_command(config, entry, user, poll, usage, live, stop_file):  # 构�
                    if item.machine_name == entry and item.enabled and item.instance_uuid), None)
     if live and (target is None or not config.auto_start.enabled):  # 可见主机不等于已有可开机实例，真实模式需要有效配置。
         raise ValueError("此入口尚未配置启用的开机实例，请先只读监控或在 config.yaml 配置 targets")
-    return [worker_python(), "-u", "-m", "autodl_watcher.main", "--config", str(ROOT / "config.yaml"),
+    if convert_no_gpu and not live:
+        raise ValueError("无卡转有卡须同时启用真实自动开机")
+    command = [worker_python(), "-u", "-m", "autodl_watcher.main", "--config", str(ROOT / "config.yaml"),
             "--host", normalize_host(entry), "--entry", entry, "--user", user.strip(),
             "--poll-seconds", str(poll), "--usage-seconds", str(usage),
-            "--live" if live else "--dry-run", "--no-login", "--stop-file", str(stop_file)]  # 参数列表直接传给进程，不经 shell 拼接；UI 单独负责人工登录。
+            "--live" if live else "--dry-run", "--no-login", "--stop-file", str(stop_file)]  # 参数列表直接传给进程，不经 shell 拼接。
+    return command + (["--convert-no-gpu"] if convert_no_gpu else [])
 
 
 class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main.run_monitor 执行。
@@ -57,6 +60,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         self.poll = tk.StringVar(value=str(self.config.monitor.poll_seconds))
         self.usage = tk.StringVar(value=str(self.config.usage_tracking.interval_seconds))
         self.live = tk.BooleanVar(value=False)  # 每次开窗都默认只读，不从历史偏好恢复付费开机开关。
+        self.convert_no_gpu = tk.BooleanVar(value=False)  # 关机切换每次也需显式选择，不保存为偏好。
         self.auxiliary = tk.BooleanVar(value=False)  # 日志面板与报表默认隐藏，需要时由用户显式展开。
         self.status = tk.StringVar(value="未运行 · 选择入口后开始监控")
         self.saved_entry = ""
@@ -118,9 +122,11 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
             self.inputs.append(entry)
         self.live_check = ttk.Checkbutton(options, text="启用真实自动开机（会产生 AutoDL 费用）", variable=self.live)
         self.live_check.grid(row=2, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+        self.convert_check = ttk.Checkbutton(options, text="空闲时将所选无卡实例关机并改为有卡开机（会中断实例）", variable=self.convert_no_gpu)
+        self.convert_check.grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=5)
         self.auxiliary_check = ttk.Checkbutton(options, text="显示辅助工具（运行日志与占用报表）",
                                                 variable=self.auxiliary, command=self._toggle_auxiliary)
-        self.auxiliary_check.grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+        self.auxiliary_check.grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=5)
         controls = ttk.Frame(frame)
         controls.pack(fill="x", pady=8)
         self.start_button = ttk.Button(controls, text="开始监控", command=self.start)
@@ -158,7 +164,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
 
     def _command(self):  # 从控件快照生成启动参数；不改写受 Git 管理的 YAML。
         return monitor_command(self.config, self.selected_entry(), self.user.get(), self.poll.get(),
-                               self.usage.get(), self.live.get(), self.stop_file)
+                               self.usage.get(), self.live.get(), self.stop_file, self.convert_no_gpu.get())
 
     def save(self):  # 保存输入前复用启动校验，避免把明显无效的设置留到下次。
         try:
@@ -176,7 +182,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
 
     def _busy(self, value):  # 统一切换操作权限；监控时能停止，登录时能确认同步。
         for button in [self.refresh_button, self.login_button, self.start_button, self.save_button,
-                       self.export_button, self.live_check, self.auxiliary_check, *self.inputs]:
+                       self.export_button, self.live_check, self.convert_check, self.auxiliary_check, *self.inputs]:
             button.configure(state="disabled" if value else "normal")
         self.stop_button.configure(state="normal" if value and self.job == "monitor" else "disabled")
         self.login_done.configure(state="normal" if value and self.job == "login" else "disabled")

@@ -46,6 +46,17 @@ class GuiOptionsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             monitor_command(self.config, "autodl-999-1", "测试用户", 1, 2, True, Path("stop"))
 
+    def test_no_gpu_conversion_requires_live_and_fixed_entry(self):
+        with self.assertRaises(ValueError):
+            monitor_command(self.config, "autodl-203-1", "user", 1, 2, False, Path("stop"), True)
+        command = monitor_command(self.config, "autodl-203-1", "user", 1, 2, True, Path("stop"), True)
+        self.assertIn("--convert-no-gpu", command)
+        self.assertIn("--entry", command)
+        self.assertEqual(command[command.index("--entry") + 1], "autodl-203-1")
+        for args in (["--convert-no-gpu", "--live"], ["--convert-no-gpu", "--entry", "1", "--dry-run"]):
+            with self.subTest(args=args), self.assertRaises(SystemExit):
+                main(["--config", str(ROOT / "config.yaml"), *args])
+
     def test_empty_username_is_rejected(self):
         with self.assertRaises(ValueError):
             monitor_command(self.config, "autodl-203-1", " ", 1, 2, False, Path("stop"))

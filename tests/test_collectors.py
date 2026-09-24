@@ -448,3 +448,121 @@ class OccupancyValidationV054Test(unittest.TestCase):
         with self.assertRaises(OccupancySnapshotMismatchError):
             validate_occupancy_snapshot(records, machine_name="autodl-202-4", expected_idle=3,
                                         expected_total=3, expected_gpu_indices={0, 1})
+
+
+class InstanceStateCollectorTest(unittest.TestCase):
+    @staticmethod
+    def _collector(tenant_payload=None):
+        collector = PlatformBrowserCollector(PlatformClassificationV052Test._config())
+        collector.start = Mock()
+        collector._context = Mock()
+        page = Mock()
+        page.url = "https://private.autodl.com/console/instance"
+        request = Mock()
+        request.url = "https://private.autodl.com/api/v2/instance/list"
+        request.method = "POST"
+        request.post_data_json = (
+            {"tenant_uuid": "tenant-123", "page_index": 1, "page_size": 10}
+            if tenant_payload is None else tenant_payload
+        )
+        manager = MagicMock()
+        manager.__enter__.return_value.value = request
+        page.expect_request.return_value = manager
+        collector._context.new_page.return_value = page
+        return collector, page
+
+    @staticmethod
+    def _response(rows, total):
+        return {"code": "Success", "data": {"list": rows, "result_total": total}}
+
+    def test_exact_uuid_on_second_page_and_close_temporary_page(self):
+        collector, page = self._collector()
+        first = [
+            {"instance_uuid": f"other-{index}", "status": "shutdown", "start_mode": "gpu"}
+            for index in range(10)
+        ]
+        second = [{"instance_uuid": "target", "machine_name": "autodl-203-1",
+                   "status": "running", "start_mode": "non_gpu"}]
+        collector.post_api_json = Mock(side_effect=[
+            self._response(first, 11), self._response(second, 11),
+        ])
+
+        self.assertEqual(
+            collector.get_instance_state("target", "autodl-203-1"),
+            {"status": "running", "start_mode": "non_gpu"},
+        )
+        self.assertEqual(collector.post_api_json.call_count, 2)
+        self.assertEqual(collector.post_api_json.call_args_list[1].args, (
+            "/api/v2/instance/list",
+            {"tenant_uuid": "tenant-123", "page_index": 2, "page_size": 10},
+        ))
+        predicate = page.expect_request.call_args.args[0]
+        self.assertTrue(predicate(page.expect_request.return_value.__enter__.return_value.value))
+        self.assertFalse(predicate(Mock(url="https://other.example/api/v2/instance/list", method="POST")))
+        page.goto.assert_called_once_with(
+            "https://private.autodl.com/console/instance", wait_until="domcontentloaded",
+        )
+        page.close.assert_called_once()
+
+    def test_wrong_machine_for_valid_uuid_fails_closed(self):
+        collector, page = self._collector()
+        collector.post_api_json = Mock(return_value=self._response([
+            {"instance_uuid": "target", "machine_name": "autodl-203-2",
+             "status": "running", "start_mode": "non_gpu"}], 1))
+        with self.assertRaisesRegex(PlatformTransientError, "入口名不匹配"):
+            collector.get_instance_state("target", "autodl-203-1")
+        page.close.assert_called_once()
+
+    def test_missing_or_duplicate_uuid_is_not_a_shutdown_signal(self):
+        for rows in (
+            [{"instance_uuid": "target-other", "status": "shutdown", "start_mode": "gpu"}],
+            [
+                {"instance_uuid": "target", "status": "shutdown", "start_mode": "gpu"},
+                {"instance_uuid": "target", "status": "running", "start_mode": "non_gpu"},
+            ],
+        ):
+            with self.subTest(rows=rows):
+                collector, page = self._collector()
+                collector.post_api_json = Mock(return_value=self._response(rows, len(rows)))
+                with self.assertRaises(PlatformTransientError):
+                    collector.get_instance_state("target", "autodl-203-1")
+                page.close.assert_called_once()
+
+    def test_bad_list_or_business_failure_fails_closed(self):
+        responses = (
+            {"code": "Failure", "data": {"list": [], "result_total": 0}},
+            {"code": "Success", "data": {"list": [], "result_total": 1}},
+            {"code": "Success", "data": {"list": [], "result_total": "1"}},
+            self._response([{"instance_uuid": "target", "status": "running"}], 1),
+        )
+        for response in responses:
+            with self.subTest(response=response):
+                collector, page = self._collector()
+                collector.post_api_json = Mock(return_value=response)
+                with self.assertRaises(PlatformTransientError):
+                    collector.get_instance_state("target", "autodl-203-1")
+                page.close.assert_called_once()
+
+    def test_missing_tenant_never_calls_instance_api(self):
+        collector, page = self._collector({"page_index": 1})
+        collector.post_api_json = Mock()
+        with self.assertRaisesRegex(PlatformTransientError, "tenant_uuid"):
+            collector.get_instance_state("target", "autodl-203-1")
+        collector.post_api_json.assert_not_called()
+        page.close.assert_called_once()
+
+    def test_login_redirect_is_distinct_from_transient_timeout(self):
+        timeout_type = __import__("playwright.sync_api", fromlist=["TimeoutError"]).TimeoutError
+        for url, error_type in (
+            ("https://private.autodl.com/login", PlatformAuthenticationError),
+            ("https://private.autodl.com/console/instance", PlatformTransientError),
+        ):
+            with self.subTest(url=url):
+                collector, page = self._collector()
+                page.url = url
+                page.expect_request.return_value.__enter__.side_effect = timeout_type("slow")
+                collector.post_api_json = Mock()
+                with self.assertRaises(error_type):
+                    collector.get_instance_state("target", "autodl-203-1")
+                collector.post_api_json.assert_not_called()
+                page.close.assert_called_once()

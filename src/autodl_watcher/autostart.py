@@ -3,9 +3,10 @@ from __future__ import annotations  # 自动开机协调器 — AutoStartCoordin
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .collectors import (
+    PlatformAuthenticationError,
     PlatformBrowserCollector,
     TelemetryApiCollector,
     filter_samples_to_platform_candidates,
@@ -101,15 +102,21 @@ class AutoStartCoordinator:  # 自动开机协调器。
         thresholds: IdleThresholds,
         platform: PlatformBrowserCollector,
         telemetry: TelemetryApiCollector,
+        convert_no_gpu: bool = False,
     ) -> None:  # 初始化自动开机协调器，并注入配置、平台采集器与物理 GPU 采集器。
         self.config = config          # 自动开机配置（含 dry_run 模式）
         self.monitor = monitor        # 监控参数（stale_after_seconds 等）
         self.thresholds = thresholds  # 显存阈值
         self.platform = platform      # 平台采集器（用于二次确认）
         self.telemetry = telemetry    # Telemetry 采集器（用于二次确认）
+        self.convert_no_gpu = convert_no_gpu  # 固定入口显式启用无卡转有卡。
+        self.pending_switch: AutoStartTarget | None = None  # 关机受理后锁定原实例 UUID。
+        self._pending_alert: AvailabilityAlert | None = None
+        self._switch_power_on_sent = False  # 响应丢失时不重复发送有卡开机。
 
-    def attempt(self, alert: AvailabilityAlert) -> StartAttemptResult:  # 执行一次自动开机尝试。
-        target = select_target( self.config, alert.host, platform_slots=alert.platform_slots, )
+    def attempt(self, alert: AvailabilityAlert, stop_requested: Callable[[], bool] = lambda: False,
+                target_override: AutoStartTarget | None = None) -> StartAttemptResult:  # 执行一次自动开机尝试。
+        target = target_override or select_target( self.config, alert.host, platform_slots=alert.platform_slots, )
         if target is None:
             return StartAttemptResult(
                 status="no_target",
@@ -159,11 +166,13 @@ class AutoStartCoordinator:  # 自动开机协调器。
                     platform_total_before=host_state.total_count,
                 )
 
-            target = select_target(  # 用最新 source_slots 重新选择入口（而非沿用 evaluator 的旧数据）
-                self.config,
-                alert.host,
-                platform_slots=host_state.source_slots,
-            )
+            if target_override is not None:  # 关机后的有卡开机只允许原入口、原 UUID。
+                slots = _slot_map(host_state.source_slots)
+                target = target_override if slots.get(target_override.machine_name, (0, 0))[0] > 0 else None
+            else:
+                target = select_target(  # 普通开机继续按最新入口空位自动选择。
+                    self.config, alert.host, platform_slots=host_state.source_slots,
+                )
             if target is None:
                 return StartAttemptResult(
                     status="recheck_failed",
@@ -195,13 +204,58 @@ class AutoStartCoordinator:  # 自动开机协调器。
                     platform_total_before=host_state.total_count,
                 )
 
-        response = self.platform.post_api_json(  # 这里才是真正改变平台状态的开机请求，前面均为选择或只读检查。
-            "/api/v2/instance/power_on",
-            { "instance_uuid": target.instance_uuid, "start_mode": target.start_mode, },
-        )
+        if stop_requested():  # 停止信号到达后不再改变实例状态。
+            return StartAttemptResult("cancelled", alert.host, target.instance_uuid, target.machine_name, "监控已请求停止。")
+
+        if self.convert_no_gpu:
+            state = self.platform.get_instance_state(target.instance_uuid, target.machine_name)  # UUID 与入口名均由实例列表核对。
+            status, mode = state["status"], state["start_mode"]
+            if status == "running" and mode == "non_gpu":
+                if target_override is not None:  # 已经发过关机，绝不在后续轮询中重复发送。
+                    return StartAttemptResult("instance_state_blocked", alert.host, target.instance_uuid,
+                                              target.machine_name, "实例又处于无卡运行状态，取消本次自动切换。")
+                if stop_requested():
+                    return StartAttemptResult("cancelled", alert.host, target.instance_uuid, target.machine_name, "监控已请求停止。")
+                self.pending_switch = target  # 先记目标；请求超时也可能已被服务端受理。
+                self._pending_alert = alert
+                try:
+                    response = self.platform.post_api_json(  # 私有云页面对无卡实例使用 release=now。
+                        "/api/v2/instance/power_off", {"instance_uuid": target.instance_uuid, "release": "now"})
+                except PlatformAuthenticationError:  # 明确 401/403 时正常走登录恢复，不留下待关机状态。
+                    self.pending_switch = None
+                    self._pending_alert = None
+                    raise
+                except Exception as exc:
+                    return StartAttemptResult("shutdown_uncertain", alert.host, target.instance_uuid,
+                                              target.machine_name, f"关机响应未确认：{exc}；继续只读查询原实例。")
+                code, msg = str(response.get("code", "")), str(response.get("msg", ""))
+                if code != "Success":
+                    self.pending_switch = None
+                    self._pending_alert = None
+                    return StartAttemptResult("shutdown_failed", alert.host, target.instance_uuid,
+                                              target.machine_name, "AutoDL 拒绝了无卡关机请求。", code or None, msg or None)
+                return StartAttemptResult("shutdown_requested", alert.host, target.instance_uuid,
+                                          target.machine_name, "无卡关机已受理，等待实例变为已关机。", code, msg or None)
+            if status != "shutdown":  # 已有卡运行、正在开关机或未知状态都不重复开机。
+                return StartAttemptResult("instance_state_blocked", alert.host, target.instance_uuid,
+                                          target.machine_name, f"实例当前状态为 {status}/{mode}，暂缓有卡开机。")
+
+        if stop_requested():
+            return StartAttemptResult("cancelled", alert.host, target.instance_uuid, target.machine_name, "监控已请求停止。")
+        if target_override is not None:
+            self._switch_power_on_sent = True  # 请求可能到达服务端，即使稍后网络报错也不盲目重发。
+        try:
+            response = self.platform.post_api_json(  # 这里才是真正改变平台状态的开机请求，前面均为选择或只读检查。
+                "/api/v2/instance/power_on",
+                { "instance_uuid": target.instance_uuid, "start_mode": target.start_mode, },
+            )
+        except PlatformAuthenticationError:  # 明确未认证时服务端没有受理，可在登录恢复后重试。
+            self._switch_power_on_sent = False
+            raise
         code = str(response.get("code", ""))  # HTTP 成功不等于业务成功，还要检查 AutoDL 的业务 code。
         msg = str(response.get("msg", ""))
         if code != "Success":
+            self._switch_power_on_sent = False  # 明确业务拒绝后允许下轮重新检查。
             return StartAttemptResult(  # AutoDL 拒绝了请求（可能是并发冲突或权限不足）
                 status="request_failed",
                 host=alert.host,
@@ -243,6 +297,34 @@ class AutoStartCoordinator:  # 自动开机协调器。
             platform_total_after=platform_total_after,
         )
 
+    def continue_switch(self, stop_requested: Callable[[], bool] = lambda: False) -> StartAttemptResult | None:  # 后续轮次推进已受理的关机。
+        target, alert = self.pending_switch, self._pending_alert
+        if target is None or alert is None or stop_requested():
+            return None
+        state = self.platform.get_instance_state(target.instance_uuid, target.machine_name)  # 只追踪原 UUID 和入口。
+        status, mode = state["status"], state["start_mode"]
+        if status == "shutting_down" or (status == "running" and mode == "non_gpu"):
+            return StartAttemptResult("shutdown_pending", alert.host, target.instance_uuid,
+                                      target.machine_name, "等待无卡实例完全关机。")
+        if status in {"starting", "running"} and mode == "gpu":
+            self.pending_switch = None  # 同一实例已由平台或人工进入有卡启动，结束本次切换。
+            self._pending_alert = None
+            self._switch_power_on_sent = False
+            return StartAttemptResult("gpu_start_observed", alert.host, target.instance_uuid,
+                                      target.machine_name, "同一实例已进入有卡启动，等待占用确认。")
+        if status != "shutdown":
+            return StartAttemptResult("instance_state_blocked", alert.host, target.instance_uuid,
+                                      target.machine_name, f"实例状态为 {status}/{mode}；已发送关机，不重复操作，等待人工核查。")
+        if self._switch_power_on_sent:  # 上次响应不明，继续只读观察，不重复 power_on。
+            return StartAttemptResult("gpu_start_uncertain", alert.host, target.instance_uuid,
+                                      target.machine_name, "有卡开机响应未确认；等待状态变化或人工核查。")
+        result = self.attempt(alert, stop_requested, target_override=target)  # 再次核对空位和显存，不允许换到另一实例。
+        if result.status == "request_accepted":
+            self.pending_switch = None
+            self._pending_alert = None
+            self._switch_power_on_sent = False
+        return result
+
 
 def _slot_text(free: int | None, total: int | None) -> str | None:  # 格式化平台空位文本，如 '3/3'。
     if free is None:
@@ -257,6 +339,14 @@ def format_start_result(result: StartAttemptResult) -> str:  # 将开机尝试�
         "dry_run": "DRY-RUN，未开机",
         "request_accepted": "开机请求成功受理",
         "request_failed": "开机请求失败",
+        "shutdown_requested": "无卡关机请求成功受理",
+        "shutdown_uncertain": "关机请求结果待确认",
+        "shutdown_pending": "等待无卡实例关机",
+        "gpu_start_observed": "已观测到同一实例有卡启动",
+        "gpu_start_uncertain": "有卡开机请求结果待确认",
+        "shutdown_failed": "无卡关机请求失败",
+        "instance_state_blocked": "实例状态不允许开机",
+        "cancelled": "已取消操作",
         "recheck_failed": "二次确认未通过",
         "no_target": "没有可用固定实例",
     }.get(result.status, result.status)
