@@ -478,18 +478,23 @@ class InstanceStateCollectorTest(unittest.TestCase):
     def test_exact_uuid_on_second_page_and_close_temporary_page(self):
         collector, page = self._collector()
         first = [
-            {"instance_uuid": f"other-{index}", "status": "shutdown", "start_mode": "gpu"}
+            {"instance_uuid": f"other-{index}", "machine_name": "autodl-204-1",
+             "status": "shutdown", "start_mode": "gpu"}
             for index in range(10)
         ]
-        second = [{"instance_uuid": "target", "machine_name": "autodl-203-1",
-                   "status": "running", "start_mode": "non_gpu"}]
+        second = [
+            {"instance_uuid": "target", "machine_name": "autodl-203-1",
+             "status": "running", "start_mode": "non_gpu"},
+            {"instance_uuid": "sibling", "machine_name": "autodl-203-2",
+             "status": "shutdown", "start_mode": "gpu"},
+        ]
         collector.post_api_json = Mock(side_effect=[
-            self._response(first, 11), self._response(second, 11),
+            self._response(first, 12), self._response(second, 12),
         ])
 
         self.assertEqual(
             collector.get_instance_state("target", "autodl-203-1"),
-            {"status": "running", "start_mode": "non_gpu"},
+            {"status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True},
         )
         self.assertEqual(collector.post_api_json.call_count, 2)
         self.assertEqual(collector.post_api_json.call_args_list[1].args, (
@@ -503,6 +508,66 @@ class InstanceStateCollectorTest(unittest.TestCase):
             "https://private.autodl.com/console/instance", wait_until="domcontentloaded",
         )
         page.close.assert_called_once()
+
+    def test_other_gpu_or_unknown_mode_on_same_host_blocks_clear(self):
+        target = {"instance_uuid": "target", "machine_name": "autodl-203-1",
+                  "status": "running", "start_mode": "non_gpu"}
+        for status, mode in (("running", "gpu"), ("starting", "gpu"),
+                             ("shutting_down", "gpu"), ("running", None)):
+            with self.subTest(status=status, mode=mode):
+                collector, _ = self._collector()
+                sibling = {"instance_uuid": "sibling", "machine_name": "autodl-203-2",
+                           "status": status, "start_mode": mode}
+                collector.post_api_json = Mock(return_value=self._response([target, sibling], 2))
+                self.assertEqual(
+                    collector.get_instance_state("target", "autodl-203-1"),
+                    {"status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": False},
+                )
+
+    def test_running_gpu_on_other_host_does_not_block_clear(self):
+        collector, _ = self._collector()
+        rows = [
+            {"instance_uuid": "target", "machine_name": "autodl-203-1",
+             "status": "running", "start_mode": "non_gpu"},
+            {"instance_uuid": "other-host", "machine_name": "autodl-204-1",
+             "status": "running", "start_mode": "gpu"},
+        ]
+        collector.post_api_json = Mock(return_value=self._response(rows, 2))
+        self.assertTrue(collector.get_instance_state("target", "autodl-203-1")["host_account_gpu_clear"])
+
+    def test_duplicate_non_target_uuid_across_pages_fails_closed(self):
+        collector, page = self._collector()
+        first = [
+            {"instance_uuid": f"other-{index}", "machine_name": "autodl-204-1",
+             "status": "shutdown", "start_mode": "gpu"}
+            for index in range(10)
+        ]
+        second = [
+            {"instance_uuid": "target", "machine_name": "autodl-203-1",
+             "status": "running", "start_mode": "non_gpu"},
+            {"instance_uuid": "other-0", "machine_name": "autodl-203-2",
+             "status": "running", "start_mode": "gpu"},
+        ]
+        collector.post_api_json = Mock(side_effect=[
+            self._response(first, 12), self._response(second, 12),
+        ])
+        with self.assertRaises(PlatformTransientError):
+            collector.get_instance_state("target", "autodl-203-1")
+        self.assertEqual(collector.post_api_json.call_count, 2)
+        page.close.assert_called_once()
+
+    def test_active_row_without_valid_machine_name_blocks_clear(self):
+        target = {"instance_uuid": "target", "machine_name": "autodl-203-1",
+                  "status": "running", "start_mode": "non_gpu"}
+        for bad_name in ("", "203-2", "autodl-unknown"):
+            with self.subTest(bad_name=bad_name):
+                collector, _ = self._collector()
+                unknown = {"instance_uuid": "unknown", "machine_name": bad_name,
+                           "status": "running", "start_mode": "gpu"}
+                collector.post_api_json = Mock(return_value=self._response([target, unknown], 2))
+                self.assertFalse(
+                    collector.get_instance_state("target", "autodl-203-1")["host_account_gpu_clear"]
+                )
 
     def test_wrong_machine_for_valid_uuid_fails_closed(self):
         collector, page = self._collector()

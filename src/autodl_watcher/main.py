@@ -399,6 +399,9 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
     next_usage_capture = 0.0  # 下次采集占用快照的时间戳（monotonic）
     absence_confirmations = 0  # v0.5.4：空占用快照需要连续确认，避免一次 DOM 空读就把本人误判为关机。
     login_validation_pending = False
+    previous_account_clear = False  # 实例列表确认状态变化时重新武装 GPU 空闲事件。
+    account_occupancy_conflict = False  # 新鲜弹窗有卡却被列表判无卡时，保持阻断直到可靠空快照。
+    last_occupancy_failed = False  # 将弹窗采集故障与实例状态分别显示。
 
     starter = AutoStartCoordinator(
         selected_auto_start,
@@ -471,6 +474,40 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                 ]
                 if not platform_hosts or (selected_entry and selected_entry not in platform_hosts[0].source_names):
                     raise PlatformTransientError("所选主机或入口不在当前账号的实时主机列表中")
+                selected_instance_state = None
+                selected_instance_error = False
+                if args.convert_no_gpu:  # 占用弹窗失败也要独立查询完整实例列表，确认所选无卡实例及同账号其他入口。
+                    target = selected_targets[0]
+                    try:
+                        selected_instance_state = platform_collector.get_instance_state(
+                            target.instance_uuid, target.machine_name)
+                    except PlatformAuthenticationError:
+                        raise
+                    except Exception as exc:
+                        selected_instance_error = True
+                        logger.warning("selected instance state query failed host=%s entry=%s: %s",
+                                       selected_host, target.machine_name, exc)
+                selected_account_clear = bool(
+                    isinstance(selected_instance_state, dict)
+                    and selected_instance_state.get("host_account_gpu_clear") is True
+                    and (selected_instance_state.get("status") == "shutdown" or (
+                        selected_instance_state.get("status") == "running"
+                        and selected_instance_state.get("start_mode") == "non_gpu"))
+                )
+                if selected_account_clear and not previous_account_clear:
+                    evaluator.rearm_host(selected_host)  # 先前被未知占用抑制的达标事件可再次触发。
+                previous_account_clear = selected_account_clear
+                if selected_instance_error:
+                    selected_instance_text = "查询失败"
+                elif selected_instance_state is None:
+                    selected_instance_text = "未查询"
+                else:
+                    status, mode = selected_instance_state.get("status"), selected_instance_state.get("start_mode")
+                    selected_instance_text = (
+                        "无卡运行" if (status, mode) == ("running", "non_gpu")
+                        else "有卡运行" if (status, mode) == ("running", "gpu")
+                        else "已关机" if status == "shutdown" else f"{status}/{mode}"
+                    )
                 all_gpu_samples = telemetry_collector.collect()  # 1b. 从 Telemetry API 采集物理 GPU 显存快照（HTTP GET）
                 if stop_requested():
                     break
@@ -494,10 +531,11 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     else f"{platform_host.free_count}/{platform_host.total_count}"
                 )
 
-                self_active = self_occupancy_known and bool(owned_instances)  # 只有本进程“查看占用”的实时正向证据才算本人已开机。 UNKNOWN 状态和 power_on 等待确认状态都必须抑制开机，避免重复开实例。
+                self_active = self_occupancy_known and bool(owned_instances) and not selected_account_clear  # 新鲜完整的账号列表可覆盖旧弹窗记录；本轮正向弹窗仍在发送前阻断。
                 occupancy_unknown = (
                     config.usage_tracking.enabled and bool(usage_targets) and not self_occupancy_known
                 )
+                occupancy_blocked = (occupancy_unknown and not selected_account_clear) or account_occupancy_conflict  # 旧记录可覆盖，新鲜证据冲突不可覆盖。
                 pending_start = (
                     pending_start_until > 0 and time.monotonic() < pending_start_until
                 )
@@ -512,7 +550,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     pending_start_until = 0.0
                     pending_start_machine = ""
 
-                if self_active or occupancy_unknown or pending_start or starter.pending_switch:  # 本人占用、状态未知、正在启动或无卡关机中均阻止重复开机。
+                if self_active or occupancy_blocked or pending_start or starter.pending_switch:  # 有卡占用、证据不足或切换中均阻止重复开机。
                     trigger_events = []
 
                 planned_target = None  # 根据实时空位预判入口。UNKNOWN 时仍显示预选入口，但不会真正开机。
@@ -554,14 +592,25 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     planned_text = starter.pending_switch.machine_name.removeprefix("autodl-")
                     start_ready_text = "等待无卡关机"
                     action_text = "确认关机后复核 GPU 再开机"
+                elif account_occupancy_conflict:
+                    planned_text = selected_targets[0].machine_name.removeprefix("autodl-")
+                    start_ready_text = "占用证据冲突"
+                    action_text = "暂停切换，等待占用弹窗确认无卡"
+                elif occupancy_unknown and selected_account_clear:
+                    planned_text = selected_targets[0].machine_name.removeprefix("autodl-")
+                    start_ready_text = "是" if start_ready else "否"
+                    action_text = ("空闲达标，核对占用" if trigger_events and selected_auto_start.enabled
+                                   else "等待平台空位和显存达标" if not start_ready else "继续监控")
                 elif occupancy_unknown:
                     planned_text = (
                         planned_target.machine_name.removeprefix("autodl-")
                         if planned_target is not None
                         else "待确认"
                     )
-                    start_ready_text = "本人状态未知"
-                    action_text = "暂缓开机，先确认本人占用"
+                    start_ready_text = ("实例查询失败" if selected_instance_error else "同主机账号状态未排除"
+                                        if args.convert_no_gpu else "本人状态未知")
+                    action_text = ("暂缓切换，先核对实例列表" if args.convert_no_gpu
+                                   else "暂缓开机，先确认本人占用")
                 else:
                     start_ready_text = "是" if start_ready else "否"
                     if trigger_events and selected_auto_start.enabled:
@@ -591,6 +640,8 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     f"开机达标={start_ready_text} | "
                     f"动作={action_text}"
                 )
+                if args.convert_no_gpu:
+                    status_line += f" | 所选实例={selected_instance_text}"
                 if self_active:
                     status_line = _green_terminal_text(status_line)
                 elif (
@@ -613,6 +664,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     len(trigger_events),
                 )
 
+                fresh_occupancy_positive = False  # 当前轮弹窗若直接看到本人有卡，优先于实例列表的相反结果。
                 if (
                     config.usage_tracking.enabled and time.monotonic() >= next_usage_capture and usage_targets
                 ):
@@ -660,6 +712,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
 
                     if stop_requested():
                         break  # 停止时丢弃不完整快照，不写入伪下机事件。
+                    last_occupancy_failed = bool(failed_entries)
                     try:  # 先判定本人状态，再决定该轮是否允许 SQLite 生成 END_SEEN。 第一次可靠空快照只是“疑似结束”，不会立即关掉 current_instances。
                         complete_occupancy_snapshot = not failed_entries  # 只有所有目标入口成功读取，本轮才具备确认消失的资格。
                         captured_owned = _owned_instances_from_records(
@@ -681,6 +734,9 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                         )
 
                         if captured_owned:
+                            fresh_occupancy_positive = True
+                            if selected_account_clear:
+                                account_occupancy_conflict = True  # 同轮两份正向/负向证据冲突，不能在下一次弹窗失败后贸然关机。
                             owned_instances = captured_owned  # 实时看到本人实例就是正向证据，无需等待多轮缺席确认。
                             self_occupancy_known = True
                             pending_start_until = 0.0
@@ -693,6 +749,9 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                                 )
 
                             if confirmed_absence:  # 连续可靠空快照达到门槛后，才能解除本人占用状态。
+                                if account_occupancy_conflict:
+                                    account_occupancy_conflict = False
+                                    evaluator.rearm_host(selected_host)  # 冲突消除后下一轮重新评估先前被拦截的空闲事件。
                                 owned_instances = []
                                 self_occupancy_known = True
                                 pending_still_valid = (
@@ -783,8 +842,11 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     pending_start_until > 0 and time.monotonic() < pending_start_until
                 )
                 if (
-                    (config.usage_tracking.enabled and usage_targets and not self_occupancy_known)
-                    or (self_occupancy_known and owned_instances)
+                    (config.usage_tracking.enabled and usage_targets and not self_occupancy_known
+                     and not selected_account_clear)
+                    or fresh_occupancy_positive
+                    or account_occupancy_conflict
+                    or (self_occupancy_known and owned_instances and not selected_account_clear)
                     or pending_start
                     or starter.pending_switch
                 ):
@@ -797,7 +859,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                 if selected_auto_start.enabled and not stop_requested():
                     results = []
                     if starter.pending_switch:  # 关机后的状态推进不依赖 evaluator 再次触发。
-                        if not (config.usage_tracking.enabled and usage_targets and not self_occupancy_known) and not owned_instances and not pending_start:
+                        if not account_occupancy_conflict and not fresh_occupancy_positive and not (owned_instances and not selected_account_clear) and not pending_start:  # 旧记录可覆盖，证据冲突仍阻断。
                             result = starter.continue_switch(stop_requested)
                             if result is not None:
                                 results.append(result)
@@ -848,9 +910,15 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                         "evaluator": evaluator.export_state(),
                     }
                 )
+                self_gpu_text = ('有（本轮弹窗）' if fresh_occupancy_positive
+                                 else '待复核（占用证据冲突）' if account_occupancy_conflict
+                                 else '无（实例列表）' if selected_account_clear
+                                 else '有' if owned_instances else '无' if self_occupancy_known else '待确认')
+                detail = (f" · 所选实例 {selected_instance_text}" if args.convert_no_gpu else "")
+                if last_occupancy_failed:
+                    detail += " · GPU 占用弹窗采集失败"
                 print(f"WATCHER_STATUS {now:%H:%M:%S} · {selected_host} · 平台 {entry_slots} · "
-                      f"物理 GPU {len(selected_gpu_samples)} 张 · "
-                      f"本人占用 {'有' if owned_instances else '无' if self_occupancy_known else '待确认'}", flush=True)
+                      f"物理 GPU {len(selected_gpu_samples)} 张 · 本人 GPU 占用 {self_gpu_text}{detail}", flush=True)
             except PlatformAuthenticationError as exc:
                 if args.no_login:
                     raise

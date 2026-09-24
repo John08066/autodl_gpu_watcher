@@ -208,8 +208,11 @@ class AutoStartCoordinator:  # 自动开机协调器。
             return StartAttemptResult("cancelled", alert.host, target.instance_uuid, target.machine_name, "监控已请求停止。")
 
         if self.convert_no_gpu:
-            state = self.platform.get_instance_state(target.instance_uuid, target.machine_name)  # UUID 与入口名均由实例列表核对。
+            state = self.platform.get_instance_state(target.instance_uuid, target.machine_name)  # UUID、入口和同主机账号实例均由完整列表核对。
             status, mode = state["status"], state["start_mode"]
+            if state.get("host_account_gpu_clear") is not True:  # 同账号其他入口仍有卡或列表不完整时禁止关机、开机。
+                return StartAttemptResult("instance_state_blocked", alert.host, target.instance_uuid,
+                                          target.machine_name, "同主机账号有卡实例尚未排除，暂缓切换。")
             if status == "running" and mode == "non_gpu":
                 if target_override is not None:  # 已经发过关机，绝不在后续轮询中重复发送。
                     return StartAttemptResult("instance_state_blocked", alert.host, target.instance_uuid,
