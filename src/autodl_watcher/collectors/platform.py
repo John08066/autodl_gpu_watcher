@@ -403,9 +403,9 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
             raise RuntimeError(f"AutoDL API {path} returned non-object JSON")
         return payload_json
 
-    def get_instance_state(self, instance_uuid: str, machine_name: str) -> dict[str, str]:  # 双重匹配实例 UUID 与入口名。
-        if not instance_uuid.strip() or not machine_name.strip():
-            raise ValueError("instance_uuid 和 machine_name 不能为空")
+    def get_instance_state(self, instance_uuid: str, machine_name: str) -> dict[str, Any]:  # 双重匹配实例，并核对同主机账号有卡占用。
+        if not instance_uuid.strip() or not _MACHINE_PATTERN.fullmatch(machine_name.strip()):
+            raise ValueError("instance_uuid 或 machine_name 格式无效")
         self.start()
         assert self._context is not None
         if self._instance_tenant_uuid is None:
@@ -439,6 +439,8 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
         page_size = 10  # 与官网实例列表默认分页一致；逐页核对后才允许认定目标状态。
         total: int | None = None
         matches: list[dict[str, Any]] = []
+        all_rows: list[dict[str, Any]] = []
+        seen_uuids: set[str] = set()  # 翻页期间若出现重复行，可能漏掉其他有卡实例，整份列表作废。
         page_index = 1
         while total is None or (page_index - 1) * page_size < total:
             response = self.post_api_json(
@@ -460,6 +462,11 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
             for row in rows:
                 if not isinstance(row, dict) or not isinstance(row.get("instance_uuid"), str):
                     raise PlatformTransientError("实例列表包含无法识别的实例")
+                row_uuid = row["instance_uuid"]
+                if not row_uuid.strip() or row_uuid in seen_uuids:
+                    raise PlatformTransientError("实例列表分页有空或重复 UUID，无法确认全部实例")
+                seen_uuids.add(row_uuid)
+                all_rows.append(row)
                 if row["instance_uuid"] == instance_uuid:
                     matches.append(row)
             page_index += 1
@@ -472,7 +479,20 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
         start_mode = matches[0].get("start_mode")
         if not isinstance(status, str) or not status.strip() or not isinstance(start_mode, str):
             raise PlatformTransientError("目标实例缺少 status/start_mode")
-        return {"status": status, "start_mode": start_mode}
+        target_host = canonical_host(machine_name)  # 覆盖配置外的同物理主机入口。
+        host_account_gpu_clear = True
+        for row in all_rows:
+            name, row_status, mode = row.get("machine_name"), row.get("status"), row.get("start_mode")
+            if not isinstance(name, str) or not _MACHINE_PATTERN.fullmatch(name.strip()):
+                if row_status != "shutdown":  # 活跃实例无法归属主机时不能证明本主机无占用。
+                    host_account_gpu_clear = False
+                continue
+            if canonical_host(name) != target_host:
+                continue
+            if row_status == "shutdown" or (row_status == "running" and mode == "non_gpu"):
+                continue
+            host_account_gpu_clear = False  # 有卡、启动中、关机中或未知状态均不视为 GPU 已空闲。
+        return {"status": status, "start_mode": start_mode, "host_account_gpu_clear": host_account_gpu_clear}
 
     def _find_occupancy_action(self, machine_name: str):  # 兼容表格/卡片两种页面结构，定位指定入口的“查看占用”。
         assert self._page is not None

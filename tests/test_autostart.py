@@ -164,10 +164,10 @@ class NoGpuConversionTest(unittest.TestCase):
     def test_shutdown_then_confirm_same_uuid_and_power_on_gpu(self):
         self.platform.collect.side_effect = [[self.before], [self.after]]
         self.platform.get_instance_state.side_effect = [
-            {"status": "running", "start_mode": "non_gpu"},
-            {"status": "shutting_down", "start_mode": "non_gpu"},
-            {"status": "shutdown", "start_mode": "non_gpu"},
-            {"status": "shutdown", "start_mode": "non_gpu"},
+            {"status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutting_down", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": True},
         ]
         self.platform.post_api_json.return_value = {"code": "Success"}
         starter = self._starter()
@@ -186,8 +186,8 @@ class NoGpuConversionTest(unittest.TestCase):
         lost = replace(self.after, source_slots=(("autodl-203-1", 0, 2), ("autodl-203-2", 2, 2)))
         self.platform.collect.side_effect = [[self.before], [lost]]
         self.platform.get_instance_state.side_effect = [
-            {"status": "running", "start_mode": "non_gpu"},
-            {"status": "shutdown", "start_mode": "non_gpu"},
+            {"status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": True},
         ]
         self.platform.post_api_json.return_value = {"code": "Success"}
         starter = self._starter()
@@ -201,14 +201,14 @@ class NoGpuConversionTest(unittest.TestCase):
             with self.subTest(status=status):
                 self.platform.reset_mock()
                 self.platform.collect.return_value = [self.before]
-                self.platform.get_instance_state.return_value = {"status": status, "start_mode": mode}
+                self.platform.get_instance_state.return_value = {"status": status, "start_mode": mode, "host_account_gpu_clear": True}
                 starter = self._starter()
                 self.assertEqual(starter.attempt(self.alert).status, "instance_state_blocked")
                 self.platform.post_api_json.assert_not_called()
 
     def test_rejected_shutdown_and_stop_signal_fail_closed(self):
         self.platform.collect.return_value = [self.before]
-        self.platform.get_instance_state.return_value = {"status": "running", "start_mode": "non_gpu"}
+        self.platform.get_instance_state.return_value = {"status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True}
         self.platform.post_api_json.return_value = {"code": "Failure", "msg": "busy"}
         starter = self._starter()
         self.assertEqual(starter.attempt(self.alert).status, "shutdown_failed")
@@ -220,9 +220,9 @@ class NoGpuConversionTest(unittest.TestCase):
     def test_conflicting_status_after_shutdown_never_repeats_power_off(self):
         self.platform.collect.side_effect = [[self.before], [self.after]]
         self.platform.get_instance_state.side_effect = [
-            {"status": "running", "start_mode": "non_gpu"},
-            {"status": "shutdown", "start_mode": "non_gpu"},
-            {"status": "running", "start_mode": "non_gpu"},
+            {"status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True},
         ]
         self.platform.post_api_json.return_value = {"code": "Success"}
         starter = self._starter()
@@ -234,8 +234,8 @@ class NoGpuConversionTest(unittest.TestCase):
     def test_existing_gpu_start_clears_pending_without_second_power_on(self):
         self.platform.collect.return_value = [self.before]
         self.platform.get_instance_state.side_effect = [
-            {"status": "running", "start_mode": "non_gpu"},
-            {"status": "starting", "start_mode": "gpu"},
+            {"status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "starting", "start_mode": "gpu", "host_account_gpu_clear": True},
         ]
         self.platform.post_api_json.return_value = {"code": "Success"}
         starter = self._starter()
@@ -247,9 +247,9 @@ class NoGpuConversionTest(unittest.TestCase):
     def test_lost_shutdown_response_still_tracks_same_uuid(self):
         self.platform.collect.side_effect = [[self.before], [self.after]]
         self.platform.get_instance_state.side_effect = [
-            {"status": "running", "start_mode": "non_gpu"},
-            {"status": "shutdown", "start_mode": "non_gpu"},
-            {"status": "shutdown", "start_mode": "non_gpu"},
+            {"status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": True},
         ]
         self.platform.post_api_json.side_effect = [TimeoutError("response lost"), {"code": "Success"}]
         starter = self._starter()
@@ -264,10 +264,10 @@ class NoGpuConversionTest(unittest.TestCase):
     def test_lost_gpu_start_response_does_not_repeat_power_on(self):
         self.platform.collect.side_effect = [[self.before], [self.after]]
         self.platform.get_instance_state.side_effect = [
-            {"status": "running", "start_mode": "non_gpu"},
-            {"status": "shutdown", "start_mode": "non_gpu"},
-            {"status": "shutdown", "start_mode": "non_gpu"},
-            {"status": "shutdown", "start_mode": "non_gpu"},
+            {"status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": True},
         ]
         self.platform.post_api_json.side_effect = [{"code": "Success"}, TimeoutError("response lost")]
         starter = self._starter()
@@ -280,12 +280,42 @@ class NoGpuConversionTest(unittest.TestCase):
 
     def test_restart_after_shutdown_can_start_fixed_instance(self):
         self.platform.collect.return_value = [self.before]
-        self.platform.get_instance_state.return_value = {"status": "shutdown", "start_mode": "non_gpu"}
+        self.platform.get_instance_state.return_value = {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": True}
         self.platform.post_api_json.return_value = {"code": "Success"}
         starter = self._starter()
         self.assertEqual(starter.attempt(self.alert).status, "request_accepted")
         self.platform.post_api_json.assert_called_once_with(
             "/api/v2/instance/power_on", {"instance_uuid": "instance-1", "start_mode": "gpu"})
+
+    def test_other_account_gpu_appearing_after_shutdown_blocks_power_on(self):
+        self.platform.collect.side_effect = [[self.before], [self.after]]
+        self.platform.get_instance_state.side_effect = [
+            {"status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": False},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": False},
+        ]
+        self.platform.post_api_json.return_value = {"code": "Success"}
+        starter = self._starter()
+        self.assertEqual(starter.attempt(self.alert).status, "shutdown_requested")
+        self.assertEqual(starter.continue_switch().status, "instance_state_blocked")
+        self.assertEqual(self.platform.post_api_json.call_count, 1)
+        self.assertEqual(starter.pending_switch, self.first)
+
+    def test_other_account_gpu_or_missing_proof_blocks_state_change(self):
+        self.platform.collect.return_value = [self.before]
+        for proof in (False, None):
+            with self.subTest(proof=proof):
+                self.platform.post_api_json.reset_mock()
+                self.platform.get_instance_state.return_value = {
+                    "status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": proof,
+                }
+                self.assertEqual(self._starter().attempt(self.alert).status, "instance_state_blocked")
+                self.platform.post_api_json.assert_not_called()
+        self.platform.get_instance_state.return_value = {
+            "status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": False,
+        }
+        self.assertEqual(self._starter().attempt(self.alert).status, "instance_state_blocked")
+        self.platform.post_api_json.assert_not_called()
 
     def test_dry_run_does_not_query_instance_or_send_state_change(self):
         starter = AutoStartCoordinator(replace(self.config, dry_run=True), self.monitor,

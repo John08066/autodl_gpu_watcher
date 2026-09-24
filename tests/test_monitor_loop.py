@@ -8,11 +8,11 @@ import time
 import unittest
 from unittest.mock import patch, call
 
-from autodl_watcher.collectors import PlatformAuthenticationError
+from autodl_watcher.collectors import PlatformAuthenticationError, PlatformTransientError
 from autodl_watcher.gui import ROOT
 from autodl_watcher.config import load_config
 from autodl_watcher.main import _fresh_gpu_indices, main
-from autodl_watcher.models import GpuSample, PlatformHost
+from autodl_watcher.models import GpuSample, OccupancyRecord, PlatformHost
 
 
 class MonitorLoopTest(unittest.TestCase):
@@ -62,35 +62,267 @@ class MonitorLoopTest(unittest.TestCase):
                 platform.return_value.post_api_json.assert_not_called()
 
 
-    def test_main_loop_switches_same_instance_after_confirmed_shutdown(self):
+    @staticmethod
+    def _conversion_config():
         config = load_config(ROOT / "config.yaml")
-        first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
-        config = replace(config,
-            auto_start=replace(config.auto_start, targets=(first,), recheck_delay_seconds=0,
+        return replace(config,
+            auto_start=replace(config.auto_start, recheck_delay_seconds=0,
                                post_start_check_seconds=-1),
-            usage_tracking=replace(config.usage_tracking, enabled=False),
+            usage_tracking=replace(config.usage_tracking, enabled=True, interval_seconds=0.01),
             monitor=replace(config.monitor, poll_seconds=0.01, confirmation_seconds=0,
                             min_idle_samples=1))
-        host = PlatformHost("gpu-203", 1, 2, ("autodl-203-1",), (("autodl-203-1", 1, 2),))
-        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
-            with patch("autodl_watcher.main.load_config", return_value=config),                  patch("autodl_watcher.main.PlatformBrowserCollector") as platform,                  patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+
+    def test_no_gpu_instance_is_visible_when_occupancy_fails_but_no_slot_exists(self):
+        config = self._conversion_config()
+        host = PlatformHost("gpu-203", 0, 2, ("autodl-203-1", "autodl-203-2"),
+                            (("autodl-203-1", 0, 2), ("autodl-203-2", 0, 2)))
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
+            with patch("autodl_watcher.main.load_config", return_value=config), \
+                 patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
                 platform.return_value.collect.return_value = [host]
-                platform.return_value.get_instance_state.side_effect = [
-                    {"status": "running", "start_mode": "non_gpu"},
-                    {"status": "shutting_down", "start_mode": "non_gpu"},
-                    {"status": "shutdown", "start_mode": "non_gpu"},
-                    {"status": "shutdown", "start_mode": "non_gpu"},
-                ]
-                platform.return_value.post_api_json.return_value = {"code": "Success"}
+                platform.return_value.collect_occupancy.side_effect = RuntimeError("popup unavailable")
+                platform.return_value.get_instance_state.return_value = {
+                    "status": "running", "start_mode": "non_gpu",
+                    "host_account_gpu_clear": True,
+                }
                 telemetry.return_value.collect.side_effect = lambda: [
                     GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
                 main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
-                      "--live", "--convert-no-gpu", "--max-cycles", "3",
+                      "--live", "--convert-no-gpu", "--max-cycles", "2",
                       "--runtime-dir", directory, "--no-login"])
+                self.assertIn("无卡运行", output.getvalue())
+                self.assertTrue(platform.return_value.get_instance_state.called)
+                platform.return_value.post_api_json.assert_not_called()
+
+    def test_occupancy_failure_does_not_hide_same_instance_switch(self):
+        config = self._conversion_config()
+        first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
+        host = PlatformHost("gpu-203", 1, 2, ("autodl-203-1", "autodl-203-2"),
+                            (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
+        phase = {"off": False, "on": False, "reads_after_off": 0}
+
+        def instance_state(*_args):
+            if phase["on"]:
+                return {"status": "running", "start_mode": "gpu", "host_account_gpu_clear": False}
+            if phase["off"]:
+                phase["reads_after_off"] += 1
+                status = "shutting_down" if phase["reads_after_off"] == 1 else "shutdown"
+                return {"status": status, "start_mode": "non_gpu", "host_account_gpu_clear": True}
+            return {"status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True}
+
+        def api_response(path, _payload):
+            phase["off" if path.endswith("power_off") else "on"] = True
+            return {"code": "Success"}
+
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
+            with patch("autodl_watcher.main.load_config", return_value=config), \
+                 patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                platform.return_value.collect.return_value = [host]
+                platform.return_value.collect_occupancy.side_effect = RuntimeError("popup unavailable")
+                platform.return_value.get_instance_state.side_effect = instance_state
+                platform.return_value.post_api_json.side_effect = api_response
+                telemetry.return_value.collect.side_effect = lambda: [
+                    GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+                main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                      "--live", "--convert-no-gpu", "--max-cycles", "4",
+                      "--runtime-dir", directory, "--no-login"])
+                self.assertIn("无卡运行", output.getvalue())
                 self.assertEqual(platform.return_value.post_api_json.call_args_list, [
                     call("/api/v2/instance/power_off", {"instance_uuid": first.instance_uuid, "release": "now"}),
                     call("/api/v2/instance/power_on", {"instance_uuid": first.instance_uuid, "start_mode": "gpu"}),
                 ])
+
+    def test_old_gpu_occupancy_is_overridden_but_fresh_positive_still_blocks(self):
+        base = self._conversion_config()
+        config = replace(base, usage_tracking=replace(base.usage_tracking, interval_seconds=0.001))
+        first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
+        names = ("autodl-203-1", "autodl-203-2")
+        blocked_host = PlatformHost("gpu-203", 0, 2, names,
+                                    (("autodl-203-1", 0, 2), ("autodl-203-2", 0, 2)))
+        ready_host = PlatformHost("gpu-203", 1, 2, names,
+                                  (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
+        mine = OccupancyRecord(datetime.now(), "gpu-203", "autodl-203-1", 0,
+                               "gpu-0", "Tesla V100", True, first.instance_uuid,
+                               config.usage_tracking.self_user, "2026-09-25 00:00:00")
+        for fresh_second in (False, True):
+            with self.subTest(fresh_second=fresh_second):
+                phase = {"platform_reads": 0, "state_reads": 0, "occupancy_reads": 0,
+                         "off": False, "on": False}
+
+                def collect_platform():
+                    phase["platform_reads"] += 1
+                    return [blocked_host if phase["platform_reads"] == 1 else ready_host]
+
+                def collect_occupancy(machine_name, **_kwargs):
+                    phase["occupancy_reads"] += 1
+                    cycle = (phase["occupancy_reads"] - 1) // 2
+                    if cycle == 0 or (cycle == 1 and fresh_second):
+                        return [mine] if machine_name == first.machine_name else []
+                    raise RuntimeError("popup unavailable")
+
+                def instance_state(*_args):
+                    phase["state_reads"] += 1
+                    if phase["on"]:
+                        return {"status": "running", "start_mode": "gpu",
+                                "host_account_gpu_clear": False}
+                    if phase["off"]:
+                        return {"status": "shutdown", "start_mode": "non_gpu",
+                                "host_account_gpu_clear": True}
+                    if phase["state_reads"] == 1:
+                        return {"status": "running", "start_mode": "gpu",
+                                "host_account_gpu_clear": False}
+                    return {"status": "running", "start_mode": "non_gpu",
+                            "host_account_gpu_clear": True}
+
+                def api_response(path, _payload):
+                    phase["off" if path.endswith("power_off") else "on"] = True
+                    return {"code": "Success"}
+
+                with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
+                    with patch("autodl_watcher.main.load_config", return_value=config), \
+                         patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                         patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                        platform.return_value.collect.side_effect = collect_platform
+                        platform.return_value.collect_occupancy.side_effect = collect_occupancy
+                        platform.return_value.get_instance_state.side_effect = instance_state
+                        platform.return_value.post_api_json.side_effect = api_response
+                        telemetry.return_value.collect.side_effect = lambda: [
+                            GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+                        main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                              "--live", "--convert-no-gpu", "--max-cycles", "2" if fresh_second else "4",
+                              "--runtime-dir", directory, "--no-login"])
+                        self.assertGreaterEqual(phase["occupancy_reads"], 4)
+                        if fresh_second:
+                            platform.return_value.post_api_json.assert_not_called()
+                        else:
+                            self.assertEqual(platform.return_value.post_api_json.call_args_list, [
+                                call("/api/v2/instance/power_off",
+                                     {"instance_uuid": first.instance_uuid, "release": "now"}),
+                                call("/api/v2/instance/power_on",
+                                     {"instance_uuid": first.instance_uuid, "start_mode": "gpu"}),
+                            ])
+
+    def test_conflicting_fresh_gpu_occupancy_stays_blocked_after_popup_failure(self):
+        base = self._conversion_config()
+        config = replace(base, usage_tracking=replace(base.usage_tracking, interval_seconds=0.001))
+        first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
+        host = PlatformHost("gpu-203", 1, 2, ("autodl-203-1", "autodl-203-2"),
+                            (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
+        mine = OccupancyRecord(datetime.now(), "gpu-203", first.machine_name, 0,
+                               "gpu-0", "Tesla V100", True, first.instance_uuid,
+                               config.usage_tracking.self_user, "2026-09-25 00:00:00")
+        occupancy_reads = 0
+
+        def collect_occupancy(machine_name, **_kwargs):
+            nonlocal occupancy_reads
+            occupancy_reads += 1
+            if occupancy_reads <= 2:
+                return [mine] if machine_name == first.machine_name else []
+            raise RuntimeError("popup unavailable")
+
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            with patch("autodl_watcher.main.load_config", return_value=config), \
+                 patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                platform.return_value.collect.return_value = [host]
+                platform.return_value.collect_occupancy.side_effect = collect_occupancy
+                platform.return_value.get_instance_state.return_value = {
+                    "status": "running", "start_mode": "non_gpu",
+                    "host_account_gpu_clear": True,
+                }
+                telemetry.return_value.collect.side_effect = lambda: [
+                    GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+                main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                      "--live", "--convert-no-gpu", "--max-cycles", "2",
+                      "--runtime-dir", directory, "--no-login"])
+                self.assertEqual(occupancy_reads, 4)
+                platform.return_value.post_api_json.assert_not_called()
+
+    def test_conflict_clears_after_two_reliable_empty_snapshots(self):
+        base = self._conversion_config()
+        config = replace(base, usage_tracking=replace(
+            base.usage_tracking, interval_seconds=0.001, absence_recheck_seconds=0.001))
+        first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
+        host = PlatformHost("gpu-203", 1, 2, ("autodl-203-1", "autodl-203-2"),
+                            (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
+        mine = OccupancyRecord(datetime.now(), "gpu-203", first.machine_name, 0,
+                               "gpu-0", "Tesla V100", True, first.instance_uuid,
+                               config.usage_tracking.self_user, "2026-09-25 00:00:00")
+        phase = {"occupancy_reads": 0, "telemetry_reads": 0, "off": False, "on": False}
+
+        def collect_occupancy(machine_name, **_kwargs):
+            phase["occupancy_reads"] += 1
+            cycle = (phase["occupancy_reads"] - 1) // 2
+            if cycle == 0:
+                return [mine] if machine_name == first.machine_name else []
+            if cycle == 1:
+                raise RuntimeError("popup unavailable")
+            return []
+
+        def collect_telemetry():
+            phase["telemetry_reads"] += 1
+            return [GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+
+        def instance_state(*_args):
+            if phase["on"]:
+                return {"status": "running", "start_mode": "gpu",
+                        "host_account_gpu_clear": False}
+            return {"status": "shutdown" if phase["off"] else "running",
+                    "start_mode": "non_gpu", "host_account_gpu_clear": True}
+
+        def api_response(path, _payload):
+            self.assertGreaterEqual(phase["occupancy_reads"], 8)
+            self.assertGreaterEqual(phase["telemetry_reads"], 6)  # 第二次可靠空快照后的下一轮才可重新评估。
+            phase["off" if path.endswith("power_off") else "on"] = True
+            return {"code": "Success"}
+
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            with patch("autodl_watcher.main.load_config", return_value=config), \
+                 patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                platform.return_value.collect.return_value = [host]
+                platform.return_value.collect_occupancy.side_effect = collect_occupancy
+                platform.return_value.get_instance_state.side_effect = instance_state
+                platform.return_value.post_api_json.side_effect = api_response
+                telemetry.return_value.collect.side_effect = collect_telemetry
+                main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                      "--live", "--convert-no-gpu", "--max-cycles", "7",
+                      "--runtime-dir", directory, "--no-login"])
+                self.assertEqual(platform.return_value.post_api_json.call_args_list, [
+                    call("/api/v2/instance/power_off",
+                         {"instance_uuid": first.instance_uuid, "release": "now"}),
+                    call("/api/v2/instance/power_on",
+                         {"instance_uuid": first.instance_uuid, "start_mode": "gpu"}),
+                ])
+
+    def test_other_same_host_gpu_or_instance_query_failure_still_blocks_switch(self):
+        config = self._conversion_config()
+        host = PlatformHost("gpu-203", 1, 2, ("autodl-203-1", "autodl-203-2"),
+                            (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
+        for other_gpu, query_error in ((True, False), (False, True)):
+            with self.subTest(other_gpu=other_gpu, query_error=query_error):
+                with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+                    with patch("autodl_watcher.main.load_config", return_value=config), \
+                         patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                         patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                        platform.return_value.collect.return_value = [host]
+                        platform.return_value.collect_occupancy.side_effect = RuntimeError("popup unavailable")
+                        if query_error:
+                            platform.return_value.get_instance_state.side_effect = PlatformTransientError("list unavailable")
+                        else:
+                            platform.return_value.get_instance_state.return_value = {
+                                "status": "running", "start_mode": "non_gpu",
+                                "host_account_gpu_clear": False,
+                            }
+                        telemetry.return_value.collect.side_effect = lambda: [
+                            GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+                        main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                              "--live", "--convert-no-gpu", "--max-cycles", "2",
+                              "--runtime-dir", directory, "--no-login"])
+                        self.assertTrue(platform.return_value.get_instance_state.called)
+                        platform.return_value.post_api_json.assert_not_called()
 
     def test_expired_ui_session_exits_and_releases_browser(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
