@@ -13,6 +13,7 @@ from autodl_watcher.collectors.platform import (
     PlatformTransientError,
     canonical_host,
     parse_platform_payload,
+    parse_occupancy_cells,
     validate_occupancy_snapshot,
 )
 from autodl_watcher.collectors.telemetry import (
@@ -450,6 +451,124 @@ class OccupancyValidationV054Test(unittest.TestCase):
                                         expected_total=3, expected_gpu_indices={0, 1})
 
 
+class OccupancySixColumnTest(unittest.TestCase):
+    def test_six_column_row_preserves_instance_and_start_time(self):
+        record = parse_occupancy_cells(
+            ["0", "gpu-uuid", "Tesla V100", "\u662f", "instance-1", "2026-09-25 01:00:00"],
+            observed_at=datetime(2026, 9, 25, 1, 0), host="gpu-203", machine_name="autodl-203-1",
+        )
+        self.assertIsNotNone(record)
+        self.assertTrue(record.occupied)
+        self.assertEqual(record.instance_id, "instance-1")
+        self.assertEqual(record.user, "")
+        self.assertEqual(record.started_at_text, "2026-09-25 01:00:00")
+
+    def test_old_seven_column_row_preserves_user_and_start_time(self):
+        record = parse_occupancy_cells(
+            ["0", "gpu-uuid", "Tesla V100", "\u662f", "instance-1", "owner",
+             "2026-09-25 01:00:00"],
+            observed_at=datetime(2026, 9, 25, 1, 0), host="gpu-203", machine_name="autodl-203-1",
+        )
+        self.assertIsNotNone(record)
+        self.assertEqual(record.user, "owner")
+        self.assertEqual(record.started_at_text, "2026-09-25 01:00:00")
+
+    def test_rechecks_full_rows_until_occupancy_counts_match(self):
+        collector = PlatformBrowserCollector(PlatformClassificationV052Test._config())
+        collector._page = Mock()
+        modal = Mock()
+        rows = Mock()
+        rows.count.return_value = 3
+        header = Mock()
+        header.locator.return_value.all_inner_texts.return_value = []
+        data_rows = []
+        for index in (0, 1):
+            row = Mock()
+            row.locator.return_value.all_inner_texts.side_effect = [
+                [str(index), f"gpu-{index}", "Tesla V100", "\u5426", "-", "-"],
+                [str(index), f"gpu-{index}", "Tesla V100", "\u662f", f"instance-{index}",
+                 "2026-09-25 01:00:00"],
+            ]
+            data_rows.append(row)
+        rows.nth.side_effect = lambda index: [header, *data_rows][index]
+        modal.locator.return_value = rows
+        with patch.object(collector, "collect"), \
+             patch.object(collector, "_find_occupancy_action", return_value=Mock()), \
+             patch.object(collector, "_find_visible_occupancy_modal", return_value=modal), \
+             patch.object(collector, "_close_occupancy_modal"):
+            records = collector.collect_occupancy("autodl-203-1", expected_idle=0, expected_total=2)
+        self.assertEqual([record.occupied for record in records], [True, True])
+        collector._page.wait_for_timeout.assert_any_call(100)
+
+    def test_persistent_occupancy_mismatch_raises_after_timeout(self):
+        collector = PlatformBrowserCollector(PlatformClassificationV052Test._config())
+        collector._page = Mock()
+        modal = Mock()
+        rows = Mock()
+        rows.count.return_value = 3
+        row_mocks = []
+        for cells in ([], ["0", "gpu-0", "Tesla V100", "\u5426", "-", "-"],
+                      ["1", "gpu-1", "Tesla V100", "\u5426", "-", "-"]):
+            row = Mock()
+            row.locator.return_value.all_inner_texts.return_value = cells
+            row_mocks.append(row)
+        rows.nth.side_effect = lambda index: row_mocks[index]
+        modal.locator.return_value = rows
+        with patch.object(collector, "collect"), \
+             patch.object(collector, "_find_occupancy_action", return_value=Mock()), \
+             patch.object(collector, "_find_visible_occupancy_modal", return_value=modal), \
+             patch.object(collector, "_close_occupancy_modal"), \
+             patch("autodl_watcher.collectors.platform.time.monotonic", side_effect=[0.0, 0.0, 21.0]):
+            with self.assertRaisesRegex(OccupancySnapshotMismatchError, "应为 2"):
+                collector.collect_occupancy("autodl-203-1", expected_idle=0, expected_total=2)
+        collector._page.wait_for_timeout.assert_any_call(100)
+
+    def test_missing_gpu_rows_still_fail_after_timeout(self):
+        collector = PlatformBrowserCollector(PlatformClassificationV052Test._config())
+        collector._page = Mock()
+        modal = Mock()
+        rows = Mock()
+        rows.count.return_value = 1
+        rows.nth.return_value.locator.return_value.all_inner_texts.return_value = []
+        modal.locator.return_value = rows
+        with patch.object(collector, "collect"), \
+             patch.object(collector, "_find_occupancy_action", return_value=Mock()), \
+             patch.object(collector, "_find_visible_occupancy_modal", return_value=modal), \
+             patch.object(collector, "_close_occupancy_modal"), \
+             patch("autodl_watcher.collectors.platform.time.monotonic", side_effect=[0.0, 0.0, 21.0]):
+            with self.assertRaises(OccupancySnapshotMismatchError):
+                collector.collect_occupancy("autodl-203-1", expected_idle=2, expected_total=2)
+        collector._page.wait_for_timeout.assert_any_call(100)
+
+    def test_waits_for_delayed_six_column_rows(self):
+        collector = PlatformBrowserCollector(PlatformClassificationV052Test._config())
+        collector._page = Mock()
+        action = Mock()
+        modal = Mock()
+        rows = Mock()
+        rows.count.side_effect = [1, 3]
+        cell_rows = [
+            [],
+            ["0", "gpu-0", "Tesla V100", "\u662f", "instance-1", "2026-09-25 01:00:00"],
+            ["1", "gpu-1", "Tesla V100", "\u5426", "-", "-"],
+        ]
+        row_mocks = []
+        for cells in cell_rows:
+            row = Mock()
+            row.locator.return_value.all_inner_texts.return_value = cells
+            row_mocks.append(row)
+        rows.nth.side_effect = lambda index: row_mocks[index]
+        modal.locator.return_value = rows
+        with patch.object(collector, "collect"), \
+             patch.object(collector, "_find_occupancy_action", return_value=action), \
+             patch.object(collector, "_find_visible_occupancy_modal", return_value=modal), \
+             patch.object(collector, "_close_occupancy_modal"):
+            records = collector.collect_occupancy("autodl-203-1", expected_idle=1, expected_total=2)
+        self.assertEqual([item.gpu_index for item in records], [0, 1])
+        self.assertEqual([item.user for item in records], ["", ""])
+        collector._page.wait_for_timeout.assert_any_call(100)
+
+
 class InstanceStateCollectorTest(unittest.TestCase):
     @staticmethod
     def _collector(tenant_payload=None):
@@ -474,6 +593,23 @@ class InstanceStateCollectorTest(unittest.TestCase):
     @staticmethod
     def _response(rows, total):
         return {"code": "Success", "data": {"list": rows, "result_total": total}}
+
+    def test_get_account_instances_paginates_and_returns_only_state_fields(self):
+        collector, page = self._collector()
+        first = [
+            {"instance_uuid": f"other-{index}", "machine_name": "autodl-204-1",
+             "status": "shutdown", "start_mode": "gpu", "secret": "ignored"}
+            for index in range(10)
+        ]
+        last = {"instance_uuid": "target", "machine_name": "autodl-203-1",
+                "status": "running", "start_mode": "non_gpu", "secret": "ignored"}
+        collector.post_api_json = Mock(side_effect=[self._response(first, 11), self._response([last], 11)])
+        rows = collector.get_account_instances()
+        self.assertEqual(len(rows), 11)
+        self.assertEqual(rows[-1], {"instance_uuid": "target", "machine_name": "autodl-203-1",
+                                    "status": "running", "start_mode": "non_gpu"})
+        self.assertEqual(collector.post_api_json.call_count, 2)
+        page.close.assert_called_once()
 
     def test_exact_uuid_on_second_page_and_close_temporary_page(self):
         collector, page = self._collector()

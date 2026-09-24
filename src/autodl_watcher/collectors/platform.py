@@ -89,15 +89,16 @@ def parse_occupancy_cells(
     machine_name: str,
 ) -> OccupancyRecord | None:  # 解析 AutoDL "查看占用"弹窗中的一行表格数据。
     values = [str(item).strip() for item in cells]
-    if len(values) < 7:  # 表头、加载占位或不完整行都不能生成占用记录。
+    if len(values) < 6:  # 新版弹窗为 6 列，旧版为 7 列；不完整行不能生成占用记录。
         return None
     try:
         gpu_index = int(values[0])
     except ValueError:
         return None
-    occupied_text = values[3]  # 表格列顺序为 INDEX、UUID、名称、占用、实例、用户、开始时间。
+    occupied_text = values[3]  # 新版列顺序为 INDEX、UUID、名称、占用、实例、开始时间。
     if occupied_text not in {"是", "否"}:
         return None
+    has_user_column = len(values) >= 7  # 旧版在实例与开始时间之间另有用户列。
     return OccupancyRecord(
         observed_at=observed_at,
         host=host,
@@ -107,8 +108,8 @@ def parse_occupancy_cells(
         gpu_name=values[2],
         occupied=occupied_text == "是",
         instance_id="" if values[4] == "-" else values[4],  # 把网页占位符转为空值，避免被误当作真实实例 ID。
-        user="" if values[5] == "-" else values[5],
-        started_at_text="" if values[6] == "-" else values[6],
+        user="" if not has_user_column or values[5] == "-" else values[5],
+        started_at_text="" if values[6 if has_user_column else 5] == "-" else values[6 if has_user_column else 5],
     )
 
 
@@ -403,9 +404,7 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
             raise RuntimeError(f"AutoDL API {path} returned non-object JSON")
         return payload_json
 
-    def get_instance_state(self, instance_uuid: str, machine_name: str) -> dict[str, Any]:  # 双重匹配实例，并核对同主机账号有卡占用。
-        if not instance_uuid.strip() or not _MACHINE_PATTERN.fullmatch(machine_name.strip()):
-            raise ValueError("instance_uuid 或 machine_name 格式无效")
+    def get_account_instances(self) -> list[dict[str, Any]]:  # 读取当前账号完整实例列表；只有全部分页一致且 UUID 唯一才返回。
         self.start()
         assert self._context is not None
         if self._instance_tenant_uuid is None:
@@ -438,7 +437,6 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
 
         page_size = 10  # 与官网实例列表默认分页一致；逐页核对后才允许认定目标状态。
         total: int | None = None
-        matches: list[dict[str, Any]] = []
         all_rows: list[dict[str, Any]] = []
         seen_uuids: set[str] = set()  # 翻页期间若出现重复行，可能漏掉其他有卡实例，整份列表作废。
         page_index = 1
@@ -466,11 +464,15 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
                 if not row_uuid.strip() or row_uuid in seen_uuids:
                     raise PlatformTransientError("实例列表分页有空或重复 UUID，无法确认全部实例")
                 seen_uuids.add(row_uuid)
-                all_rows.append(row)
-                if row["instance_uuid"] == instance_uuid:
-                    matches.append(row)
+                all_rows.append({key: row.get(key) for key in ("instance_uuid", "machine_name", "status", "start_mode")})
             page_index += 1
+        return all_rows
 
+    def get_instance_state(self, instance_uuid: str, machine_name: str) -> dict[str, Any]:  # 双重匹配实例，并核对同主机账号有卡占用。
+        if not instance_uuid.strip() or not _MACHINE_PATTERN.fullmatch(machine_name.strip()):
+            raise ValueError("instance_uuid 或 machine_name 格式无效")
+        all_rows = self.get_account_instances()
+        matches = [row for row in all_rows if row["instance_uuid"] == instance_uuid]
         if len(matches) != 1:
             raise PlatformTransientError("实例列表中目标 UUID 缺失或重复")
         if matches[0].get("machine_name") != machine_name:
@@ -584,31 +586,35 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
         modal = None
         try:
             modal = self._find_visible_occupancy_modal(machine_name)
-            self._page.wait_for_timeout(200)
-
-            observed_at = datetime.now()
+            deadline = time.monotonic() + self.config.response_timeout_seconds  # 表头先出现，GPU 行可能异步加载。
             host = canonical_host(machine_name)
-            result: list[OccupancyRecord] = []
-            rows = modal.locator("tr")
-            for index in range(rows.count()):
-                cells = rows.nth(index).locator("td").all_inner_texts()
-                record = parse_occupancy_cells(
-                    cells,
-                    observed_at=observed_at,
-                    host=host,
-                    machine_name=machine_name,
-                )
-                if record is not None:
-                    result.append(record)
-
-            result = sorted(result, key=lambda item: item.gpu_index)
-            return validate_occupancy_snapshot(
-                result,
-                machine_name=machine_name,
-                expected_idle=expected_idle,
-                expected_total=expected_total,
-                expected_gpu_indices=expected_gpu_indices,
-            )
+            while True:
+                observed_at = datetime.now()
+                result: list[OccupancyRecord] = []
+                rows = modal.locator("tr")
+                for index in range(rows.count()):
+                    cells = rows.nth(index).locator("td").all_inner_texts()
+                    record = parse_occupancy_cells(
+                        cells,
+                        observed_at=observed_at,
+                        host=host,
+                        machine_name=machine_name,
+                    )
+                    if record is not None:
+                        result.append(record)
+                result = sorted(result, key=lambda item: item.gpu_index)
+                try:
+                    return validate_occupancy_snapshot(
+                        result,
+                        machine_name=machine_name,
+                        expected_idle=expected_idle,
+                        expected_total=expected_total,
+                        expected_gpu_indices=expected_gpu_indices,
+                    )
+                except OccupancySnapshotMismatchError:  # 足额行也可能尚未更新占用状态；只接受完整一致的快照。
+                    if time.monotonic() >= deadline:
+                        raise
+                    self._page.wait_for_timeout(100)
         finally:
             if modal is not None:
                 self._close_occupancy_modal(modal)

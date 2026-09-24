@@ -68,7 +68,8 @@ class MonitorLoopTest(unittest.TestCase):
         return replace(config,
             auto_start=replace(config.auto_start, recheck_delay_seconds=0,
                                post_start_check_seconds=-1),
-            usage_tracking=replace(config.usage_tracking, enabled=True, interval_seconds=0.01),
+            usage_tracking=replace(config.usage_tracking, enabled=True, interval_seconds=1e-6,
+                                   absence_recheck_seconds=1e-6),
             monitor=replace(config.monitor, poll_seconds=0.01, confirmation_seconds=0,
                             min_idle_samples=1))
 
@@ -135,8 +136,7 @@ class MonitorLoopTest(unittest.TestCase):
                 ])
 
     def test_old_gpu_occupancy_is_overridden_but_fresh_positive_still_blocks(self):
-        base = self._conversion_config()
-        config = replace(base, usage_tracking=replace(base.usage_tracking, interval_seconds=0.001))
+        config = self._conversion_config()
         first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
         names = ("autodl-203-1", "autodl-203-2")
         blocked_host = PlatformHost("gpu-203", 0, 2, names,
@@ -205,8 +205,7 @@ class MonitorLoopTest(unittest.TestCase):
                             ])
 
     def test_conflicting_fresh_gpu_occupancy_stays_blocked_after_popup_failure(self):
-        base = self._conversion_config()
-        config = replace(base, usage_tracking=replace(base.usage_tracking, interval_seconds=0.001))
+        config = self._conversion_config()
         first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
         host = PlatformHost("gpu-203", 1, 2, ("autodl-203-1", "autodl-203-2"),
                             (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
@@ -241,9 +240,7 @@ class MonitorLoopTest(unittest.TestCase):
                 platform.return_value.post_api_json.assert_not_called()
 
     def test_conflict_clears_after_two_reliable_empty_snapshots(self):
-        base = self._conversion_config()
-        config = replace(base, usage_tracking=replace(
-            base.usage_tracking, interval_seconds=0.001, absence_recheck_seconds=0.001))
+        config = self._conversion_config()
         first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
         host = PlatformHost("gpu-203", 1, 2, ("autodl-203-1", "autodl-203-2"),
                             (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
@@ -334,6 +331,145 @@ class MonitorLoopTest(unittest.TestCase):
                           "--dry-run", "--no-login"])
                 login.assert_not_called()
                 platform.return_value.close.assert_called_once()
+
+
+    def test_six_column_occupancy_matches_account_uuid_and_records_user(self):
+        config = self._conversion_config()
+        first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
+        host = PlatformHost("gpu-203", 0, 2, ("autodl-203-1", "autodl-203-2"),
+                            (("autodl-203-1", 0, 2), ("autodl-203-2", 0, 2)))
+        mine = OccupancyRecord(datetime.now(), "gpu-203", first.machine_name, 0,
+                               "gpu-0", "Tesla V100", True,
+                               f"aaaaaaaaaa-bbbbbbbb (other)\n{first.instance_uuid} (mine)",
+                               "", "2026-09-25 00:00:00")
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
+            with patch("autodl_watcher.main.load_config", return_value=config), \
+                 patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                platform.return_value.collect.return_value = [host]
+                platform.return_value.collect_occupancy.side_effect = (
+                    lambda name, **_kwargs: [mine] if name == first.machine_name else [])
+                platform.return_value.get_account_instances.return_value = [
+                    {"instance_uuid": first.instance_uuid, "machine_name": first.machine_name,
+                     "status": "running", "start_mode": "gpu"}]
+                platform.return_value.get_instance_state.return_value = {
+                    "status": "running", "start_mode": "gpu", "host_account_gpu_clear": False}
+                telemetry.return_value.collect.return_value = [
+                    GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+                main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                      "--live", "--convert-no-gpu", "--max-cycles", "1",
+                      "--runtime-dir", directory, "--no-login"])
+                self.assertIn("本人 GPU 占用 有", output.getvalue())
+                self.assertIn(
+                    f"{config.usage_tracking.self_user}({first.instance_uuid})", output.getvalue())
+                self.assertIn("aaaaaaaaaa-bbbbbbbb", output.getvalue())
+                platform.return_value.get_account_instances.assert_called_once()
+                platform.return_value.post_api_json.assert_not_called()
+
+    def test_unknown_six_column_identity_with_list_failure_blocks_switch(self):
+        config = self._conversion_config()
+        first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
+        host = PlatformHost("gpu-203", 1, 2, ("autodl-203-1", "autodl-203-2"),
+                            (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
+        unknown = OccupancyRecord(datetime.now(), "gpu-203", first.machine_name, 0,
+                                  "gpu-0", "Tesla V100", True,
+                                  "aaaaaaaaaa-bbbbbbbb (other)\ncccccccccc-dddddddd (other)",
+                                  "", "2026-09-25 00:00:00")
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
+            with patch("autodl_watcher.main.load_config", return_value=config), \
+                 patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                platform.return_value.collect.return_value = [host]
+                platform.return_value.collect_occupancy.side_effect = (
+                    lambda name, **_kwargs: [unknown] if name == first.machine_name else [])
+                platform.return_value.get_account_instances.side_effect = PlatformTransientError(
+                    "instance list unavailable")
+                platform.return_value.get_instance_state.return_value = {
+                    "status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True}
+                telemetry.return_value.collect.side_effect = lambda: [
+                    GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+                main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                      "--live", "--convert-no-gpu", "--max-cycles", "2",
+                      "--runtime-dir", directory, "--no-login"])
+                self.assertIn("占用身份未确认", output.getvalue())
+                self.assertNotIn("本人 GPU 占用 无", output.getvalue())
+                platform.return_value.post_api_json.assert_not_called()
+
+    def test_unknown_six_column_identity_excluded_by_complete_account_list(self):
+        config = self._conversion_config()
+        first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
+        host = PlatformHost("gpu-203", 0, 2, ("autodl-203-1", "autodl-203-2"),
+                            (("autodl-203-1", 0, 2), ("autodl-203-2", 0, 2)))
+        other = OccupancyRecord(datetime.now(), "gpu-203", first.machine_name, 0,
+                                "gpu-0", "Tesla V100", True,
+                                "aaaaaaaaaa-bbbbbbbb (other)\ncccccccccc-dddddddd (other)",
+                                "", "2026-09-25 00:00:00")
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
+            with patch("autodl_watcher.main.load_config", return_value=config), \
+                 patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                platform.return_value.collect.return_value = [host]
+                platform.return_value.collect_occupancy.side_effect = (
+                    lambda name, **_kwargs: [other] if name == first.machine_name else [])
+                platform.return_value.get_account_instances.return_value = [
+                    {"instance_uuid": first.instance_uuid, "machine_name": first.machine_name,
+                     "status": "running", "start_mode": "non_gpu"}]
+                telemetry.return_value.collect.side_effect = lambda: [
+                    GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+                main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                      "--dry-run", "--max-cycles", "5", "--runtime-dir", directory, "--no-login"])
+                self.assertIn("本人 GPU 占用 无", output.getvalue())
+                platform.return_value.get_account_instances.assert_called()
+                platform.return_value.post_api_json.assert_not_called()
+
+    def test_unparseable_instance_id_cell_blocks_switch_even_with_clear_account_list(self):
+        config = self._conversion_config()
+        first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
+        host = PlatformHost("gpu-203", 1, 2, ("autodl-203-1", "autodl-203-2"),
+                            (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
+        unknown = OccupancyRecord(datetime.now(), "gpu-203", first.machine_name, 0,
+                                  "gpu-0", "Tesla V100", True,
+                                  f"aaaaaaaaaa-bbbbbbbb (other)\n{first.instance_uuid}e (bad suffix)",
+                                  "", "2026-09-25 00:00:00")
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
+            with patch("autodl_watcher.main.load_config", return_value=config), \
+                 patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                platform.return_value.collect.return_value = [host]
+                platform.return_value.collect_occupancy.side_effect = (
+                    lambda name, **_kwargs: [unknown] if name == first.machine_name else [])
+                platform.return_value.get_account_instances.return_value = [
+                    {"instance_uuid": first.instance_uuid, "machine_name": first.machine_name,
+                     "status": "running", "start_mode": "non_gpu"}]
+                platform.return_value.get_instance_state.return_value = {
+                    "status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True}
+                telemetry.return_value.collect.side_effect = lambda: [
+                    GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+                main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                      "--live", "--convert-no-gpu", "--max-cycles", "2",
+                      "--runtime-dir", directory, "--no-login"])
+                self.assertIn("占用身份未确认", output.getvalue())
+                self.assertNotIn("本人 GPU 占用 无", output.getvalue())
+                platform.return_value.post_api_json.assert_not_called()
+
+    def test_missing_configured_instance_id_is_explicit_in_status(self):
+        config = self._conversion_config()
+        host = PlatformHost("gpu-203", 0, 2, ("autodl-203-1", "autodl-203-2"),
+                            (("autodl-203-1", 0, 2), ("autodl-203-2", 0, 2)))
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
+            with patch("autodl_watcher.main.load_config", return_value=config), \
+                 patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                platform.return_value.collect.return_value = [host]
+                platform.return_value.collect_occupancy.return_value = []
+                platform.return_value.get_instance_state.side_effect = PlatformTransientError(
+                    "实例列表中目标 UUID 缺失或重复")
+                telemetry.return_value.collect.return_value = []
+                main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                      "--live", "--convert-no-gpu", "--max-cycles", "1",
+                      "--runtime-dir", directory, "--no-login"])
+                self.assertIn("配置实例不存在或ID已过期", output.getvalue())
+                platform.return_value.post_api_json.assert_not_called()
 
 
 if __name__ == "__main__":

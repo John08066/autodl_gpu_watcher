@@ -242,6 +242,18 @@ class AutoStartCoordinator:  # 自动开机协调器。
             if status != "shutdown":  # 已有卡运行、正在开关机或未知状态都不重复开机。
                 return StartAttemptResult("instance_state_blocked", alert.host, target.instance_uuid,
                                           target.machine_name, f"实例当前状态为 {status}/{mode}，暂缓有卡开机。")
+        else:
+            try:
+                state = self.platform.get_instance_state(target.instance_uuid, target.machine_name)  # 普通开机也须核实配置 UUID、入口及本账号同主机占用。
+            except PlatformAuthenticationError:
+                raise
+            except Exception as exc:
+                return StartAttemptResult("instance_state_blocked", alert.host, target.instance_uuid,
+                                          target.machine_name, f"实例列表无法核对目标：{exc}")
+            if (not isinstance(state, dict) or state.get("status") != "shutdown"
+                    or state.get("host_account_gpu_clear") is not True):
+                return StartAttemptResult("instance_state_blocked", alert.host, target.instance_uuid,
+                                          target.machine_name, "目标实例未确认已关机，或同主机账号有卡占用尚未排除，暂缓开机。")
 
         if stop_requested():
             return StartAttemptResult("cancelled", alert.host, target.instance_uuid, target.machine_name, "监控已请求停止。")

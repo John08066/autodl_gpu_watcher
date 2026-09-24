@@ -77,6 +77,9 @@ class AutoStartTest(unittest.TestCase):
             def post_api_json(self, path, payload):  # 执行 `post_api_json` 对应的内部处理逻辑。
                 raise AssertionError("post_api_json must not be called in dry-run")
 
+            def get_instance_state(self, instance_uuid, machine_name):
+                raise AssertionError("get_instance_state must not be called in dry-run")
+
         confirmed = ConfirmedGpu(
             host="gpu-202",
             gpu_index=1,
@@ -323,6 +326,58 @@ class NoGpuConversionTest(unittest.TestCase):
         self.assertEqual(starter.attempt(self.alert).status, "dry_run")
         self.platform.get_instance_state.assert_not_called()
         self.platform.post_api_json.assert_not_called()
+
+    def test_regular_start_requires_confirmed_shutdown_and_matching_account(self):
+        self.platform.collect.return_value = [self.before]
+        self.platform.get_instance_state.return_value = {
+            "status": "shutdown", "start_mode": "gpu", "host_account_gpu_clear": True,
+        }
+        self.platform.post_api_json.return_value = {"code": "Success"}
+        starter = AutoStartCoordinator(self.config, self.monitor, self.thresholds,
+                                       self.platform, self.telemetry)
+        self.assertEqual(starter.attempt(self.alert).status, "request_accepted")
+        self.platform.get_instance_state.assert_called_once_with("instance-1", "autodl-203-1")
+        self.platform.post_api_json.assert_called_once_with(
+            "/api/v2/instance/power_on", {"instance_uuid": "instance-1", "start_mode": "gpu"})
+
+    def test_regular_start_blocks_running_or_other_account_gpu(self):
+        self.platform.collect.return_value = [self.before]
+        for status, proof in (("running", True), ("shutdown", False), ("shutdown", None)):
+            with self.subTest(status=status, proof=proof):
+                self.platform.post_api_json.reset_mock()
+                self.platform.get_instance_state.return_value = {
+                    "status": status, "start_mode": "non_gpu", "host_account_gpu_clear": proof,
+                }
+                starter = AutoStartCoordinator(self.config, self.monitor, self.thresholds,
+                                               self.platform, self.telemetry)
+                self.assertEqual(starter.attempt(self.alert).status, "instance_state_blocked")
+                self.platform.post_api_json.assert_not_called()
+
+    def test_regular_start_blocks_missing_or_duplicate_configured_uuid(self):
+        from autodl_watcher.collectors import PlatformTransientError
+        self.platform.collect.return_value = [self.before]
+        for reason in ("目标 UUID 缺失", "目标 UUID 重复"):
+            with self.subTest(reason=reason):
+                self.platform.post_api_json.reset_mock()
+                self.platform.get_instance_state.side_effect = PlatformTransientError(reason)
+                starter = AutoStartCoordinator(self.config, self.monitor, self.thresholds,
+                                               self.platform, self.telemetry)
+                result = starter.attempt(self.alert)
+                self.assertEqual(result.status, "instance_state_blocked")
+                self.assertIn(reason, result.message)
+                self.platform.post_api_json.assert_not_called()
+
+    def test_regular_start_checks_instance_even_without_capacity_recheck(self):
+        config = replace(self.config, verify_before_start=False)
+        self.platform.get_instance_state.return_value = {
+            "status": "shutdown", "start_mode": "gpu", "host_account_gpu_clear": True,
+        }
+        self.platform.post_api_json.return_value = {"code": "Success"}
+        starter = AutoStartCoordinator(config, self.monitor, self.thresholds,
+                                       self.platform, self.telemetry)
+        self.assertEqual(starter.attempt(self.alert).status, "request_accepted")
+        self.platform.get_instance_state.assert_called_once_with("instance-1", "autodl-203-1")
+        self.platform.collect.assert_not_called()
 
 
 if __name__ == "__main__":
