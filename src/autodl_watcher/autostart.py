@@ -139,7 +139,7 @@ class AutoStartCoordinator:  # 自动开机协调器。
 
         platform_free_before = alert.platform_free_count  # 先使用事件内快照；开启二次确认时会被更近的读数替换。
         platform_total_before = alert.platform_total_count
-        if self.config.verify_before_start:  # 显存和平台空位可能在通知后变化，因此发送请求前再次确认。
+        if self.config.verify_before_start or self.convert_no_gpu:  # 无卡切换始终复核容量，不能让可选配置跳过关机前检查。
             if self.config.recheck_delay_seconds > 0:
                 time.sleep(self.config.recheck_delay_seconds)
 
@@ -203,6 +203,29 @@ class AutoStartCoordinator:  # 自动开机协调器。
                     platform_free_before=host_state.free_count,
                     platform_total_before=host_state.total_count,
                 )
+
+            if self.convert_no_gpu:  # 入口空位与达标显存必须属于同一 GPU INDEX。
+                target_slot = _slot_map(host_state.source_slots).get(target.machine_name)
+                if target_slot is None or not 0 < target_slot[0] <= target_slot[1]:
+                    return StartAttemptResult("recheck_failed", alert.host, target.instance_uuid,
+                                              target.machine_name, "二次确认失败：目标入口无可靠空位。")
+                try:
+                    rows = self.platform.collect_occupancy(
+                        target.machine_name, expected_idle=target_slot[0], expected_total=target_slot[1])
+                    free_indices = {item.gpu_index for item in rows if not item.occupied}
+                    valid_rows = (len(rows) == target_slot[1]
+                                  and len({item.gpu_index for item in rows}) == target_slot[1]
+                                  and len(free_indices) == target_slot[0]
+                                  and all(item.host == alert.host and item.machine_name == target.machine_name
+                                          for item in rows))
+                except PlatformAuthenticationError:
+                    raise
+                except Exception as exc:
+                    return StartAttemptResult("recheck_failed", alert.host, target.instance_uuid,
+                                              target.machine_name, f"二次确认失败：目标入口占用详情不可用：{exc}")
+                if not valid_rows or not free_indices.intersection(sample.gpu_index for sample in still_ready):
+                    return StartAttemptResult("recheck_failed", alert.host, target.instance_uuid,
+                                              target.machine_name, "二次确认失败：目标入口空闲 GPU INDEX 与达标显存不重合。")
 
         if stop_requested():  # 停止信号到达后不再改变实例状态。
             return StartAttemptResult("cancelled", alert.host, target.instance_uuid, target.machine_name, "监控已请求停止。")
