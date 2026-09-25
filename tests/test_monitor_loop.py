@@ -73,6 +73,16 @@ class MonitorLoopTest(unittest.TestCase):
             monitor=replace(config.monitor, poll_seconds=0.01, confirmation_seconds=0,
                             min_idle_samples=1))
 
+    @staticmethod
+    def _one_free_gpu(machine_name):
+        now = datetime.now()
+        return [
+            OccupancyRecord(now, "gpu-203", machine_name, 0, "gpu-0", "Tesla V100",
+                            False, "", "", ""),
+            OccupancyRecord(now, "gpu-203", machine_name, 1, "gpu-1", "Tesla V100",
+                            True, "aaaaaaaaaa-bbbbbbbb", "other_user", "2026-09-25 00:00:00"),
+        ]
+
     def test_no_gpu_instance_is_visible_when_occupancy_fails_but_no_slot_exists(self):
         config = self._conversion_config()
         host = PlatformHost("gpu-203", 0, 2, ("autodl-203-1", "autodl-203-2"),
@@ -96,7 +106,7 @@ class MonitorLoopTest(unittest.TestCase):
                 self.assertTrue(platform.return_value.get_instance_state.called)
                 platform.return_value.post_api_json.assert_not_called()
 
-    def test_occupancy_failure_does_not_hide_same_instance_switch(self):
+    def test_other_entry_popup_failure_does_not_hide_same_instance_switch(self):
         config = self._conversion_config()
         first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
         host = PlatformHost("gpu-203", 1, 2, ("autodl-203-1", "autodl-203-2"),
@@ -116,12 +126,17 @@ class MonitorLoopTest(unittest.TestCase):
             phase["off" if path.endswith("power_off") else "on"] = True
             return {"code": "Success"}
 
+        def collect_occupancy(machine_name, **_kwargs):
+            if machine_name == first.machine_name:
+                return self._one_free_gpu(machine_name)
+            raise RuntimeError("other entry popup unavailable")
+
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
             with patch("autodl_watcher.main.load_config", return_value=config), \
                  patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
                  patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
                 platform.return_value.collect.return_value = [host]
-                platform.return_value.collect_occupancy.side_effect = RuntimeError("popup unavailable")
+                platform.return_value.collect_occupancy.side_effect = collect_occupancy
                 platform.return_value.get_instance_state.side_effect = instance_state
                 platform.return_value.post_api_json.side_effect = api_response
                 telemetry.return_value.collect.side_effect = lambda: [
@@ -134,6 +149,26 @@ class MonitorLoopTest(unittest.TestCase):
                     call("/api/v2/instance/power_off", {"instance_uuid": first.instance_uuid, "release": "now"}),
                     call("/api/v2/instance/power_on", {"instance_uuid": first.instance_uuid, "start_mode": "gpu"}),
                 ])
+
+    def test_target_popup_failure_blocks_same_instance_switch(self):
+        config = self._conversion_config()
+        host = PlatformHost("gpu-203", 1, 2, ("autodl-203-1", "autodl-203-2"),
+                            (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
+            with (patch("autodl_watcher.main.load_config", return_value=config),
+                  patch("autodl_watcher.main.PlatformBrowserCollector") as platform,
+                  patch("autodl_watcher.main.TelemetryApiCollector") as telemetry):
+                platform.return_value.collect.return_value = [host]
+                platform.return_value.collect_occupancy.side_effect = RuntimeError("popup unavailable")
+                platform.return_value.get_instance_state.return_value = {
+                    "status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True}
+                telemetry.return_value.collect.side_effect = lambda: [
+                    GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+                main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                      "--live", "--convert-no-gpu", "--max-cycles", "2",
+                      "--runtime-dir", directory, "--no-login"])
+                self.assertIn("目标入口占用详情不可用", output.getvalue())
+                platform.return_value.post_api_json.assert_not_called()
 
     def test_old_gpu_occupancy_is_overridden_but_fresh_positive_still_blocks(self):
         config = self._conversion_config()
@@ -159,8 +194,12 @@ class MonitorLoopTest(unittest.TestCase):
                     phase["occupancy_reads"] += 1
                     cycle = (phase["occupancy_reads"] - 1) // 2
                     if cycle == 0 or (cycle == 1 and fresh_second):
-                        return [mine] if machine_name == first.machine_name else []
-                    raise RuntimeError("popup unavailable")
+                        if machine_name != first.machine_name:
+                            return []
+                        rows = self._one_free_gpu(machine_name)
+                        return [replace(rows[0], occupied=True, instance_id=first.instance_uuid,
+                                        user=config.usage_tracking.self_user), rows[1]]
+                    return self._one_free_gpu(machine_name) if machine_name == first.machine_name else []
 
                 def instance_state(*_args):
                     phase["state_reads"] += 1
@@ -193,7 +232,7 @@ class MonitorLoopTest(unittest.TestCase):
                         main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
                               "--live", "--convert-no-gpu", "--max-cycles", "2" if fresh_second else "4",
                               "--runtime-dir", directory, "--no-login"])
-                        self.assertGreaterEqual(phase["occupancy_reads"], 4)
+                        self.assertGreaterEqual(phase["occupancy_reads"], 3 if fresh_second else 4, output.getvalue())
                         if fresh_second:
                             platform.return_value.post_api_json.assert_not_called()
                         else:
@@ -234,9 +273,9 @@ class MonitorLoopTest(unittest.TestCase):
                 telemetry.return_value.collect.side_effect = lambda: [
                     GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
                 main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
-                      "--live", "--convert-no-gpu", "--max-cycles", "2",
+                      "--live", "--convert-no-gpu", "--max-cycles", "3",
                       "--runtime-dir", directory, "--no-login"])
-                self.assertEqual(occupancy_reads, 4)
+                self.assertGreaterEqual(occupancy_reads, 4)
                 platform.return_value.post_api_json.assert_not_called()
 
     def test_conflict_clears_after_two_reliable_empty_snapshots(self):
@@ -256,7 +295,7 @@ class MonitorLoopTest(unittest.TestCase):
                 return [mine] if machine_name == first.machine_name else []
             if cycle == 1:
                 raise RuntimeError("popup unavailable")
-            return []
+            return self._one_free_gpu(machine_name)
 
         def collect_telemetry():
             phase["telemetry_reads"] += 1

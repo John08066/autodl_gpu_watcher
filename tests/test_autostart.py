@@ -12,7 +12,7 @@ from autodl_watcher.config import (
     IdleThresholds,
     MonitorConfig,
 )
-from autodl_watcher.models import AvailabilityAlert, ConfirmedGpu, GpuSample, PlatformHost
+from autodl_watcher.models import AvailabilityAlert, ConfirmedGpu, GpuSample, OccupancyRecord, PlatformHost
 
 
 class AutoStartTest(unittest.TestCase):
@@ -148,6 +148,11 @@ class NoGpuConversionTest(unittest.TestCase):
         self.thresholds = IdleThresholds(False, 100, 8192, 0.25)
         self.platform = Mock()
         self.telemetry = Mock()
+        self.platform.collect_occupancy.side_effect = lambda machine_name, *, expected_idle, expected_total: [
+            OccupancyRecord(datetime.now(), "gpu-203", machine_name, index, f"gpu-{index}",
+                            "Tesla V100", index >= expected_idle, "", "", "")
+            for index in range(expected_total)
+        ]
         self.telemetry.collect.return_value = [
             GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())
         ]
@@ -163,6 +168,59 @@ class NoGpuConversionTest(unittest.TestCase):
     def _starter(self):
         return AutoStartCoordinator(self.config, self.monitor, self.thresholds,
                                     self.platform, self.telemetry, convert_no_gpu=True)
+
+    def test_free_entry_and_ready_memory_on_different_gpu_blocks_shutdown(self):
+        host = replace(self.before, free_count=1,
+                       source_slots=(("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
+        self.platform.collect.return_value = [host]
+        self.telemetry.collect.return_value = [
+            GpuSample("gpu-203", 0, "Tesla V100", 0, 30000, 32000, datetime.now()),
+            GpuSample("gpu-203", 1, "Tesla V100", 0, 0, 32000, datetime.now()),
+        ]
+        self.platform.get_instance_state.return_value = {
+            "status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True}
+        result = self._starter().attempt(self.alert)
+        self.assertEqual(result.status, "recheck_failed")
+        self.platform.post_api_json.assert_not_called()
+
+    def test_conversion_rechecks_indices_even_when_optional_recheck_is_disabled(self):
+        host = replace(self.before, free_count=1,
+                       source_slots=(("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
+        self.platform.collect.return_value = [host]
+        self.telemetry.collect.return_value = [
+            GpuSample("gpu-203", 0, "Tesla V100", 0, 30000, 32000, datetime.now()),
+            GpuSample("gpu-203", 1, "Tesla V100", 0, 0, 32000, datetime.now()),
+        ]
+        starter = AutoStartCoordinator(replace(self.config, verify_before_start=False), self.monitor,
+                                       self.thresholds, self.platform, self.telemetry, convert_no_gpu=True)
+        self.assertEqual(starter.attempt(self.alert).status, "recheck_failed")
+        self.platform.collect.assert_called_once()
+        self.platform.post_api_json.assert_not_called()
+
+    def test_occupancy_failure_blocks_shutdown(self):
+        self.platform.collect.return_value = [self.before]
+        self.platform.collect_occupancy.side_effect = RuntimeError("popup unavailable")
+        self.assertEqual(self._starter().attempt(self.alert).status, "recheck_failed")
+        self.platform.post_api_json.assert_not_called()
+
+    def test_free_entry_and_ready_memory_on_different_gpu_blocks_power_on(self):
+        after = replace(self.after, free_count=1,
+                        source_slots=(("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
+        self.platform.collect.side_effect = [[self.before], [after]]
+        self.telemetry.collect.side_effect = [
+            [GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())],
+            [GpuSample("gpu-203", 1, "Tesla V100", 0, 0, 32000, datetime.now())],
+        ]
+        self.platform.get_instance_state.side_effect = [
+            {"status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+        ]
+        self.platform.post_api_json.return_value = {"code": "Success"}
+        starter = self._starter()
+        self.assertEqual(starter.attempt(self.alert).status, "shutdown_requested")
+        self.assertEqual(starter.continue_switch().status, "recheck_failed")
+        self.assertEqual(self.platform.post_api_json.call_args_list, [
+            call("/api/v2/instance/power_off", {"instance_uuid": "instance-1", "release": "now"})])
 
     def test_shutdown_then_confirm_same_uuid_and_power_on_gpu(self):
         self.platform.collect.side_effect = [[self.before], [self.after]]
