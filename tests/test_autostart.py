@@ -197,6 +197,21 @@ class NoGpuConversionTest(unittest.TestCase):
         self.platform.collect.assert_called_once()
         self.platform.post_api_json.assert_not_called()
 
+    def test_instance_recheck_failure_is_retryable_before_shutdown(self):
+        self.platform.collect.return_value = [self.before]
+        self.platform.get_instance_state.side_effect = TimeoutError("instance list timeout")
+        starter = self._starter()
+        self.assertEqual(starter.attempt(self.alert).status, "recheck_failed")
+        self.assertIsNone(starter.pending_switch)
+        self.platform.post_api_json.assert_not_called()
+
+    def test_recheck_authentication_failure_still_requires_login(self):
+        from autodl_watcher.collectors import PlatformAuthenticationError
+        self.platform.collect.side_effect = PlatformAuthenticationError("session expired")
+        with self.assertRaises(PlatformAuthenticationError):
+            self._starter().attempt(self.alert)
+        self.platform.post_api_json.assert_not_called()
+
     def test_occupancy_failure_blocks_shutdown(self):
         self.platform.collect.return_value = [self.before]
         self.platform.collect_occupancy.side_effect = RuntimeError("popup unavailable")
@@ -348,6 +363,55 @@ class NoGpuConversionTest(unittest.TestCase):
         self.platform.post_api_json.assert_called_once_with(
             "/api/v2/instance/power_on", {"instance_uuid": "instance-1", "start_mode": "gpu"})
 
+    def test_quota_rejection_blocks_further_regular_gpu_requests_until_restart(self):
+        self.platform.collect.return_value = [self.before]
+        self.platform.get_instance_state.return_value = {
+            "status": "shutdown", "start_mode": "gpu", "host_account_gpu_clear": True}
+        self.platform.post_api_json.return_value = {
+            "code": "GpuStockReqNum", "msg": "tenant quota exceeded"}
+        starter = AutoStartCoordinator(self.config, self.monitor, self.thresholds,
+                                       self.platform, self.telemetry)
+        blocked = starter.attempt(self.alert)
+        self.assertEqual(blocked.status, "quota_blocked")
+        self.assertEqual(blocked.instance_uuid, self.first.instance_uuid)
+        self.assertEqual(blocked.api_code, "GpuStockReqNum")
+        self.assertEqual(blocked.api_msg, "tenant quota exceeded")
+        self.assertIn("额度不足", blocked.message)
+        for _ in range(3):
+            self.assertEqual(starter.attempt(self.alert, target_override=self.second), blocked)
+            self.assertEqual(starter.continue_switch(), blocked)
+        self.platform.post_api_json.assert_called_once_with(
+            "/api/v2/instance/power_on", {"instance_uuid": self.first.instance_uuid, "start_mode": "gpu"})
+        self.platform.post_api_json.reset_mock()
+        self.platform.post_api_json.return_value = {"code": "Success"}
+        restarted = AutoStartCoordinator(self.config, self.monitor, self.thresholds,
+                                         self.platform, self.telemetry)
+        self.assertEqual(restarted.attempt(self.alert).status, "request_accepted")  # 显式重启监控才建立新协调器。
+        self.platform.post_api_json.assert_called_once()
+
+    def test_quota_rejection_keeps_fixed_conversion_blocked_without_repeat_power_on(self):
+        self.platform.collect.return_value = [self.before]
+        self.platform.get_instance_state.side_effect = [
+            {"status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": True}]
+        self.platform.post_api_json.side_effect = [
+            {"code": "Success"}, {"code": "GpuStockReqNum", "msg": "tenant quota exceeded"}]
+        starter = self._starter()
+        self.assertEqual(starter.attempt(self.alert).status, "shutdown_requested")
+        blocked = starter.continue_switch()
+        self.assertEqual(blocked.status, "quota_blocked")
+        self.assertEqual(blocked.instance_uuid, self.first.instance_uuid)
+        self.assertEqual(blocked.api_code, "GpuStockReqNum")
+        self.assertEqual(blocked.api_msg, "tenant quota exceeded")
+        for _ in range(3):
+            self.assertEqual(starter.continue_switch(), blocked)
+            self.assertEqual(starter.attempt(self.alert), blocked)
+        self.assertEqual(starter.pending_switch, self.first)
+        self.assertEqual(self.platform.post_api_json.call_args_list, [
+            call("/api/v2/instance/power_off", {"instance_uuid": self.first.instance_uuid, "release": "now"}),
+            call("/api/v2/instance/power_on", {"instance_uuid": self.first.instance_uuid, "start_mode": "gpu"})])
+
     def test_other_account_gpu_appearing_after_shutdown_blocks_power_on(self):
         self.platform.collect.side_effect = [[self.before], [self.after]]
         self.platform.get_instance_state.side_effect = [
@@ -398,6 +462,49 @@ class NoGpuConversionTest(unittest.TestCase):
         self.platform.post_api_json.assert_called_once_with(
             "/api/v2/instance/power_on", {"instance_uuid": "instance-1", "start_mode": "gpu"})
 
+    def test_regular_start_rechecks_matching_gpu_indices(self):
+        host = replace(self.before, free_count=1,
+                       source_slots=(("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
+        self.platform.collect.return_value = [host]
+        self.telemetry.collect.return_value = [
+            GpuSample("gpu-203", 1, "Tesla V100", 0, 0, 32000, datetime.now())]
+        self.platform.get_instance_state.return_value = {
+            "status": "shutdown", "start_mode": "gpu", "host_account_gpu_clear": True}
+        starter = AutoStartCoordinator(self.config, self.monitor, self.thresholds,
+                                       self.platform, self.telemetry)
+        self.assertEqual(starter.attempt(self.alert).status, "recheck_failed")
+        self.platform.post_api_json.assert_not_called()
+
+    def test_a100_four_gpu_conversion_uses_same_target_and_capacity_ratio(self):
+        target = AutoStartTarget("gpu-201", "autodl-201-1", "a100-instance", "gpu", 10, True)
+        config = replace(self.config, default_host="gpu-201", targets=(target,))
+        host = PlatformHost("gpu-201", 2, 4, (target.machine_name,), ((target.machine_name, 2, 4),))
+        alert = AvailabilityAlert("gpu-201", 2, 4, 4, 1, (), (target.machine_name,), host.source_slots)
+        self.platform.collect.return_value = [host]
+        self.platform.collect_occupancy.side_effect = None
+        self.platform.collect_occupancy.return_value = [
+            OccupancyRecord(datetime.now(), "gpu-201", target.machine_name, index, f"a100-{index}",
+                            "NVIDIA A100-SXM4-40GB", index >= 2, "", "", "")
+            for index in range(4)]
+        self.telemetry.collect.return_value = [
+            GpuSample("gpu-201", 0, "NVIDIA A100-SXM4-40GB", 0, 32000, 40960, datetime.now())]
+        self.platform.get_instance_state.side_effect = [
+            {"status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": True},
+            {"status": "shutdown", "start_mode": "non_gpu", "host_account_gpu_clear": True}]
+        self.platform.post_api_json.return_value = {"code": "Success"}
+        starter = AutoStartCoordinator(config, self.monitor, self.thresholds,
+                                       self.platform, self.telemetry, convert_no_gpu=True)
+        self.assertEqual(starter.attempt(alert).status, "recheck_failed")  # 8960MB低于A100的25%门槛，不能关机。
+        self.platform.post_api_json.assert_not_called()
+        self.telemetry.collect.return_value = [
+            GpuSample("gpu-201", 0, "NVIDIA A100-SXM4-40GB", 0, 30000, 40960, datetime.now())]
+        self.assertEqual(starter.attempt(alert).status, "shutdown_requested")
+        self.assertEqual(starter.continue_switch().status, "request_accepted")
+        self.assertEqual(self.platform.post_api_json.call_args_list, [
+            call("/api/v2/instance/power_off", {"instance_uuid": target.instance_uuid, "release": "now"}),
+            call("/api/v2/instance/power_on", {"instance_uuid": target.instance_uuid, "start_mode": "gpu"})])
+
     def test_regular_start_blocks_running_or_other_account_gpu(self):
         self.platform.collect.return_value = [self.before]
         for status, proof in (("running", True), ("shutdown", False), ("shutdown", None)):
@@ -425,8 +532,9 @@ class NoGpuConversionTest(unittest.TestCase):
                 self.assertIn(reason, result.message)
                 self.platform.post_api_json.assert_not_called()
 
-    def test_regular_start_checks_instance_even_without_capacity_recheck(self):
+    def test_regular_gpu_start_requires_capacity_even_when_optional_recheck_disabled(self):
         config = replace(self.config, verify_before_start=False)
+        self.platform.collect.return_value = [self.before]
         self.platform.get_instance_state.return_value = {
             "status": "shutdown", "start_mode": "gpu", "host_account_gpu_clear": True,
         }
@@ -435,7 +543,8 @@ class NoGpuConversionTest(unittest.TestCase):
                                        self.platform, self.telemetry)
         self.assertEqual(starter.attempt(self.alert).status, "request_accepted")
         self.platform.get_instance_state.assert_called_once_with("instance-1", "autodl-203-1")
-        self.platform.collect.assert_not_called()
+        self.platform.collect.assert_called_once()
+        self.platform.collect_occupancy.assert_called_once()
 
 
 if __name__ == "__main__":

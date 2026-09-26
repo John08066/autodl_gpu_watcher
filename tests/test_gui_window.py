@@ -49,15 +49,15 @@ class GuiWindowTest(unittest.TestCase):
         self.assertEqual(settings["poll"], "0.5")
         self.assertFalse(self.window.live.get())
 
-    def test_auxiliary_tools_are_hidden_by_default_and_can_be_shown(self):
-        self.assertEqual(self.window.log.frame.winfo_manager(), "")
-        self.assertEqual(self.window.export_button.winfo_manager(), "")
-
-        self.window.auxiliary.set(True)
-        self.window._toggle_auxiliary()
-
+    def test_live_log_is_shown_by_default_and_can_be_hidden(self):
         self.assertEqual(self.window.log.frame.winfo_manager(), "pack")
         self.assertEqual(self.window.export_button.winfo_manager(), "pack")
+
+        self.window.auxiliary.set(False)
+        self.window._toggle_auxiliary()
+
+        self.assertEqual(self.window.log.frame.winfo_manager(), "")
+        self.assertEqual(self.window.export_button.winfo_manager(), "")
 
     def test_background_output_stop_and_restart(self):
         code = ("import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); "

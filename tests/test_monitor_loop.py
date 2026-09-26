@@ -83,6 +83,103 @@ class MonitorLoopTest(unittest.TestCase):
                             True, "aaaaaaaaaa-bbbbbbbb", "other_user", "2026-09-25 00:00:00"),
         ]
 
+    def test_conversion_retries_after_transient_capacity_recheck_failure(self):
+        config = self._conversion_config()
+        first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
+        host = PlatformHost("gpu-203", 1, 2, ("autodl-203-1", "autodl-203-2"),
+                            (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
+        for failing_collector in ("platform", "telemetry"):
+            with self.subTest(failing_collector=failing_collector):
+                phase = {"off": False}
+                counts = {"platform": 0, "telemetry": 0}
+
+                def collect_platform():
+                    counts["platform"] += 1
+                    if failing_collector == "platform" and counts["platform"] == 2:
+                        raise PlatformTransientError("recheck timeout")
+                    return [host]
+
+                def collect_telemetry():
+                    counts["telemetry"] += 1
+                    if failing_collector == "telemetry" and counts["telemetry"] == 2:
+                        raise TimeoutError("telemetry recheck timeout")
+                    return [GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+
+                def api_response(path, _payload):
+                    phase["off"] = True
+                    return {"code": "Success"}
+
+                with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
+                    with patch("autodl_watcher.main.load_config", return_value=config), \
+                         patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                         patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                        platform.return_value.collect.side_effect = collect_platform
+                        platform.return_value.collect_occupancy.side_effect = (
+                            lambda machine_name, **kwargs: self._one_free_gpu(machine_name))
+                        platform.return_value.get_instance_state.return_value = {
+                            "status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True}
+                        platform.return_value.get_account_instances.return_value = [{
+                            "instance_uuid": first.instance_uuid, "machine_name": first.machine_name,
+                            "status": "running", "start_mode": "non_gpu"}]
+                        platform.return_value.post_api_json.side_effect = api_response
+                        telemetry.return_value.collect.side_effect = collect_telemetry
+                        main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                              "--live", "--convert-no-gpu", "--max-cycles", "2",
+                              "--runtime-dir", directory, "--no-login"])
+                        self.assertEqual(platform.return_value.post_api_json.call_args_list, [
+                            call("/api/v2/instance/power_off", {
+                                "instance_uuid": first.instance_uuid, "release": "now"})])
+                        self.assertIn("二次确认未通过", output.getvalue())
+                        self.assertTrue(phase["off"])
+
+    def test_quota_blocked_status_keeps_read_only_monitoring_without_repeat_power_requests(self):
+        config = self._conversion_config()
+        first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
+        host = PlatformHost("gpu-203", 1, 2, ("autodl-203-1", "autodl-203-2"),
+                            (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
+        for conversion in (False, True):
+            with self.subTest(conversion=conversion):
+                phase = {"off": False}
+
+                def instance_state(*_args):
+                    return {"status": "running" if conversion and not phase["off"] else "shutdown",
+                            "start_mode": "non_gpu", "host_account_gpu_clear": True}
+
+                def api_response(path, _payload):
+                    if path.endswith("power_off"):
+                        phase["off"] = True
+                        return {"code": "Success"}
+                    return {"code": "GpuStockReqNum", "msg": "tenant quota exceeded"}
+
+                with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
+                    with patch("autodl_watcher.main.load_config", return_value=config), \
+                         patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                         patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                        platform.return_value.collect.return_value = [host]
+                        platform.return_value.collect_occupancy.side_effect = (
+                            lambda machine_name, **kwargs: self._one_free_gpu(machine_name))
+                        platform.return_value.get_instance_state.side_effect = instance_state
+                        platform.return_value.post_api_json.side_effect = api_response
+                        telemetry.return_value.collect.side_effect = lambda: [
+                            GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+                        args = ["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                                "--live", "--max-cycles", "4", "--runtime-dir", directory, "--no-login"]
+                        main(args + (["--convert-no-gpu"] if conversion else []))
+                        requests = [call("/api/v2/instance/power_on", {
+                            "instance_uuid": first.instance_uuid, "start_mode": "gpu"})]
+                        if conversion:
+                            requests.insert(0, call("/api/v2/instance/power_off", {
+                                "instance_uuid": first.instance_uuid, "release": "now"}))
+                        self.assertEqual(platform.return_value.post_api_json.call_args_list, requests)
+                        self.assertGreaterEqual(platform.return_value.collect.call_count, 4)
+                        self.assertGreaterEqual(telemetry.return_value.collect.call_count, 4)
+                        lines = output.getvalue().splitlines()
+                        heartbeat = [line for line in lines if line.startswith("WATCHER_STATUS ")][-1]
+                        status = [line for line in lines if " | 动作=" in line][-1]
+                        self.assertIn("额度不足", heartbeat)
+                        self.assertIn("暂停自动开机", status)
+                        self.assertNotIn("等待无卡关机", status)
+
     def test_no_gpu_instance_is_visible_when_occupancy_fails_but_no_slot_exists(self):
         config = self._conversion_config()
         host = PlatformHost("gpu-203", 0, 2, ("autodl-203-1", "autodl-203-2"),
@@ -317,7 +414,9 @@ class MonitorLoopTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
             with patch("autodl_watcher.main.load_config", return_value=config), \
                  patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
-                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry, \
+                 patch("autodl_watcher.main.time.monotonic",
+                       side_effect=(step / 10 for step in range(1000))):  # 固定推进各轮采样，避免依赖真实微秒计时。
                 platform.return_value.collect.return_value = [host]
                 platform.return_value.collect_occupancy.side_effect = collect_occupancy
                 platform.return_value.get_instance_state.side_effect = instance_state

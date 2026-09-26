@@ -113,9 +113,16 @@ class AutoStartCoordinator:  # 自动开机协调器。
         self.pending_switch: AutoStartTarget | None = None  # 关机受理后锁定原实例 UUID。
         self._pending_alert: AvailabilityAlert | None = None
         self._switch_power_on_sent = False  # 响应丢失时不重复发送有卡开机。
+        self._quota_blocked: StartAttemptResult | None = None  # 明确租户额度拒绝后保持暂停，用户重启监控才解除。
+
+    @property
+    def quota_blocked(self) -> StartAttemptResult | None:  # 只读公开额度拒绝，主循环据此显示暂停状态。
+        return self._quota_blocked
 
     def attempt(self, alert: AvailabilityAlert, stop_requested: Callable[[], bool] = lambda: False,
                 target_override: AutoStartTarget | None = None) -> StartAttemptResult:  # 执行一次自动开机尝试。
+        if self._quota_blocked is not None:
+            return self._quota_blocked  # 保留原实例和拒绝证据，不能换目标绕过租户额度。
         target = target_override or select_target( self.config, alert.host, platform_slots=alert.platform_slots, )
         if target is None:
             return StartAttemptResult(
@@ -139,11 +146,17 @@ class AutoStartCoordinator:  # 自动开机协调器。
 
         platform_free_before = alert.platform_free_count  # 先使用事件内快照；开启二次确认时会被更近的读数替换。
         platform_total_before = alert.platform_total_count
-        if self.config.verify_before_start or self.convert_no_gpu:  # 无卡切换始终复核容量，不能让可选配置跳过关机前检查。
+        if self.config.verify_before_start or self.convert_no_gpu or target.start_mode == "gpu":  # 真实有卡开机始终复核容量，不能绕过安全检查。
             if self.config.recheck_delay_seconds > 0:
                 time.sleep(self.config.recheck_delay_seconds)
 
-            platform_hosts = self.platform.collect()  # 重新采集平台数据
+            try:
+                platform_hosts = self.platform.collect()  # 重新采集平台数据；此阶段还未发出电源请求。
+            except PlatformAuthenticationError:
+                raise
+            except Exception as exc:
+                return StartAttemptResult("recheck_failed", alert.host, target.instance_uuid,
+                                          target.machine_name, f"二次确认失败：平台采集暂时不可用：{exc}")
             host_state = _host_lookup(platform_hosts, alert.host)
             if host_state is None:
                 return StartAttemptResult(  # 账号可能已登出或主机被移除
@@ -184,7 +197,11 @@ class AutoStartCoordinator:  # 自动开机协调器。
                     platform_total_before=host_state.total_count,
                 )
 
-            all_samples = self.telemetry.collect()  # 重新采集物理显存数据，检查是否仍有 GPU 满足条件
+            try:
+                all_samples = self.telemetry.collect()  # 请求前采集失败返回可重试结果，避免已触发事件永久失效。
+            except Exception as exc:
+                return StartAttemptResult("recheck_failed", alert.host, target.instance_uuid,
+                                          target.machine_name, f"二次确认失败：显存采集暂时不可用：{exc}")
             candidate_samples, _, _ = filter_samples_to_platform_candidates( all_samples, platform_hosts, )  # 二次确认仍使用平台可见性和空位过滤，不能仅凭显存余量。
             now = datetime.now()
             still_ready = [
@@ -204,7 +221,7 @@ class AutoStartCoordinator:  # 自动开机协调器。
                     platform_total_before=host_state.total_count,
                 )
 
-            if self.convert_no_gpu:  # 入口空位与达标显存必须属于同一 GPU INDEX。
+            if self.convert_no_gpu or target.start_mode == "gpu":  # 普通有卡开机与无卡切换均要求空位和显存属于同一 INDEX。
                 target_slot = _slot_map(host_state.source_slots).get(target.machine_name)
                 if target_slot is None or not 0 < target_slot[0] <= target_slot[1]:
                     return StartAttemptResult("recheck_failed", alert.host, target.instance_uuid,
@@ -231,7 +248,13 @@ class AutoStartCoordinator:  # 自动开机协调器。
             return StartAttemptResult("cancelled", alert.host, target.instance_uuid, target.machine_name, "监控已请求停止。")
 
         if self.convert_no_gpu:
-            state = self.platform.get_instance_state(target.instance_uuid, target.machine_name)  # UUID、入口和同主机账号实例均由完整列表核对。
+            try:
+                state = self.platform.get_instance_state(target.instance_uuid, target.machine_name)  # UUID、入口及同主机账号实例均由完整列表核对。
+            except PlatformAuthenticationError:
+                raise
+            except Exception as exc:
+                return StartAttemptResult("recheck_failed", alert.host, target.instance_uuid,
+                                          target.machine_name, f"二次确认失败：实例状态暂时无法核对：{exc}")
             status, mode = state["status"], state["start_mode"]
             if state.get("host_account_gpu_clear") is not True:  # 同账号其他入口仍有卡或列表不完整时禁止关机、开机。
                 return StartAttemptResult("instance_state_blocked", alert.host, target.instance_uuid,
@@ -292,6 +315,13 @@ class AutoStartCoordinator:  # 自动开机协调器。
             raise
         code = str(response.get("code", ""))  # HTTP 成功不等于业务成功，还要检查 AutoDL 的业务 code。
         msg = str(response.get("msg", ""))
+        if code == "GpuStockReqNum":  # 此业务码已由真实接口确认，不能像瞬时故障一样持续重试。
+            self._switch_power_on_sent = False
+            self._quota_blocked = StartAttemptResult(
+                "quota_blocked", alert.host, target.instance_uuid, target.machine_name,
+                "额度不足：租户GPU开机请求被拒绝，已暂停自动开机；处理额度后请手动重新开始监控。",
+                code, msg or None, platform_free_before, platform_total_before)
+            return self._quota_blocked
         if code != "Success":
             self._switch_power_on_sent = False  # 明确业务拒绝后允许下轮重新检查。
             return StartAttemptResult(  # AutoDL 拒绝了请求（可能是并发冲突或权限不足）
@@ -336,6 +366,8 @@ class AutoStartCoordinator:  # 自动开机协调器。
         )
 
     def continue_switch(self, stop_requested: Callable[[], bool] = lambda: False) -> StartAttemptResult | None:  # 后续轮次推进已受理的关机。
+        if self._quota_blocked is not None:
+            return None if stop_requested() else self._quota_blocked  # 继续显示额度阻断，绝不重复电源请求。
         target, alert = self.pending_switch, self._pending_alert
         if target is None or alert is None or stop_requested():
             return None
@@ -377,6 +409,7 @@ def format_start_result(result: StartAttemptResult) -> str:  # 将开机尝试�
         "dry_run": "DRY-RUN，未开机",
         "request_accepted": "开机请求成功受理",
         "request_failed": "开机请求失败",
+        "quota_blocked": "GPU额度不足，暂停自动开机",
         "shutdown_requested": "无卡关机请求成功受理",
         "shutdown_uncertain": "关机请求结果待确认",
         "shutdown_pending": "等待无卡实例关机",

@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .venv/
 .ui/
+
+# 本地构建工具与生成的EXE发行包。
+.tools/
+dist/

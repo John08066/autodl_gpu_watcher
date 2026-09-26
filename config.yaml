@@ -90,7 +90,7 @@ auto_start:
       enabled: true
     - host: "gpu-201"
       machine_name: "autodl-201-1"
-      instance_uuid: "455740ad7e-6e39976d"
+      instance_uuid: "455740ad7e-d0238011"
       start_mode: "gpu"
       priority: 10
       enabled: true

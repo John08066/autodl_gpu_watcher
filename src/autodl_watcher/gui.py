@@ -16,13 +16,32 @@ from . import __version__
 from .config import load_config
 from .main import positive_seconds
 
-ROOT = Path(__file__).resolve().parents[2]  # 从 src/autodl_watcher 回到仓库根目录，避免启动位置改变配置路径。
+ROOT = (Path(os.environ.get("AUTODL_APP_ROOT", Path(sys.executable).parent)).resolve()
+        if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[2])  # 配置和运行数据归属于源码根目录或公开 EXE 所在目录。
 DATA_PREFIX = "WATCHER_HOSTS "  # 约定的结构化输出前缀；主机列表与普通日志共用 stdout 管道。
 
 
 def worker_python():  # GUI 用 pythonw，后台任务用带管道且无窗口的 python，保证日志和登录输入可用。
     executable = Path(sys.executable)  # 获取当前 GUI 所属环境，后台任务必须使用同一环境的依赖。
     return str(executable.with_name("python.exe")) if executable.name.lower() == "pythonw.exe" else sys.executable
+
+
+def worker_command(task, *args):  # 源码使用当前 Python；发布版使用共享依赖目录中的无窗口后台程序。
+    modules = {"monitor": "autodl_watcher.main", "discover": "autodl_watcher.gui",
+               "login": "autodl_watcher.login", "export": "autodl_watcher.usage_report"}
+    module = modules[task]  # 仅允许这四个应用任务，不执行任意模块。
+    if getattr(sys, "frozen", False):
+        return [str(ROOT / "_internal" / "AutoDLWorker.exe"), task, *args]
+    return [worker_python(), "-u", "-m", module, *(["--discover"] if task == "discover" else []), *args]
+
+
+def log_tag(line):  # 失败优先识别，避免“开机成功验证失败”被误标为成功。
+    lowered = line.lower()
+    if any(word in lowered for word in ("失败", "断连", "断开", "异常", "错误", "error", "traceback", "timeout", "失效", "额度不足", "拒绝")):
+        return "error"
+    if any(word in lowered for word in ("成功", "已开机", "已连接", "连接正常", "会话有效", "采集恢复", "已同步")):
+        return "success"
+    return "normal"
 
 
 def monitor_command(config, entry, user, poll, usage, live, stop_file, convert_no_gpu=False):  # 构造与 CLI 相同的监控命令。
@@ -38,10 +57,10 @@ def monitor_command(config, entry, user, poll, usage, live, stop_file, convert_n
         raise ValueError("此入口尚未配置启用的开机实例，请先只读监控或在 config.yaml 配置 targets")
     if convert_no_gpu and not live:
         raise ValueError("无卡转有卡须同时启用真实自动开机")
-    command = [worker_python(), "-u", "-m", "autodl_watcher.main", "--config", str(ROOT / "config.yaml"),
+    command = worker_command("monitor", "--config", str(ROOT / "config.yaml"),
             "--host", normalize_host(entry), "--entry", entry, "--user", user.strip(),
             "--poll-seconds", str(poll), "--usage-seconds", str(usage),
-            "--live" if live else "--dry-run", "--no-login", "--stop-file", str(stop_file)]  # 参数列表直接传给进程，不经 shell 拼接。
+            "--live" if live else "--dry-run", "--no-login", "--stop-file", str(stop_file))  # 参数列表直接传给进程，不经 shell 拼接。
     return command + (["--convert-no-gpu"] if convert_no_gpu else [])
 
 
@@ -61,7 +80,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         self.usage = tk.StringVar(value=str(self.config.usage_tracking.interval_seconds))
         self.live = tk.BooleanVar(value=False)  # 每次开窗都默认只读，不从历史偏好恢复付费开机开关。
         self.convert_no_gpu = tk.BooleanVar(value=False)  # 关机切换每次也需显式选择，不保存为偏好。
-        self.auxiliary = tk.BooleanVar(value=False)  # 日志面板与报表默认隐藏，需要时由用户显式展开。
+        self.auxiliary = tk.BooleanVar(value=True)  # 默认显示实时日志，让用户直接确认后台是否仍在监控。
         self.status = tk.StringVar(value="未运行 · 选择入口后开始监控")
         self.saved_entry = ""
         preferences = self.local / "preferences.json"
@@ -139,9 +158,11 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         ttk.Label(frame, textvariable=self.status, foreground="#245cc4").pack(anchor="w", pady=6)
         self.log = ScrolledText(frame, height=12, wrap="word", state="disabled", font=("Microsoft YaHei UI", 10),
                                 background="#17202e", foreground="#e2e8f0", padx=10, pady=10)
+        self.log.tag_configure("success", foreground="#79e69d")
+        self.log.tag_configure("error", foreground="#ff8181")
         self._toggle_auxiliary()
 
-    def _toggle_auxiliary(self):  # 辅助入口默认不占界面；核心文件日志不受此开关影响。
+    def _toggle_auxiliary(self):  # 用户可收起日志与报表，核心文件日志不受此开关影响。
         if self.auxiliary.get():
             self.export_button.pack(side="right")
             self.log.pack(fill="both", expand=True)
@@ -191,7 +212,9 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         if self.process is not None:  # 禁止同一窗口重复启动任务，避免同时占用浏览器资料。
             return
         env = os.environ.copy()
-        env["PYTHONPATH"] = str(ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
+        if not getattr(sys, "frozen", False):
+            env["PYTHONPATH"] = str(ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
+        env["AUTODL_APP_ROOT"] = str(ROOT)  # 后台 EXE 位于依赖目录，配置与运行数据仍归属于应用根目录。
         env["PYTHONUTF8"] = "1"  # 子进程日志使用 UTF-8，与读取管道时的解码一致。
         try:
             self.process = subprocess.Popen(command, cwd=ROOT, env=env, stdin=subprocess.PIPE,
@@ -236,7 +259,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
                     self.status.set(value.strip())  # 状态摘要始终可见，不依赖辅助日志面板。
                 if self.auxiliary.get():
                     self.log.configure(state="normal")
-                    self.log.insert("end", value)
+                    self.log.insert("end", value, log_tag(value))
                     if int(self.log.index("end-1c").split(".")[0]) > 2000:
                         self.log.delete("1.0", "201.0")  # 仅裁剪控件中的早期文本；监控文件日志仍由核心独立写入。
                     self.log.see("end")
@@ -256,10 +279,10 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
             self.status.set("正在安全停止 · 等待当前网络请求完成并保存状态")
 
     def refresh(self):  # 独立任务读取当前账号的主机列表；不会发起实例开机。
-        self._launch([worker_python(), "-u", "-m", "autodl_watcher.gui", "--discover"], "discover")
+        self._launch(worker_command("discover"), "discover")
 
     def login(self):  # 浏览器由登录模块打开，验证码仍由用户手动完成。
-        self._launch([worker_python(), "-u", "-m", "autodl_watcher.login"], "login")
+        self._launch(worker_command("login"), "login")
 
     def finish_login(self):  # 按钮代替控制台 Enter，让登录模块继续同步浏览器资料。
         if self.process is not None and self.job == "login" and self.process.poll() is None:
@@ -272,7 +295,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
                 self.status.set(f"登录同步失败：{exc}")
 
     def export(self):  # 从已有 SQLite 数据生成报表，不重新采集平台数据。
-        self._launch([worker_python(), "-u", "-m", "autodl_watcher.usage_report"], "export")
+        self._launch(worker_command("export"), "export")
 
     def close(self):  # 空闲时立即关闭；任务运行中等待资源释放；登录中提示先完成同步。
         if self.process is None:

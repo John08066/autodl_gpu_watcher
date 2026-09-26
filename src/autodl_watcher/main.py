@@ -582,7 +582,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     pending_start_until = 0.0
                     pending_start_machine = ""
 
-                if self_active or occupancy_blocked or pending_start or starter.pending_switch:  # 有卡占用、证据不足或切换中均阻止重复开机。
+                if self_active or occupancy_blocked or pending_start or starter.pending_switch or starter.quota_blocked:  # 有卡占用、证据不足或切换中均阻止重复开机。
                     trigger_events = []
 
                 planned_target = None  # 根据实时空位预判入口。UNKNOWN 时仍显示预选入口，但不会真正开机。
@@ -604,7 +604,11 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     evaluator.rearm_host(selected_host)
                     trigger_events = []
 
-                if self_active:
+                if starter.quota_blocked is not None:
+                    planned_text = (starter.quota_blocked.machine_name or "未知入口").removeprefix("autodl-")
+                    start_ready_text = "额度不足"
+                    action_text = "暂停自动开机，请处理租户额度后重新开始监控"
+                elif self_active:
                     ready_indices = _format_owned_indices(  # 绿色“已开机”只来自本进程实时占用快照的正向证据。
                         owned_instances,
                         selected_gpu_samples,
@@ -678,7 +682,9 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                 )
                 if args.convert_no_gpu:
                     status_line += f" | 所选实例={selected_instance_text}"
-                if self_active:
+                if starter.quota_blocked is not None:
+                    status_line = _red_terminal_text(status_line)
+                elif self_active:
                     status_line = _green_terminal_text(status_line)
                 elif (
                     trigger_events and selected_auto_start.enabled and not selected_auto_start.dry_run
@@ -927,6 +933,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     or (self_occupancy_known and owned_instances and not selected_account_clear)
                     or pending_start
                     or starter.pending_switch
+                    or starter.quota_blocked
                 ):
                     trigger_events = []
 
@@ -994,6 +1001,8 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                                  else '无（实例列表）' if selected_account_clear
                                  else '有' if owned_instances else '无' if self_occupancy_known else '待确认')
                 detail = (f" · 所选实例 {selected_instance_text}" if args.convert_no_gpu else "")
+                if starter.quota_blocked is not None:
+                    detail += " · 额度不足，暂停自动开机"  # 保留实时监控心跳，同时明确电源操作已被阻断。
                 if last_occupancy_failed:
                     detail += " · GPU 占用弹窗采集失败"
                 print(f"WATCHER_STATUS {now:%H:%M:%S} · {selected_host} · 平台 {entry_slots} · "

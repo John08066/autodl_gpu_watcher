@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from autodl_watcher.config import load_config
-from autodl_watcher.gui import ROOT, monitor_command, worker_python
+from autodl_watcher.gui import ROOT, log_tag, monitor_command, worker_command, worker_python
 from autodl_watcher.main import _build_parser, apply_monitor_options, main, positive_seconds
 
 
@@ -15,6 +15,26 @@ class GuiOptionsTest(unittest.TestCase):
         executable = str(Path("runtime") / "pythonw.exe")
         with patch("sys.executable", executable):
             self.assertEqual(worker_python(), str(Path("runtime") / "python.exe"))
+
+    def test_source_and_frozen_worker_commands(self):
+        import sys
+        with patch.object(sys, "frozen", False, create=True):
+            command = worker_command("discover")
+            self.assertEqual(command[1:], ["-u", "-m", "autodl_watcher.gui", "--discover"])
+        with patch.object(sys, "frozen", True, create=True):
+            command = worker_command("monitor", "--dry-run")
+            self.assertEqual(command, [str(ROOT / "_internal/AutoDLWorker.exe"), "monitor", "--dry-run"])
+            self.assertNotIn("-m", command)
+        with self.assertRaises(KeyError):
+            worker_command("arbitrary-module")
+
+    def test_log_colors_prioritize_failures(self):
+        self.assertEqual(log_tag("开机成功，但验证失败"), "error")
+        self.assertEqual(log_tag("连接断开，正在重连"), "error")
+        self.assertEqual(log_tag("GPU额度不足，暂停自动开机"), "error")
+        self.assertEqual(log_tag("已开机，继续监控"), "success")
+        self.assertEqual(log_tag("开机成功 · connected"), "success")
+        self.assertEqual(log_tag("本人占用待确认"), "normal")
 
     def setUp(self):
         self.config = load_config(ROOT / "config.yaml")
