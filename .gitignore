@@ -8,3 +8,5 @@ __pycache__/
 # 本地构建工具与生成的EXE发行包。
 .tools/
 dist/
+/AutoDLWatcher.exe
+/_internal/

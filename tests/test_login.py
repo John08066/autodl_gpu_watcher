@@ -136,3 +136,63 @@ class LoginWorkflowV051Test(unittest.TestCase):
 
             self.assertEqual((browser_profile / "Cookies").read_text(encoding="utf-8"), "fresh")
             self.assertFalse((browser_profile / "SingletonLock").exists())
+
+
+class LoginSessionVerificationTest(unittest.TestCase):
+    def verify_login(self, error=None, exit_code=None):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        from types import SimpleNamespace
+        from autodl_watcher.login import main
+        from autodl_watcher.session import SESSION_PREFIX
+
+        config = SimpleNamespace(platform=SimpleNamespace())
+        with redirect_stdout(io.StringIO()) as output, \
+             patch("autodl_watcher.login.load_config", return_value=config), \
+             patch("autodl_watcher.login.interactive_login") as login, \
+             patch("autodl_watcher.collectors.PlatformBrowserCollector") as collector:
+            collector.return_value.collect.side_effect = error
+            if exit_code is None:
+                main()
+            else:
+                with self.assertRaises(SystemExit) as stopped:
+                    main()
+                self.assertEqual(stopped.exception.code, exit_code)
+            collector.return_value.collect.assert_called_once()
+            login.assert_called_once_with(config, reason="manual")
+            collector.return_value.close.assert_called_once()
+        return [json.loads(line[len(SESSION_PREFIX):]) for line in output.getvalue().splitlines()
+                if line.startswith(SESSION_PREFIX)]
+
+    def test_copied_profile_requires_successful_api_verification(self):
+        statuses = self.verify_login()
+        self.assertEqual([item["status"] for item in statuses], ["checking", "valid"])
+        self.assertTrue(statuses[-1]["checked_at"])
+
+    def test_expired_profile_reports_invalid_without_claiming_success(self):
+        from autodl_watcher.collectors import PlatformAuthenticationError
+        statuses = self.verify_login(PlatformAuthenticationError("HTTP 401"), 3)
+        self.assertEqual([item["status"] for item in statuses], ["checking", "invalid"])
+
+    def test_network_failure_cannot_be_classified_as_expired_login(self):
+        from autodl_watcher.collectors import PlatformTransientError
+        statuses = self.verify_login(PlatformTransientError("response body unavailable"), 4)
+        self.assertEqual([item["status"] for item in statuses], ["checking", "unknown"])
+
+
+    def test_profile_sync_failure_reports_unknown_without_unhandled_worker_error(self):
+        import io
+        from contextlib import redirect_stdout
+        from types import SimpleNamespace
+        from autodl_watcher.login import main
+        with redirect_stdout(io.StringIO()) as output, \
+             patch("autodl_watcher.login.load_config", return_value=SimpleNamespace(platform=SimpleNamespace())), \
+             patch("autodl_watcher.login.interactive_login", side_effect=EOFError("login confirmation closed")), \
+             patch("autodl_watcher.collectors.PlatformBrowserCollector") as collector:
+            with self.assertRaises(SystemExit) as stopped:
+                main()
+            self.assertEqual(stopped.exception.code, 1)
+            self.assertIn('"status": "unknown"', output.getvalue())
+            self.assertNotIn('"status": "valid"', output.getvalue())
+            collector.assert_not_called()

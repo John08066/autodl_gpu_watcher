@@ -29,6 +29,7 @@ from .evaluator import AvailabilityEvaluator, sample_meets_capacity
 from .login import interactive_login
 from .notifiers import EmailNotifier
 from .state_store import JsonStateStore
+from .session import emit_session
 from .usage import UsageSqliteLogger, aggregate_gpu_occupants, merge_duplicate_instances
 
 
@@ -483,10 +484,13 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
         while not stop_requested():
             cycle_start = time.monotonic()  # 本轮开始时间（用于控制循环间隔）
 
+            platform_session_verified = False
             try:
                 all_platform_hosts = platform_collector.collect()  # 1a. 从 AutoDL 控制台采集平台级 GPU ID 空位（Playwright 控制浏览器）
                 if stop_requested():
                     break
+                platform_session_verified = True
+                emit_session("valid", "登录会话有效，平台主机接口已核验")
                 if login_validation_pending:
                     print( f"[{datetime.now():%H:%M:%S}] 登录验证成功，平台主机接口已恢复，继续监控。", flush=True, )
                     logger.info("platform login recovery verified by machine/list success")
@@ -1008,8 +1012,10 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                 print(f"WATCHER_STATUS {now:%H:%M:%S} · {selected_host} · 平台 {entry_slots} · "
                       f"物理 GPU {len(selected_gpu_samples)} 张 · 本人 GPU 占用 {self_gpu_text}{detail}", flush=True)
             except PlatformAuthenticationError as exc:
+                emit_session("invalid", f"登录会话失效，请重新登录：{exc}")
                 if args.no_login:
-                    raise
+                    print("WATCHER_STATUS 登录会话失效 · 监控已停止，请在主界面重新登录", flush=True)
+                    raise SystemExit(3) from None  # GUI收到明确状态，避免预期认证失败变成PyInstaller堆栈。
                 now = datetime.now()  # v0.5.2：只有明确 /login 或 HTTP 401/403 才进入人工登录恢复。
                 print(f"[{now:%H:%M:%S}] 登录会话确认失效：{exc}", flush=True)
                 logger.warning("platform authentication expired: %s", exc)
@@ -1029,11 +1035,15 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     print( f"[{datetime.now():%H:%M:%S}] 登录恢复失败：{login_exc}", flush=True, )
                     logger.exception("interactive login recovery failed")
             except PlatformTransientError as exc:
+                if not platform_session_verified:  # 后续入口或数据故障不否定本轮已成功的会话核验。
+                    emit_session("unknown", f"平台请求异常，无法确认会话：{exc}")
                 print(f"WATCHER_STATUS 平台采集暂时失败 · 等待重试：{exc}", flush=True)
                 now = datetime.now()  # 页面/API 慢、超时、429、5xx 都属于数据采集瞬时故障。 不弹登录窗口，不修改本人占用状态，也绝不发送开机请求。
                 print( f"[{now:%H:%M:%S}] AutoDL 主机接口暂时不可用：{exc} | " "本轮跳过开机，保持登录状态并自动重试。", flush=True, )
                 logger.warning("platform transient failure: %s", exc)
             except Exception as exc:
+                if not platform_session_verified:
+                    emit_session("unknown", f"主机接口核验失败，无法确认会话：{exc}")
                 print(f"WATCHER_STATUS 本轮采集失败 · 等待重试：{exc}", flush=True)
                 now = datetime.now()  # 本轮任意环节抛异常 → 打日志，不中断循环
                 print(f"[{now:%H:%M:%S}] 本轮失败：{exc}", flush=True)

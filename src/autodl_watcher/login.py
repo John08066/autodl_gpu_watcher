@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from .config import AppConfig, load_config
+from .session import emit_session
 
 
 _AUTOMATION_FLAGS = ("--no-sandbox", "--remote-debugging-pipe", "--headless")
@@ -259,11 +260,33 @@ def interactive_login(config: AppConfig | None = None, *, reason: str = "manual"
     input("\n登录完成并关闭 Edge 后按 Enter：")
     prepare_profile_for_exclusive_use(clean_profile)
     sync_login_profile_to_browser(clean_profile, browser_profile)
-    print("登录会话已同步到 runtime/browser_profile，监控可继续使用。")
+    print("登录资料已同步，实际会话状态仍待接口核验。")
+    emit_session("checking", "登录资料已同步，等待实际接口核验")
 
 
 def main() -> None:
-    interactive_login(reason="manual")
+    from .collectors import PlatformAuthenticationError, PlatformBrowserCollector, PlatformTransientError
+
+    collector = None
+    try:
+        config = load_config()
+        interactive_login(config, reason="manual")
+        emit_session("checking", "正在核验同步后的登录会话")
+        collector = PlatformBrowserCollector(config.platform)
+        collector.collect()  # 复制Cookie不是登录成功，必须由真实主机接口确认。
+        emit_session("valid", "登录会话有效，已通过实际接口核验")
+    except PlatformAuthenticationError as exc:
+        emit_session("invalid", f"登录会话失效，请重新登录：{exc}")
+        raise SystemExit(3) from None
+    except PlatformTransientError as exc:
+        emit_session("unknown", f"网络或响应异常，无法确认会话：{exc}")
+        raise SystemExit(4) from None
+    except Exception as exc:
+        emit_session("unknown", f"登录核验失败，无法确认会话：{exc}")
+        raise SystemExit(1) from None
+    finally:
+        if collector is not None:
+            collector.close()
 
 
 if __name__ == "__main__":

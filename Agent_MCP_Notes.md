@@ -44,11 +44,22 @@
 
 ## Windows EXE、路径与后台日志
 
-- 适用版本v0.6.8；核验日期2026-09-26；实际只读运行与本地打包验证，201完整有卡转换已实际通过；其他机型验证范围见电源与占用条目。
+- 适用版本v0.6.8～v0.6.9；核验日期2026-09-26；实际只读运行与本地打包验证，201完整有卡转换已实际通过；其他机型验证范围见电源与占用条目。
 
-- v0.6.8公开入口为 `dist/AutoDLWatcher/AutoDLWatcher.exe`（windowed PE）；内部 `_internal/AutoDLWorker.exe`（console PE）用CREATE_NO_WINDOW和stdin/stdout管道启动。windowed bootloader的标准流为None，不能直接当原Python `-m`入口使用。
+- v0.6.9公开入口改为项目根目录 `AutoDLWatcher.exe`（v0.6.8在 `dist/AutoDLWatcher/AutoDLWatcher.exe`）（windowed PE）；内部 `_internal/AutoDLWorker.exe`（console PE）用CREATE_NO_WINDOW和stdin/stdout管道启动。windowed bootloader的标准流为None，不能直接当原Python `-m`入口使用。
 - GUI按frozen状态选后台命令；外部配置/runtime根目录由公开EXE目录决定，内部worker通过 `AUTODL_APP_ROOT` 使用同一目录，不能写到打包内部目录。
 - 打包解释器为 `D:/Dev/Anaconda/envs/autodl-watcher/python.exe`。该Conda环境未激活时，PyInstaller曾选到不匹配OpenSSL DLL导致 `_ssl.pyd` 失败；构建显式收集 `sys.prefix/Library/bin` 的libssl/libcrypto并设置构建PATH。
 - EXE包含Python、Tk和Playwright driver，使用系统Edge，不打包浏览器会话或Chromium。无需外部Python PATH，但Windows PowerShell路径仍须可用（登录模块会检查专用Edge进程）。
 - 构建先写 `.tools/build/release` 再合并生成文件，避免PyInstaller清理用户已登录的发行目录。已有外部config/runtime/.ui要保留；干净分发另打包白名单文件。
-- 实际验证：无Python PATH三轮真实只读监控成功；148项模拟/本地测试通过，覆盖无控制台PE、空格路径、后台管道与重建保留配置；最终两个EXE内18个项目模块递归字节码与源码一致，未启动的构建目录无个人运行数据。证据：`tools/build_exe.py`、`tools/worker_entry.py`、`tests/test_package_layout.py`、`tests/test_gui_window.py`；最终实测 `runtime/validation/exe-final-readonly-output.txt`，完整测试 `runtime/validation/full-tests.txt`。干净包为 `dist/AutoDLWatcher-v0.6.8.zip`，不复制运行后的dist。
+- v0.6.8历史验证：无Python PATH三轮真实只读监控成功；148项模拟/本地测试通过，覆盖无控制台PE、空格路径、后台管道与重建保留配置；最终两个EXE内18个项目模块递归字节码与源码一致，未启动的构建目录无个人运行数据。证据：`tools/build_exe.py`、`tools/worker_entry.py`、`tests/test_package_layout.py`、`tests/test_gui_window.py`；最终实测 `runtime/validation/exe-final-readonly-output.txt`，完整测试 `runtime/validation/full-tests.txt`。干净包为 `dist/AutoDLWatcher-v0.6.8.zip`，不复制运行后的dist。
+
+- v0.6.9实际验证：174项测试全部通过，最终两个EXE内19个项目模块与当前源码递归字节码一致；无外部Python PATH两次刷新各5台服务器、三轮201只读监控通过。干净包`dist/AutoDLWatcher-v0.6.9.zip`仅含未启动构建文件、config与说明；证据`runtime/validation/v0.6.9/`下的`full-tests.txt`、`discover-1.txt`、`discover-2.txt`、`monitor.txt`和`build-final.txt`。
+
+## 网页响应体丢失与登录核验
+
+- 适用v0.6.9；核验日期2026-09-26；模拟测试复现原CDP故障并验证恢复，实际EXE两次刷新与三轮201只读采集通过；没有电源操作。
+- 浏览器 `Response.json()` 可抛 `Network.getResponseBody: No resource with given identifier found`；原v0.6.8只捕获超时，错误绕过恢复。这是响应读取故障，不是认证失效证据；有已捕获Authorization/请求体时改用新context.request响应，只重试machine/list只读请求，不重发电源POST。
+- 登录资料同步不代表会话有效。`WATCHER_SESSION`仅输出checking/valid/invalid/unknown、消息和核验时间；成功主机接口才标valid，登录页/401/403证据才标invalid。未知或网络失败不能猜测为过期。
+- GUI管道/消息错误必须仍处理任务结束并继续事件调度；真实后台未结束前不允许另一个任务并发使用同一profile。证据：`collectors/platform.py`、`gui.py`、`login.py`、`main.py`及对应故障回归测试。
+- 实际验证：仅复制config到临时目录，以隔离空profile运行最终worker discover；真实跳转/login后输出invalid并退出1，无Traceback/PyInstaller异常，原会话不变。证据`runtime/validation/v0.6.9/no-session.txt`。正常会话核验成功只证明检查时刻有效，不能保证后续持续有效。
+- 集成验证：运行源码collector，注入一次与用户堆栈相同的响应体读取错误；真实只读machine/list新响应一次恢复，读取3个物理主机/5入口，电源操作0次。这是模拟故障＋真实只读恢复，不是自然复现；证据`runtime/validation/v0.6.9/response-recovery.json`。

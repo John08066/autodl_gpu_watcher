@@ -1,4 +1,4 @@
-from __future__ import annotations  # v0.5.1 发布目录与一键脚本回归测试。
+from __future__ import annotations  # 源码入口、根目录 EXE 与发布数据隔离回归测试。
 
 import unittest
 import os
@@ -73,14 +73,19 @@ class PackageLayoutTest(unittest.TestCase):
 
     def test_rebuild_preserves_user_configuration_and_login_data(self):
         build = runpy.run_path(str(self.root / "tools/build_exe.py"))["main"]
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(prefix="autodl root package ") as directory:
             root = Path(directory)
-            (root / "config.yaml").write_text("new defaults", encoding="utf-8")
-            release = root / "dist/AutoDLWatcher"
+            release = root
             (release / "runtime/browser_profile").mkdir(parents=True)
             profile = release / "runtime/browser_profile/preserved.txt"
             profile.write_text("user data", encoding="utf-8")
             (release / "config.yaml").write_text("user settings", encoding="utf-8")
+            preserved = {".ui/preferences.json": "user preferences", ".env": "user environment",
+                         "dist/AutoDLWatcher/runtime/old-profile.txt": "old release data"}
+            for name, content in preserved.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
             def fake_build(*args, **kwargs):
                 staged = root / ".tools/build/release/AutoDLWatcher"
                 (staged / "_internal").mkdir(parents=True)
@@ -91,11 +96,15 @@ class PackageLayoutTest(unittest.TestCase):
             self.assertEqual(profile.read_text(encoding="utf-8"), "user data")
             self.assertEqual((release / "config.yaml").read_text(encoding="utf-8"), "user settings")
             self.assertEqual((release / "_internal/AutoDLWorker.exe").read_bytes(), b"worker")
+            self.assertEqual((root / "AutoDLWatcher.exe").read_bytes(), b"gui")
+            self.assertFalse((root / "dist/AutoDLWatcher/AutoDLWatcher.exe").exists())
+            for name, content in preserved.items():
+                self.assertEqual((root / name).read_text(encoding="utf-8"), content)
 
     @unittest.skipUnless(os.name == "nt", "Windows EXE 验收")
     def test_built_worker_runs_without_python_and_never_samples_after_stop(self):
         import struct
-        release = self.root / "dist/AutoDLWatcher"
+        release = self.root
         gui, worker = release / "AutoDLWatcher.exe", release / "_internal/AutoDLWorker.exe"
         if not gui.is_file() or not worker.is_file():
             self.skipTest("尚未生成 EXE；构建后再运行本验收")

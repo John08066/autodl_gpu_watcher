@@ -15,6 +15,7 @@ from tkinter.scrolledtext import ScrolledText
 from . import __version__
 from .config import load_config
 from .main import positive_seconds
+from .session import SESSION_PREFIX, emit_session
 
 ROOT = (Path(os.environ.get("AUTODL_APP_ROOT", Path(sys.executable).parent)).resolve()
         if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[2])  # 配置和运行数据归属于源码根目录或公开 EXE 所在目录。
@@ -39,7 +40,7 @@ def log_tag(line):  # 失败优先识别，避免“开机成功验证失败”�
     lowered = line.lower()
     if any(word in lowered for word in ("失败", "断连", "断开", "异常", "错误", "error", "traceback", "timeout", "失效", "额度不足", "拒绝")):
         return "error"
-    if any(word in lowered for word in ("成功", "已开机", "已连接", "连接正常", "会话有效", "采集恢复", "已同步")):
+    if any(word in lowered for word in ("成功", "已开机", "已连接", "连接正常", "会话有效", "采集恢复")):
         return "success"
     return "normal"
 
@@ -82,6 +83,9 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         self.convert_no_gpu = tk.BooleanVar(value=False)  # 关机切换每次也需显式选择，不保存为偏好。
         self.auxiliary = tk.BooleanVar(value=True)  # 默认显示实时日志，让用户直接确认后台是否仍在监控。
         self.status = tk.StringVar(value="未运行 · 选择入口后开始监控")
+        self.session_status = "unknown"
+        self.session_message = "登录会话尚未核验"
+        self.session_text = tk.StringVar(value="会话未核验 · 核验时间：—")
         self.saved_entry = ""
         preferences = self.local / "preferences.json"
         if preferences.exists():
@@ -97,6 +101,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         self._populate([(item.machine_name, "待刷新", "已配置")
                         for item in self.config.auto_start.targets if item.enabled])
         self.root.after(100, self._drain)  # 将首次消息处理排入 Tk 事件队列，而不是阻塞等待后台输出。
+        self.root.after(0, self.refresh)  # 启动后只读核验，不开始监控或打开登录浏览器。
         self.root.protocol("WM_DELETE_WINDOW", self.close)  # 标题栏关闭按钮也走安全停止流程。
 
     def _build(self):  # 从上到下构建工具栏、服务器表、配置区、操作按钮和日志区。
@@ -120,6 +125,9 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         self.login_button.pack(side="left", padx=8)
         self.login_done = ttk.Button(toolbar, text="已登录并关闭浏览器", command=self.finish_login, state="disabled")
         self.login_done.pack(side="left")
+        self.session_label = ttk.Label(frame, textvariable=self.session_text, foreground="#7a5a18", wraplength=900)
+        self.session_label.pack(anchor="w", pady=(0, 8))
+        frame.bind("<Configure>", lambda event: self.session_label.configure(wraplength=max(200, event.width - 40)))
         self.table = ttk.Treeview(frame, columns=("entry", "slots", "target"), show="headings", height=6, selectmode="browse")
         for column, title, width in [("entry", "服务器入口", 350), ("slots", "平台空闲 / 总 GPU ID", 240),
                                      ("target", "自动开机配置", 260)]:
@@ -208,6 +216,14 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         self.stop_button.configure(state="normal" if value and self.job == "monitor" else "disabled")
         self.login_done.configure(state="normal" if value and self.job == "login" else "disabled")
 
+    def _session(self, status, message, checked_at=""):
+        labels = {"checking": "会话核验中", "valid": "登录会话有效", "invalid": "登录已失效", "unknown": "无法确认登录会话"}
+        if status not in labels or not isinstance(message, str) or not isinstance(checked_at, str):
+            raise ValueError("会话消息格式无效")
+        self.session_status, self.session_message = status, message
+        self.session_text.set(f"{labels[status]} · {message} · 核验时间：{checked_at or '—'}")
+        self.session_label.configure(foreground={"valid": "#18733a", "invalid": "#b42318"}.get(status, "#7a5a18"))
+
     def _launch(self, command, job):  # 为所有任务建立相同的环境、日志管道和退出通知。
         if self.process is not None:  # 禁止同一窗口重复启动任务，避免同时占用浏览器资料。
             return
@@ -225,46 +241,81 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
             return
         self.job = job
         self._busy(True)
+        if job in {"discover", "monitor", "login"}:
+            self._session("checking", "等待人工登录及同步后核验" if job == "login" else "正在核验真实主机接口")
         self.status.set({"monitor": "监控进程已启动 · 等待首次采集", "discover": "正在读取实际服务器列表…",
                          "login": "请在 Edge 登录并关闭窗口，然后点击“已登录并关闭浏览器”",
                          "export": "正在导出报表…"}[job])
         threading.Thread(target=self._read, args=(self.process,), daemon=True).start()  # 管道 readline 可以阻塞，因此放入后台线程。
 
     def _read(self, process):  # 子线程只传递消息，所有控件更新留在 Tk 主线程。
-        for line in process.stdout:
-            self.events.put(("line", line))
-        self.events.put(("exit", process.wait()))  # 先读完末尾日志，再发送退出码，保证界面不会提前丢失输出。
+        try:
+            for line in process.stdout:
+                self.events.put(("line", line))
+        except (OSError, ValueError) as exc:
+            self.events.put(("line", f"后台日志读取失败：{exc}\n"))
+            if self.job == "monitor":
+                self.stop_file.touch()  # 长期监控先请求现有安全停止，不能只等坏管道自行恢复。
+            elif self.job in {"discover", "export"} and process.poll() is None:
+                process.terminate()  # 仅结束自有只读任务，不中断登录资料同步或正常监控。
+            if self.job != "login":
+                try:
+                    process.stdout.close()  # 释放损坏的读端，避免worker写满管道后阻塞。
+                except (OSError, ValueError):
+                    pass
+        finally:
+            self.events.put(("exit", process.wait()))  # 管道异常仍等待真实退出，再恢复操作按钮。
 
     def _drain(self):  # 仅由 Tk 的 after 回调调用，在主线程消费跨线程消息。
-        for _ in range(200):  # 每次限制处理量，让鼠标、重绘和停止按钮仍有机会响应。
-            try:
-                kind, value = self.events.get_nowait()  # 空队列立即返回，不能在 UI 线程等待新日志。
-            except queue.Empty:
-                break
-            if kind == "exit":
-                self.process.stdout.close()
-                self.process.stdin.close()
-                self.process = None  # 只有收到真实退出通知才允许启动下一个任务。
-                self._busy(False)
-                self.status.set("任务已结束" if value == 0 else "任务失败 · 请查看日志；登录失效时点击登录")
-                if self.closing:
-                    self.root.destroy()
-                    return
-            elif value.startswith(DATA_PREFIX):
-                self._populate(json.loads(value[len(DATA_PREFIX):]))  # 带约定前缀的 JSON 用来更新表格，不作为普通日志显示。
-                self.status.set("服务器列表已刷新")
-            else:
-                if value.startswith("WATCHER_STATUS "):
-                    value = value.removeprefix("WATCHER_STATUS ")
-                    self.status.set(value.strip())  # 状态摘要始终可见，不依赖辅助日志面板。
-                if self.auxiliary.get():
-                    self.log.configure(state="normal")
-                    self.log.insert("end", value, log_tag(value))
-                    if int(self.log.index("end-1c").split(".")[0]) > 2000:
-                        self.log.delete("1.0", "201.0")  # 仅裁剪控件中的早期文本；监控文件日志仍由核心独立写入。
-                    self.log.see("end")
-                    self.log.configure(state="disabled")
-        self.root.after(100, self._drain)  # 当前批次结束后重新预约，避免 busy-loop 占满 CPU。
+        reschedule = True
+        try:
+            for _ in range(200):  # 限制处理量，让鼠标、重绘和停止按钮仍有机会响应。
+                try:
+                    kind, value = self.events.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if kind == "exit":
+                        process, self.process = self.process, None  # 真实退出先解除任务锁，流清理异常不再卡住按钮。
+                        self._busy(False)
+                        if process is not None:
+                            for stream in (process.stdout, process.stdin):
+                                try:
+                                    stream.close()
+                                except (OSError, ValueError):
+                                    pass
+                        if self.job in {"discover", "monitor", "login"} and self.session_status == "checking":
+                            self._session("unknown", "核验未完成，后台任务失败，请重试" if value else "核验未完成，后台任务已结束，请重试")
+                        self.status.set(self.session_message if self.job != "export" and self.session_status in {"invalid", "unknown"}
+                                        else "任务已结束" if value == 0 else "任务失败 · 请查看日志并重试")
+                        if self.closing:
+                            reschedule = False
+                            self.root.destroy()
+                            return
+                    elif value.startswith(SESSION_PREFIX):
+                        data = json.loads(value[len(SESSION_PREFIX):])
+                        self._session(data["status"], data["message"], data["checked_at"])
+                        if data["status"] in {"invalid", "unknown"}:
+                            self.status.set(data["message"])
+                    elif value.startswith(DATA_PREFIX):
+                        self._populate(json.loads(value[len(DATA_PREFIX):]))
+                        self.status.set("服务器列表已刷新")
+                    else:
+                        if value.startswith("WATCHER_STATUS "):
+                            value = value.removeprefix("WATCHER_STATUS ")
+                            self.status.set(value.strip())
+                        if self.auxiliary.get():
+                            self.log.configure(state="normal")
+                            self.log.insert("end", value, log_tag(value))
+                            if int(self.log.index("end-1c").split(".")[0]) > 2000:
+                                self.log.delete("1.0", "201.0")
+                            self.log.see("end")
+                            self.log.configure(state="disabled")
+                except Exception as exc:
+                    self.status.set(f"后台消息处理失败：{exc}")
+        finally:
+            if reschedule:
+                self.root.after(100, self._drain)  # 坏消息不能中断后续退出通知和按钮恢复。
 
     def start(self):  # 每次监控使用当前设置启动新进程，状态与上一轮任务隔离。
         if self.process is not None or not self.save():
@@ -310,15 +361,26 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
 
 def discover():  # 子进程模式：采集结果编码为一行 JSON，供父进程更新服务器表格。
     from .collectors import PlatformBrowserCollector
+    from .collectors.platform import PlatformAuthenticationError
     config = load_config(ROOT / "config.yaml")
     collector = PlatformBrowserCollector(config.platform)
     try:
+        emit_session("checking", "正在核验真实主机接口")
         configured = {item.machine_name for item in config.auto_start.targets if item.enabled and item.instance_uuid}
         rows = [(name, f"{idle}/{total}", "已配置" if name in configured else "只读监控")
                 for host in collector.collect() for name, idle, total in host.source_slots]
         print(DATA_PREFIX + json.dumps(rows, ensure_ascii=False), flush=True)
+        emit_session("valid", "主机接口核验成功")
+    except Exception as exc:
+        message = f"登录已失效，请点击登录 / 更新会话：{exc}" if isinstance(exc, PlatformAuthenticationError) else f"服务器刷新失败，网络或响应错误，无法确认会话，请重试：{exc}"
+        emit_session("invalid" if isinstance(exc, PlatformAuthenticationError) else "unknown", message)
+        print(message, flush=True)
+        raise SystemExit(1) from None  # 预期刷新错误不显示PyInstaller未处理异常堆栈。
     finally:
-        collector.close()  # 无论刷新成功与否都释放持久浏览器上下文，供后续任务使用。
+        try:
+            collector.close()  # 刷新成功与否都释放浏览器上下文，供后续任务使用。
+        except Exception as exc:
+            print(f"刷新浏览器清理失败：{exc}", flush=True)
 
 
 def main():  # 同一模块既可作为桌面入口，也可作为无界面的主机发现子进程。

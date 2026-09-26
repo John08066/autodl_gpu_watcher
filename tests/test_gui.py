@@ -1,4 +1,6 @@
 import argparse
+import io
+import json
 from dataclasses import replace
 from pathlib import Path
 import tempfile
@@ -6,7 +8,8 @@ import unittest
 from unittest.mock import patch
 
 from autodl_watcher.config import load_config
-from autodl_watcher.gui import ROOT, log_tag, monitor_command, worker_command, worker_python
+from autodl_watcher.gui import ROOT, SESSION_PREFIX, discover, log_tag, monitor_command, worker_command, worker_python
+from autodl_watcher.collectors.platform import PlatformAuthenticationError, PlatformTransientError
 from autodl_watcher.main import _build_parser, apply_monitor_options, main, positive_seconds
 
 
@@ -35,6 +38,46 @@ class GuiOptionsTest(unittest.TestCase):
         self.assertEqual(log_tag("已开机，继续监控"), "success")
         self.assertEqual(log_tag("开机成功 · connected"), "success")
         self.assertEqual(log_tag("本人占用待确认"), "normal")
+        self.assertEqual(log_tag("登录会话已同步，等待核验"), "normal")
+
+
+    def test_discover_reports_authentication_and_network_failures_distinctly(self):
+        failures = [(PlatformAuthenticationError("HTTP 401"), "invalid"),
+                    (PlatformTransientError("Network.getResponseBody: No resource"), "unknown")]
+        for error, expected in failures:
+            with self.subTest(status=expected), patch("autodl_watcher.collectors.PlatformBrowserCollector") as factory, \
+                    patch("sys.stdout", new_callable=io.StringIO) as output:
+                factory.return_value.collect.side_effect = error
+                with self.assertRaises(SystemExit) as failure:
+                    discover()
+                self.assertNotEqual(failure.exception.code, 0)
+                messages = [json.loads(line[len(SESSION_PREFIX):]) for line in output.getvalue().splitlines()
+                            if line.startswith(SESSION_PREFIX)]
+                self.assertEqual([item["status"] for item in messages], ["checking", expected])
+                self.assertTrue(messages[-1]["checked_at"])
+                factory.return_value.close.assert_called_once()
+                self.assertNotIn("Traceback", output.getvalue())
+
+    def test_discover_marks_session_valid_only_after_collection(self):
+        with patch("autodl_watcher.collectors.PlatformBrowserCollector") as factory, \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            factory.return_value.collect.return_value = []
+            discover()
+            messages = [json.loads(line[len(SESSION_PREFIX):]) for line in output.getvalue().splitlines()
+                        if line.startswith(SESSION_PREFIX)]
+            self.assertEqual([item["status"] for item in messages], ["checking", "valid"])
+            self.assertIn("WATCHER_HOSTS []", output.getvalue())
+            factory.return_value.close.assert_called_once()
+
+    def test_discover_cleanup_failure_does_not_mask_authentication_message(self):
+        with patch("autodl_watcher.collectors.PlatformBrowserCollector") as factory, \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            factory.return_value.collect.side_effect = PlatformAuthenticationError("HTTP 401")
+            factory.return_value.close.side_effect = OSError("close failed")
+            with self.assertRaises(SystemExit):
+                discover()
+            self.assertIn('"status": "invalid"', output.getvalue())
+            self.assertIn("清理失败", output.getvalue())
 
     def setUp(self):
         self.config = load_config(ROOT / "config.yaml")

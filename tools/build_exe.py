@@ -35,13 +35,10 @@ COLLECT(gui, a.binaries, a.datas, [('AutoDLWorker.exe', worker.name, 'BINARY')],
     subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm",
                     "--distpath", str(folder / "release"), "--workpath", str(folder / "work"),
                     str(spec)], cwd=ROOT, env=env, check=True)
-    release = ROOT / "dist" / "AutoDLWatcher"
+    release = ROOT  # 主程序直接放项目根目录，沿用已有配置和运行资料。
     staged = folder / "release" / "AutoDLWatcher"
-    release.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(staged / "AutoDLWatcher.exe", release / "AutoDLWatcher.exe")
     shutil.copytree(staged / "_internal", release / "_internal", dirs_exist_ok=True)  # 只合并生成依赖，保留用户配置、登录资料与日志。
-    if not (release / "config.yaml").exists():
-        shutil.copyfile(ROOT / "config.yaml", release / "config.yaml")
     print(f"GUI: {release / 'AutoDLWatcher.exe'}")
     print(f"Worker: {release / '_internal' / 'AutoDLWorker.exe'}")
 

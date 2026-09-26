@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from playwright.sync_api import BrowserContext, Page, Playwright, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, Playwright, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 from ..config import PlatformConfig
 from ..login import prepare_profile_for_exclusive_use
@@ -301,7 +301,10 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
             if isinstance(request_payload, dict):
                 self._machine_list_payload = request_payload
 
-        payload = response.json()
+        try:
+            payload = response.json()  # 浏览器可能已清理响应体；读取错误不能证明登录失效。
+        except PlaywrightError as exc:
+            raise PlatformTransientError("AutoDL machine/list 响应体暂时无法读取") from exc
         if not isinstance(payload, dict):
             raise RuntimeError("AutoDL machine/list returned non-object JSON")
         if payload.get("code") != "Success":
@@ -310,7 +313,8 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
 
     def _collect_machine_list_direct(self) -> list[PlatformHost]:  # 使用已捕获 token/请求体直接调用 machine/list，避免每轮整页刷新。
         self.start()
-        assert self._context is not None
+        if self._context is None:
+            raise PlatformTransientError("当前没有可复用的浏览器 API 请求上下文")
         if not self._authorization or self._machine_list_payload is None:
             raise PlatformTransientError("尚未捕获到可复用的 machine/list 请求上下文")
 
@@ -332,7 +336,7 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
                 return self._parse_machine_list_response(response)
             except PlatformAuthenticationError:
                 raise
-            except (PlatformTransientError, PlaywrightTimeoutError) as exc:
+            except (PlatformTransientError, PlaywrightError) as exc:
                 last_error = exc
                 if attempt < self.config.max_attempts:
                     time.sleep(self.config.retry_delay_seconds)
@@ -356,23 +360,23 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
                 else:
                     self._page.reload(wait_until="domcontentloaded")
             return self._parse_machine_list_response(response_info.value)
-        except PlaywrightTimeoutError as exc:
+        except (PlaywrightError, PlatformTransientError) as exc:  # 超时、响应体丢失或传输失败均走有限只读恢复。
             current_url = self._page.url
             if self._url_is_login(current_url):
                 raise PlatformAuthenticationError( f"AutoDL 已跳转到登录页：{current_url}" ) from exc
 
-            if self._authorization and self._machine_list_payload is not None:  # request 监听器可能已经拿到 token/请求体，只是网页响应过慢。 此时直接 API 重试一次链路，而不是误弹登录窗口。
+            if self._context is not None and self._authorization and self._machine_list_payload is not None:  # 用新 API 响应恢复读取，避免复用已丢失的浏览器响应体。
                 try:
                     return self._collect_machine_list_direct()
                 except PlatformAuthenticationError:
                     raise
                 except PlatformTransientError as direct_exc:
                     raise PlatformTransientError(
-                        f"AutoDL 控制台仍在 {current_url}，但主机列表接口本轮超时；"
+                        f"AutoDL 控制台仍在 {current_url}，但主机列表响应本轮暂时不可用；"
                         "这是数据采集故障，不是登录失效。"
                     ) from direct_exc
 
-            raise PlatformTransientError( f"AutoDL 控制台仍在 {current_url}，但本轮未捕获到主机列表响应；" "没有登录失效证据，本轮仅跳过开机。" ) from exc
+            raise PlatformTransientError( f"AutoDL 控制台仍在 {current_url}，但本轮未能可靠读取主机列表响应；" "没有登录失效证据，本轮仅跳过开机。" ) from exc
 
     def post_api_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:  # 使用已保存的浏览器会话发送同源 POST API 请求。
         self.start()

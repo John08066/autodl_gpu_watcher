@@ -163,7 +163,7 @@ class MonitorLoopTest(unittest.TestCase):
                         telemetry.return_value.collect.side_effect = lambda: [
                             GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
                         args = ["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
-                                "--live", "--max-cycles", "4", "--runtime-dir", directory, "--no-login"]
+                                "--live", "--max-cycles", "6", "--runtime-dir", directory, "--no-login"]
                         main(args + (["--convert-no-gpu"] if conversion else []))
                         requests = [call("/api/v2/instance/power_on", {
                             "instance_uuid": first.instance_uuid, "start_mode": "gpu"})]
@@ -171,8 +171,8 @@ class MonitorLoopTest(unittest.TestCase):
                             requests.insert(0, call("/api/v2/instance/power_off", {
                                 "instance_uuid": first.instance_uuid, "release": "now"}))
                         self.assertEqual(platform.return_value.post_api_json.call_args_list, requests)
-                        self.assertGreaterEqual(platform.return_value.collect.call_count, 4)
-                        self.assertGreaterEqual(telemetry.return_value.collect.call_count, 4)
+                        self.assertGreaterEqual(platform.return_value.collect.call_count, 6)
+                        self.assertGreaterEqual(telemetry.return_value.collect.call_count, 6)
                         lines = output.getvalue().splitlines()
                         heartbeat = [line for line in lines if line.startswith("WATCHER_STATUS ")][-1]
                         status = [line for line in lines if " | 动作=" in line][-1]
@@ -460,13 +460,16 @@ class MonitorLoopTest(unittest.TestCase):
                         platform.return_value.post_api_json.assert_not_called()
 
     def test_expired_ui_session_exits_and_releases_browser(self):
-        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
             with patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
                  patch("autodl_watcher.main.interactive_login") as login:
                 platform.return_value.collect.side_effect = PlatformAuthenticationError("expired")
-                with self.assertRaises(PlatformAuthenticationError):
+                with self.assertRaises(SystemExit) as stopped:
                     main(["--config", str(ROOT / "config.yaml"), "--runtime-dir", directory,
                           "--dry-run", "--no-login"])
+                self.assertEqual(stopped.exception.code, 3)
+                self.assertIn('"status": "invalid"', output.getvalue())
+                self.assertNotIn("Traceback", output.getvalue())
                 login.assert_not_called()
                 platform.return_value.close.assert_called_once()
 
@@ -612,3 +615,26 @@ class MonitorLoopTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionMonitorRegressionTest(unittest.TestCase):
+    def test_session_status_distinguishes_platform_failure_from_telemetry_failure(self):
+        import json
+        from autodl_watcher.session import SESSION_PREFIX
+        host = PlatformHost("gpu-999", 0, 2, ("autodl-999-1",), (("autodl-999-1", 0, 2),))
+        sample = GpuSample("gpu-999", 0, "Test GPU", 0, 0, 32000, datetime.now())
+        for failure_source, expected in (("platform", ["valid", "unknown"]), ("telemetry", ["valid", "valid"])):
+            with self.subTest(source=failure_source), tempfile.TemporaryDirectory() as directory, \
+                 redirect_stdout(io.StringIO()) as output, \
+                 patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                platform.return_value.collect.side_effect = [[host], RuntimeError("machine response malformed")] if failure_source == "platform" else [[host], [host]]
+                platform.return_value.collect_occupancy.return_value = []
+                telemetry.return_value.collect.side_effect = [[sample], RuntimeError("telemetry unavailable")] if failure_source == "telemetry" else [[sample], [sample]]
+                main(["--config", str(ROOT / "config.yaml"), "--host", "999", "--entry", "1", "--dry-run", "--no-login",
+                      "--poll-seconds", "0.01", "--max-cycles", "2", "--runtime-dir", directory])
+                statuses = [json.loads(line[len(SESSION_PREFIX):])["status"] for line in output.getvalue().splitlines()
+                            if line.startswith(SESSION_PREFIX)]
+                self.assertEqual(statuses, expected)
+                platform.return_value.post_api_json.assert_not_called()
+                platform.return_value.close.assert_called_once()

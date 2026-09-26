@@ -381,6 +381,153 @@ class PlatformApiResponseCompatibilityV053Test(unittest.TestCase):  # v0.5.3: di
         collector._context.request.post.assert_called_once()
 
 
+class PlatformResponseBodyRecoveryTest(unittest.TestCase):
+    @staticmethod
+    def _response(error=None):
+        response = Mock(spec=["status", "json"])
+        response.status = 200
+        if error is not None:
+            response.json.side_effect = error
+        else:
+            response.json.return_value = {"code": "Success", "data": {"list": [
+                {"machine_name": "autodl-201-1", "gpu": {"idle": 2, "total": 4}}]}}
+        return response
+
+    @staticmethod
+    def _body_error():
+        from playwright.sync_api import Error
+        return Error("Response.json: Protocol error (Network.getResponseBody): "
+                     "No resource with given identifier found")
+
+    def _collector(self, browser_response=None):
+        collector = PlatformBrowserCollector(PlatformClassificationV052Test._config())
+        collector.start = Mock()
+        collector._context = Mock()
+        collector._page = Mock()
+        collector._page.url = collector.config.page_url
+        if browser_response is not None:
+            request = Mock()
+            request.all_headers.return_value = {"authorization": "test-session"}
+            request.post_data_json = {"page_index": 1, "page_size": 10}
+            browser_response.request = request
+            manager = MagicMock()
+            manager.__enter__.return_value = manager
+            manager.value = browser_response
+            collector._page.expect_response.return_value = manager
+        return collector
+
+    def test_browser_response_body_eviction_recovers_through_fresh_api_response(self):
+        lost = self._response(self._body_error())
+        collector = self._collector(lost)
+        fresh = self._response()
+        collector._context.request.post.return_value = fresh
+        hosts = collector.collect()
+        self.assertEqual([(item.host, item.free_count, item.total_count) for item in hosts],
+                         [("gpu-201", 2, 4)])
+        lost.json.assert_called_once()
+        fresh.json.assert_called_once()
+        collector._context.request.post.assert_called_once()
+        self.assertEqual(collector._context.request.post.call_args.kwargs["data"],
+                         {"page_index": 1, "page_size": 10})
+        collector._page.reload.assert_called_once()
+
+    def test_body_eviction_without_reusable_context_is_transient_with_original_cause(self):
+        error = self._body_error()
+        collector = self._collector(self._response(error))
+        collector._context = None
+        with self.assertRaises(PlatformTransientError) as caught:
+            collector._collect_machine_list_via_browser()
+        cause = caught.exception
+        while cause.__cause__ is not None:
+            cause = cause.__cause__
+        self.assertIs(cause, error)
+
+    def test_browser_body_eviction_and_exhausted_direct_read_retry_stays_transient(self):
+        first_error, last_error = self._body_error(), self._body_error()
+        collector = self._collector(self._response(first_error))
+        collector._context.request.post.side_effect = [self._response(first_error), self._response(last_error)]
+        with patch("autodl_watcher.collectors.platform.time.sleep"), \
+             self.assertRaises(PlatformTransientError) as caught:
+            collector.collect()
+        self.assertEqual(collector._context.request.post.call_count, collector.config.max_attempts)
+        cause = caught.exception
+        while cause.__cause__ is not None:
+            cause = cause.__cause__
+        self.assertIs(cause, last_error)
+
+    def test_direct_response_or_transport_playwright_error_retries_without_auth_failure(self):
+        from playwright.sync_api import Error
+        for location in ("response_json", "request_transport"):
+            with self.subTest(location=location):
+                collector = self._collector()
+                collector._authorization = "test-session"
+                collector._machine_list_payload = {"page_index": 1}
+                fresh = self._response()
+                error = self._body_error() if location == "response_json" else Error("APIRequestContext.post: ECONNRESET")
+                collector._context.request.post.side_effect = [
+                    self._response(error) if location == "response_json" else error, fresh]
+                with patch("autodl_watcher.collectors.platform.time.sleep"):
+                    hosts = collector._collect_machine_list_direct()
+                self.assertEqual(hosts[0].host, "gpu-201")
+                self.assertEqual(collector._context.request.post.call_count, 2)
+
+    def test_direct_transport_retry_exhaustion_preserves_original_error(self):
+        from playwright.sync_api import Error
+        error = Error("APIRequestContext.post: ECONNRESET")
+        collector = self._collector()
+        collector._authorization = "test-session"
+        collector._machine_list_payload = {"page_index": 1}
+        collector._context.request.post.side_effect = error
+        with patch("autodl_watcher.collectors.platform.time.sleep"), \
+             self.assertRaises(PlatformTransientError) as caught:
+            collector._collect_machine_list_direct()
+        self.assertEqual(collector._context.request.post.call_count, collector.config.max_attempts)
+        self.assertIs(caught.exception.__cause__, error)
+
+    def test_direct_missing_browser_context_is_transient(self):
+        collector = self._collector()
+        collector._context = None
+        collector._authorization = "test-session"
+        collector._machine_list_payload = {"page_index": 1}
+        with self.assertRaises(PlatformTransientError):
+            collector._collect_machine_list_direct()
+
+    def test_http_unauthorized_response_is_not_retried_or_read_as_json(self):
+        for status in (401, 403):
+            for browser in (True, False):
+                with self.subTest(status=status, browser=browser):
+                    response = self._response(self._body_error())
+                    response.status = status
+                    collector = self._collector(response if browser else None)
+                    if not browser:
+                        collector._authorization = "test-session"
+                        collector._machine_list_payload = {"page_index": 1}
+                        collector._context.request.post.return_value = response
+                    with self.assertRaises(PlatformAuthenticationError):
+                        if browser:
+                            collector._collect_machine_list_via_browser()
+                        else:
+                            collector._collect_machine_list_direct()
+                    response.json.assert_not_called()
+                    self.assertEqual(collector._context.request.post.call_count, 0 if browser else 1)
+
+    def test_login_redirect_with_body_error_remains_authentication_failure(self):
+        collector = self._collector(self._response(self._body_error()))
+        collector._page.url = "https://private.autodl.com/login"
+        with self.assertRaises(PlatformAuthenticationError):
+            collector._collect_machine_list_via_browser()
+        collector._context.request.post.assert_not_called()
+
+    def test_non_playwright_json_error_is_not_hidden_or_retried(self):
+        collector = self._collector()
+        collector._authorization = "test-session"
+        collector._machine_list_payload = {"page_index": 1}
+        collector._context.request.post.return_value = self._response(ValueError("invalid JSON fixture"))
+        with self.assertRaisesRegex(ValueError, "invalid JSON fixture"):
+            collector._collect_machine_list_direct()
+        collector._context.request.post.assert_called_once()
+
+
 class OccupancyValidationV054Test(unittest.TestCase):
     @staticmethod
     def _record(machine: str, gpu_index: int, occupied: bool, user: str = "") -> OccupancyRecord:

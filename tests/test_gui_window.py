@@ -6,7 +6,7 @@ import tempfile
 import time
 import tkinter as tk
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from autodl_watcher import gui
 
@@ -18,6 +18,8 @@ class GuiWindowTest(unittest.TestCase):
         shutil.copyfile(gui.ROOT / "config.yaml", self.folder / "config.yaml")
         self.location = patch.object(gui, "ROOT", self.folder)
         self.location.start()
+        self.refresh = patch.object(gui.WatcherWindow, "refresh")
+        self.refresh_mock = self.refresh.start()  # 窗口启动会自动只读刷新；本测试不得连接真实服务。
         self.root = tk.Tk()
         self.root.withdraw()
         self.window = gui.WatcherWindow(self.root)
@@ -28,6 +30,7 @@ class GuiWindowTest(unittest.TestCase):
             self.pump(lambda: self.window.process is None)
         self.root.destroy()
         self.location.stop()
+        self.refresh.stop()
         self.temp.cleanup()
 
     def pump(self, condition, timeout=5):
@@ -36,6 +39,124 @@ class GuiWindowTest(unittest.TestCase):
             self.root.update()
             time.sleep(0.02)
         self.assertTrue(condition(), "UI 子进程未在期限内完成")
+
+
+    def test_startup_schedules_readonly_session_check(self):
+        self.root.update()
+        self.refresh_mock.assert_called_once()
+        self.assertEqual(self.window.session_status, "unknown")
+        self.assertEqual(self.window.session_label.winfo_manager(), "pack")
+
+    def test_authentication_and_transient_failures_restore_buttons_and_preserve_reason(self):
+        for status, message in [("invalid", "登录已失效，请重新登录"),
+                                ("unknown", "网络或响应错误，无法确认会话")]:
+            with self.subTest(status=status):
+                payload = json.dumps({"status": status, "message": message, "checked_at": "2026-09-26T16:00:00"})
+                code = f"import sys; print({gui.SESSION_PREFIX + payload!r},flush=True); sys.exit(3)"
+                self.window._launch([sys.executable, "-u", "-c", code], "discover")
+                self.pump(lambda: self.window.process is None)
+                self.assertEqual(self.window.session_status, status)
+                self.assertEqual(self.window.status.get(), message)
+                self.assertIn("2026-09-26T16:00:00", self.window.session_text.get())
+                self.assertEqual(str(self.window.login_button["state"]), "normal")
+                self.assertEqual(str(self.window.refresh_button["state"]), "normal")
+
+    def test_pipe_read_and_cleanup_errors_cannot_leave_buttons_locked(self):
+        class BrokenPipe:
+            def __iter__(self):
+                raise OSError("pipe read failed")
+            def close(self):
+                raise OSError("pipe close failed")
+        process = Mock(stdout=BrokenPipe(), stdin=BrokenPipe())
+        process.poll.return_value = None
+        def stopped_wait():
+            process.terminate.assert_called_once()
+            return 7
+        process.wait.side_effect = stopped_wait
+        self.window.process, self.window.job = process, "discover"
+        self.window._session("checking", "正在核验")
+        self.window._busy(True)
+        self.window._read(process)
+        self.window._drain()
+        self.assertIsNone(self.window.process)
+        self.assertEqual(str(self.window.refresh_button["state"]), "normal")
+        self.assertIn("后台日志读取失败", self.window.log.get("1.0", "end"))
+        self.assertEqual(self.window.session_status, "unknown")
+        self.assertIn("核验未完成", self.window.session_text.get())
+        process.wait.assert_called_once()
+
+    def test_worker_exit_without_validation_cannot_leave_session_checking(self):
+        for job, code in [("discover", 3), ("discover", 0), ("monitor", 0), ("login", 4)]:
+            with self.subTest(job=job, code=code):
+                self.window.process, self.window.job = Mock(), job
+                self.window._session("checking", "正在核验")
+                self.window._busy(True)
+                self.window.events.put(("exit", code))
+                self.window._drain()
+                self.assertEqual(self.window.session_status, "unknown")
+                self.assertIn("核验未完成", self.window.status.get())
+                self.assertEqual(str(self.window.login_button["state"]), "normal")
+
+    def test_export_exit_does_not_change_session_status(self):
+        self.window.process, self.window.job = Mock(), "export"
+        self.window._session("checking", "先前的核验状态")
+        self.window._busy(True)
+        self.window.events.put(("exit", 1))
+        self.window._drain()
+        self.assertEqual(self.window.session_status, "checking")
+        self.assertEqual(self.window.session_message, "先前的核验状态")
+
+    def test_monitor_pipe_failure_requests_safe_stop_before_waiting(self):
+        stdout = Mock()
+        stdout.__iter__ = Mock(side_effect=OSError("pipe read failed"))
+        process = Mock(stdout=stdout)
+        def stopped_wait():
+            self.assertTrue(self.window.stop_file.exists())
+            stdout.close.assert_called_once()
+            return 7
+        process.wait.side_effect = stopped_wait
+        self.window.job = "monitor"
+        self.window._read(process)
+        process.terminate.assert_not_called()
+        self.assertEqual(self.window.events.get()[0], "line")
+        self.assertEqual(self.window.events.get(), ("exit", 7))
+
+    def test_login_pipe_failure_does_not_interrupt_profile_sync(self):
+        stdout = Mock()
+        stdout.__iter__ = Mock(side_effect=OSError("pipe read failed"))
+        process = Mock(stdout=stdout)
+        process.wait.return_value = 7
+        self.window.job = "login"
+        self.window._read(process)
+        process.terminate.assert_not_called()
+        stdout.close.assert_not_called()
+        self.assertFalse(self.window.stop_file.exists())
+
+    def test_bad_message_does_not_stop_event_pump_or_lose_exit(self):
+        self.window.process, self.window.job = Mock(), "discover"
+        self.window._busy(True)
+        self.window.events.put(("line", gui.DATA_PREFIX + "{broken"))
+        self.window._drain()
+        self.window.events.put(("line", gui.SESSION_PREFIX + json.dumps(
+            {"status": "invalid", "message": "登录已失效", "checked_at": "2026-09-26T16:00:00"})))
+        self.window.events.put(("exit", 3))
+        self.pump(lambda: self.window.process is None)
+        self.assertEqual(self.window.status.get(), "登录已失效")
+        self.assertEqual(str(self.window.login_button["state"]), "normal")
+
+    def test_login_profile_sync_is_pending_until_real_validation_message(self):
+        checking = gui.SESSION_PREFIX + json.dumps(
+            {"status": "checking", "message": "资料已同步，等待核验", "checked_at": "2026-09-26T16:00:00"})
+        valid = gui.SESSION_PREFIX + json.dumps(
+            {"status": "valid", "message": "主机接口核验成功", "checked_at": "2026-09-26T16:00:01"})
+        code = f"print({checking!r},flush=True); input(); print({valid!r},flush=True)"
+        self.window._launch([sys.executable, "-u", "-c", code], "login")
+        self.pump(lambda: "资料已同步" in self.window.session_text.get())
+        self.assertEqual(self.window.session_status, "checking")
+        self.window.finish_login()
+        self.pump(lambda: self.window.process is None)
+        self.assertEqual(self.window.session_status, "valid")
+        self.assertIn("16:00:01", self.window.session_text.get())
 
     def test_selection_and_custom_settings_are_saved(self):
         self.window._populate([("autodl-202-4", "3/3", "只读监控")])
