@@ -200,7 +200,8 @@ def _build_parser(default_host: str) -> argparse.ArgumentParser:  # 构建 CLI �
     parser.add_argument("--stop-file", type=Path, help="UI 的安全停止信号文件")
     parser.add_argument("--max-cycles", type=int, default=0, help="限定轮数，0 为持续运行")
     parser.add_argument("--no-login", action="store_true", help="登录失效时退出，由 UI 完成登录")
-    parser.add_argument("--convert-no-gpu", action="store_true", help="固定入口显式允许无卡关机后有卡开机；需同时指定 --live。")
+    parser.add_argument("--convert-no-gpu", action="store_true", help="目标达标时关闭当前账号全部无卡实例，再有卡开机；需固定 --entry 和 --live。")
+    parser.add_argument("--no-usage-report", action="store_true", help="关闭历史占用统计和报表写入，仍保留开机必需的占用核验。")
     parser.add_argument("--runtime-dir", type=Path, help="独立运行数据目录")
     return parser
 
@@ -402,7 +403,8 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
 
     platform_collector = PlatformBrowserCollector(config.platform)   # 浏览器 → AutoDL 平台
     telemetry_collector = TelemetryApiCollector(config.telemetry)    # HTTP   → Telemetry API
-    usage_logger = UsageSqliteLogger(config.usage_tracking.database_path)  # SQLite 占用日志
+    usage_report_enabled = config.usage_tracking.enabled and not args.no_usage_report
+    usage_logger = UsageSqliteLogger(config.usage_tracking.database_path) if usage_report_enabled else None  # 历史统计与电源安全核验独立。
     self_user = config.usage_tracking.self_user.strip()
 
     owned_instances: list[_OwnedInstance] = []  # v0.5.1：SQLite 只用于历史统计，绝不参与“本人现在是否已开机”的判定。 每次启动都从 UNKNOWN 开始，必须等本进程成功采集“查看占用”后， 才能进入 ACTIVE / ABSENT。这样彻底消除数据库陈旧记录导致的假绿色。
@@ -439,7 +441,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
     if selected_auto_start.enabled:
         auto_mode = "DRY-RUN" if selected_auto_start.dry_run else "真实开机"
         if args.convert_no_gpu:
-            auto_mode += "；所选实例无卡转有卡"
+            auto_mode += "；目标达标时关闭本账号全部无卡实例释放额度"
 
     entry_mode = (
         "自动选择[" + ", ".join(item.machine_name for item in selected_targets) + "]"
@@ -468,7 +470,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
     if config.platform.autodl_direct:
         print( "AutoDL网络：watcher 控制面直连，绕过系统代理；" "Telemetry 仍可使用本机 HTTP_PROXY。" )
     print(f"监控日志：{config.runtime.log_file}")
-    if config.usage_tracking.enabled:
+    if usage_report_enabled:
         usage_entry_text = ", ".join(item.machine_name for item in usage_targets) or "无"
         print(
             "占用日志：每 "
@@ -477,6 +479,9 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
             f"CSV导出目录={config.usage_tracking.export_dir}；"
             f"本人用户={self_user or '未配置'}"
         )
+
+    if not usage_report_enabled:
+        print("占用统计与报表已关闭；开机必需的实时占用核验继续运行。")
 
     cycles = 0
     stop_requested = lambda: args.stop_file is not None and args.stop_file.exists()
@@ -690,10 +695,6 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     status_line = _red_terminal_text(status_line)
                 elif self_active:
                     status_line = _green_terminal_text(status_line)
-                elif (
-                    trigger_events and selected_auto_start.enabled and not selected_auto_start.dry_run
-                ):
-                    status_line = _red_terminal_text(status_line)
                 print(status_line, flush=True)
                 logger.info(  # 结构化日志（用于事后分析）
                     "target_host=%s entry_mode=%s platform_gpu_ids=%s entries=%s physical_indices=%d ready_indices=%s planned_entry=%s start_ready=%s self_active=%s self_user=%s trigger_events=%d",
@@ -878,7 +879,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                             raw_occupancy,
                             complete_snapshot=complete_for_db,
                             snapshot_hosts={selected_host},  # 数据库结束事件仅作用于本轮覆盖的主机，其他主机历史不受影响。
-                        )
+                        ) if usage_logger is not None else []
                         instance_records = merge_duplicate_instances(raw_occupancy)
                         gpu_rows = aggregate_gpu_occupants(raw_occupancy)
 
@@ -958,7 +959,8 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     for result in results:
                         result_text = format_start_result(result)
                         if result.status in {"request_accepted", "gpu_start_observed"}:
-                            result_text = _green_terminal_text(result_text)  # 请求受理或实例启动已观测；仍需占用详情确认。
+                            if result.status == "gpu_start_observed":
+                                result_text = _green_terminal_text(result_text)  # 受理只表示请求进入队列；实际有卡运行才显示成功色。
                             pending_start_until = (
                                 time.monotonic() + _POWER_ON_CONFIRM_GRACE_SECONDS
                             )
@@ -977,6 +979,8 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                             and result.status in {"request_failed", "recheck_failed", "no_target", "shutdown_failed", "instance_state_blocked"}
                         ):
                             evaluator.rearm_host(selected_host)  # 请求根本没有成功落地时，不能让 evaluator 的 alerted 锁住后续重试。
+                        if result.status in {"request_failed", "recheck_failed", "shutdown_failed", "switch_failed", "instance_state_blocked", "quota_blocked"}:
+                            result_text = _red_terminal_text(result_text)
                         print(result_text, flush=True)
                         logger.info(
                             "auto_start status=%s host=%s machine=%s instance=%s before=%s/%s after=%s/%s code=%s msg=%s",

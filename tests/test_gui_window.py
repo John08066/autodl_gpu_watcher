@@ -160,6 +160,8 @@ class GuiWindowTest(unittest.TestCase):
 
     def test_selection_and_custom_settings_are_saved(self):
         self.window._populate([("autodl-202-4", "3/3", "只读监控")])
+        self.window.live.set(False)
+        self.window.convert_no_gpu.set(False)
         self.window.user.set("任意用户名")
         self.window.poll.set("0.5")
         self.window.usage.set("75")
@@ -170,15 +172,67 @@ class GuiWindowTest(unittest.TestCase):
         self.assertEqual(settings["poll"], "0.5")
         self.assertFalse(self.window.live.get())
 
-    def test_live_log_is_shown_by_default_and_can_be_hidden(self):
+    def test_statistics_switch_preserves_log_output_and_saves_preference(self):
+        self.assertTrue(self.window.usage_tracking.get())
         self.assertEqual(self.window.log.frame.winfo_manager(), "pack")
         self.assertEqual(self.window.export_button.winfo_manager(), "pack")
-
-        self.window.auxiliary.set(False)
-        self.window._toggle_auxiliary()
-
-        self.assertEqual(self.window.log.frame.winfo_manager(), "")
+        self.window.usage_tracking.set(False)
+        self.window._toggle_usage()
+        self.assertEqual(self.window.log.frame.winfo_manager(), "pack")
         self.assertEqual(self.window.export_button.winfo_manager(), "")
+        self.window.events.put(("line", "连接正常，实时输出仍然可见\n"))
+        self.window._drain()
+        self.assertIn("实时输出仍然可见", self.window.log.get("1.0", "end"))
+        self.assertIn("success", self.window.log.tag_names("1.0"))
+        self.assertIn("--no-usage-report", self.window._command())
+        self.assertTrue(self.window.save())
+        settings = json.loads((self.folder / ".ui/preferences.json").read_text(encoding="utf-8"))
+        self.assertFalse(settings["usage_tracking"])
+        self.root.destroy()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.window = gui.WatcherWindow(self.root)
+        self.assertFalse(self.window.usage_tracking.get())
+        self.assertEqual(self.window.log.frame.winfo_manager(), "pack")
+        self.assertEqual(self.window.export_button.winfo_manager(), "")
+
+    def test_normal_mode_defaults_to_live_and_debug_defaults_to_readonly(self):
+        self.assertTrue(self.window.live.get())
+        self.assertTrue(self.window.convert_no_gpu.get())
+        self.assertIn("--live", self.window._command())
+        self.assertIn("全部无卡实例", self.window.convert_check["text"])
+        self.window.live_check.invoke()  # 取消真实开机也取消无卡关机，避免不一致的只读参数。
+        self.assertFalse(self.window.live.get())
+        self.assertFalse(self.window.convert_no_gpu.get())
+        self.assertIn("--dry-run", self.window._command())
+        self.root.destroy()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.window = gui.WatcherWindow(self.root, debug=True)
+        self.assertFalse(self.window.live.get())
+        self.assertFalse(self.window.convert_no_gpu.get())
+        self.assertIn("--dry-run", self.window._command())
+        self.assertNotIn("--convert-no-gpu", self.window._command())
+
+    def test_checked_indicator_is_tick_and_output_has_event_colors(self):
+        self.assertEqual(self.window.live_check["style"], "Watcher.TCheckbutton")
+        style = gui.ttk.Style(self.root)
+        self.assertIn("Watcher.indicator", style.element_names())
+        unchecked, checked = self.window.check_images
+        self.assertEqual(unchecked.get(5, 9), (255, 255, 255))
+        self.assertEqual(checked.get(5, 9), (36, 92, 196))
+        self.assertEqual(checked.get(5, 5), (255, 255, 255))  # 左上角无斜线：不是原先的X图形。
+        self.assertEqual(checked.get(12, 6), (36, 92, 196))
+        self.window.events.put(("line", "Telemetry容错：单次超时20秒；瞬时失败重试\n"))
+        self.window.events.put(("line", "本人 GPU 占用 有（本轮弹窗）\n"))
+        self.window.events.put(("line", "连接断开，采集失败\n"))
+        self.window._drain()
+        self.assertNotIn("error", self.window.log.tag_names("1.0"))
+        self.assertIn("success", self.window.log.tag_names("2.0"))
+        self.assertIn("error", self.window.log.tag_names("3.0"))
+        self.assertEqual(self.window.log.tag_cget("success", "foreground"), "#79e69d")
+        self.assertEqual(self.window.log.tag_cget("error", "foreground"), "#ff8181")
+        self.assertEqual(self.window.log.cget("foreground"), "#e2e8f0")
 
     def test_background_output_stop_and_restart(self):
         code = ("import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); "

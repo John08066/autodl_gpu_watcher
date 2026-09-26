@@ -44,7 +44,7 @@
 
 ## Windows EXE、路径与后台日志
 
-- 适用版本v0.6.8～v0.6.9；核验日期2026-09-26；实际只读运行与本地打包验证，201完整有卡转换已实际通过；其他机型验证范围见电源与占用条目。
+- 适用版本v0.6.8～v0.6.10；核验日期2026-09-26；实际只读运行与本地打包验证，201完整有卡转换已实际通过；其他机型验证范围见电源与占用条目。
 
 - v0.6.9公开入口改为项目根目录 `AutoDLWatcher.exe`（v0.6.8在 `dist/AutoDLWatcher/AutoDLWatcher.exe`）（windowed PE）；内部 `_internal/AutoDLWorker.exe`（console PE）用CREATE_NO_WINDOW和stdin/stdout管道启动。windowed bootloader的标准流为None，不能直接当原Python `-m`入口使用。
 - GUI按frozen状态选后台命令；外部配置/runtime根目录由公开EXE目录决定，内部worker通过 `AUTODL_APP_ROOT` 使用同一目录，不能写到打包内部目录。
@@ -63,3 +63,17 @@
 - GUI管道/消息错误必须仍处理任务结束并继续事件调度；真实后台未结束前不允许另一个任务并发使用同一profile。证据：`collectors/platform.py`、`gui.py`、`login.py`、`main.py`及对应故障回归测试。
 - 实际验证：仅复制config到临时目录，以隔离空profile运行最终worker discover；真实跳转/login后输出invalid并退出1，无Traceback/PyInstaller异常，原会话不变。证据`runtime/validation/v0.6.9/no-session.txt`。正常会话核验成功只证明检查时刻有效，不能保证后续持续有效。
 - 集成验证：运行源码collector，注入一次与用户堆栈相同的响应体读取错误；真实只读machine/list新响应一次恢复，读取3个物理主机/5入口，电源操作0次。这是模拟故障＋真实只读恢复，不是自然复现；证据`runtime/validation/v0.6.9/response-recovery.json`。
+
+
+## 跨入口无卡额度释放与个人列表边界
+
+- 适用v0.6.10；核验日期2026-09-26。电源流程仅模拟测试，真实接口仅只读核验归属；本轮没有实际关机/开机。
+- 当前普通账号实际验证：POST `/api/v2/user/get`（空对象）返回data中的user_uuid/tenant_uuid；登录响应将is_admin/is_platform_admin存入localStorage的user，两者不在user/get中。普通 `/api/v2/instance/list` 返回个人实例且无owner字段；其他用户的7条GPU绑定UUID均未出现在个人列表。管理员前端另用 `platform_admin/v1/instance/list`，不能凭tenant_uuid认定实例属于本人。
+- 批量释放读取完整列表前核对API身份、浏览器身份和捕获tenant一致，并要求两个管理员标志严格false；管理员/缺失标志/身份错配阻断自动释放。仅当前普通账号范围已实际验证，不推断管理员列表的所有权语义。代码`collectors/platform.py:get_account_instances(require_personal_scope=True)`，证据`runtime/validation/v0.6.10/account-scope.json`；拒绝条件由`tests/test_collectors.py`模拟验证。
+- 目标空位与新鲜显存同INDEX达标后，关闭个人列表中其它running/non_gpu实例（含未配置入口），记录已发off集合并等待全部shutdown，再关原目标无卡实例或启动原已关机目标。有卡实例不关闭；响应丢失只读查询、不重复off/on。后来出现的新无卡实例必须重新核对目标容量；目标已发off但尚未shutdown时保持只读等待。最终on前再次核实原UUID、入口、shutdown及同主机本人GPU已空闲。代码`autostart.py`、`main.py`；模拟回归`tests/test_autostart.py`、`tests/test_monitor_loop.py`。
+- 其它无卡仍starting/shutting_down时，即使尚未发POST也必须保留pending_switch和事件；否则evaluator一次事件被消耗后不会再次释放。模拟复现并修复；starting/gpu只显示等待，running/gpu才报告运行。
+- 普通GUI默认真实开机和全账号无卡释放，`--debug`默认只读；启动GUI仅核验会话，仍须手动开始监控。统计开关通过`--no-usage-report`停止历史SQLite写入，不关闭必要占用核验；日志始终显示。代码`gui.py`、`main.py`；Tk及循环模拟测试验证，窗口1000x800保留。
+- Playwright的网络错误Call log会打印请求头，可能含Authorization；通用post_api_json将PlaywrightError转为固定安全说明并from None，避免因果堆栈泄露。没有增加电源重试。已核对本机Playwright driver源码，并用虚构令牌模拟传输/读体错误验证无泄露且每次仅发1请求；证据`tests/test_collectors.py:ApiTransportPrivacyTest`。
+- 模拟修复：目标原已shutdown、无需关闭其它实例时，仍必须在convert有卡开机POST前锁原目标和已发请求；否则响应丢失后缺席确认可能重新武装并重复on。成功响应后清锁，由主循环等待实际占用；失联只查询状态。证据`tests/test_autostart.py`的初始已关机目标开机失联回归。
+- 实际只读：新增require_personal_scope=True路径成功读取3个当前个人实例，identity API和浏览器身份校验均通过，接口白名单禁止电源请求。证据`runtime/validation/v0.6.10/personal-scope-guard.json`。
+- 最终验收：204项回归通过；两个EXE各19项目模块与最终源码匹配；无Python PATH读取5入口及三轮201只读采集通过，no-usage-report未创建历史数据库但实时占用核验正常。本轮电源0操作。证据`runtime/validation/v0.6.10/full-tests.txt`、`exe-source-match.json`、`discover.txt`、`monitor-no-reports.txt`；干净分发`dist/AutoDLWatcher-v0.6.10.zip`。

@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from autodl_watcher.config import load_config
-from autodl_watcher.gui import ROOT, SESSION_PREFIX, discover, log_tag, monitor_command, worker_command, worker_python
+from autodl_watcher.gui import ROOT, SESSION_PREFIX, discover, log_tag, monitor_command, worker_command, worker_python, main as gui_main
 from autodl_watcher.collectors.platform import PlatformAuthenticationError, PlatformTransientError
 from autodl_watcher.main import _build_parser, apply_monitor_options, main, positive_seconds
 
@@ -39,6 +39,35 @@ class GuiOptionsTest(unittest.TestCase):
         self.assertEqual(log_tag("开机成功 · connected"), "success")
         self.assertEqual(log_tag("本人占用待确认"), "normal")
         self.assertEqual(log_tag("登录会话已同步，等待核验"), "normal")
+
+    def test_log_colors_follow_events_instead_of_configuration_or_request_receipts(self):
+        cases = [("Telemetry容错：单次超时20秒；瞬时失败后等待2秒重试；每轮最多2次请求。", "normal"),
+                 ("连接平台，正在采集……", "normal"), ("开机请求成功受理；等待占用确认", "normal"),
+                 ("无卡关机请求成功受理", "normal"), ("验证成功后再恢复监控", "normal"),
+                 ("本人 GPU 占用 有（本轮弹窗）", "success"), ("预选入口=已占用203-1", "success"),
+                 ("本人 GPU 占用 无（实例列表）", "normal"), ("本人 GPU 占用 待确认", "normal"),
+                 ("本轮采集失败：Telemetry timeout", "error"), ("Telemetry请求超时，正在重试", "error"),
+                 ("二次确认未通过，暂停开机", "error"), ("结果：实例状态不允许开机", "error"),
+                 ("完整账号实例列表或关机前状态无法核对", "error"), ("账号列表中目标身份已变化，暂缓释放额度", "error"),
+                 ("暂停释放无卡实例", "error"), ("正在有卡启动，尚未确认运行或占用", "normal"),
+                 ("本人 GPU 占用 有 · GPU 占用弹窗采集失败", "error")]
+        for line, expected in cases:
+            with self.subTest(line=line):
+                self.assertEqual(log_tag(line), expected)
+
+    def test_gui_debug_option_reaches_window_without_starting_monitor(self):
+        with patch("sys.argv", ["AutoDLWatcher.exe", "--debug"]), patch("autodl_watcher.gui.tk.Tk") as tk_root, \
+                patch("autodl_watcher.gui.WatcherWindow") as window:
+            gui_main()
+            window.assert_called_once_with(tk_root.return_value, debug=True)
+            tk_root.return_value.mainloop.assert_called_once()
+
+    def test_disable_statistics_keeps_usage_safety_parameters(self):
+        command = monitor_command(self.config, "autodl-203-1", "user", 1, 2, True, Path("stop"), True, False)
+        self.assertIn("--no-usage-report", command)
+        self.assertIn("--usage-seconds", command)
+        self.assertIn("--convert-no-gpu", command)
+        self.assertNotIn("--no-usage-report", monitor_command(self.config, "autodl-203-1", "user", 1, 2, True, Path("stop"), True))
 
 
     def test_discover_reports_authentication_and_network_failures_distinctly(self):

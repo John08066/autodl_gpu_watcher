@@ -42,6 +42,46 @@ class MonitorLoopTest(unittest.TestCase):
             self.assertTrue((Path(directory) / "state.json").exists())
             self.assertTrue((Path(directory) / "occupancy.db").exists())
 
+    def test_disabled_usage_reports_keep_occupancy_checks_without_database(self):
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
+            with patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry, \
+                 patch("autodl_watcher.main.UsageSqliteLogger") as database:
+                platform.return_value.collect.return_value = [PlatformHost(
+                    "gpu-999", 0, 2, ("autodl-999-1",), (("autodl-999-1", 0, 2),))]
+                platform.return_value.collect_occupancy.return_value = []
+                telemetry.return_value.collect.return_value = [GpuSample(
+                    "gpu-999", 0, "Test GPU", 10, 1000, 32000, datetime.now())]
+                main(["--config", str(ROOT / "config.yaml"), "--host", "999", "--entry", "1",
+                      "--user", "测试用户", "--poll-seconds", "0.01", "--usage-seconds", "0.01",
+                      "--max-cycles", "2", "--runtime-dir", directory, "--dry-run", "--no-login",
+                      "--no-usage-report"])
+                database.assert_not_called()  # 关闭统计不能只隐藏按钮，必须停止建立历史数据库。
+                self.assertGreater(platform.return_value.collect_occupancy.call_count, 0)
+                platform.return_value.post_api_json.assert_not_called()
+            self.assertIn("占用统计与报表已关闭", output.getvalue())
+            self.assertFalse((Path(directory) / "occupancy.db").exists())
+            self.assertTrue((Path(directory) / "state.json").exists())
+
+    def test_disabled_usage_reports_still_block_unknown_ownership_in_live_mode(self):
+        config = self._conversion_config()
+        host = PlatformHost("gpu-203", 1, 2, ("autodl-203-1",), (("autodl-203-1", 1, 2),))
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            with patch("autodl_watcher.main.load_config", return_value=config), \
+                 patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry, \
+                 patch("autodl_watcher.main.UsageSqliteLogger") as database:
+                platform.return_value.collect.return_value = [host]
+                platform.return_value.collect_occupancy.side_effect = PlatformTransientError("occupancy timeout")
+                telemetry.return_value.collect.side_effect = lambda: [
+                    GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+                main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                      "--live", "--max-cycles", "2", "--runtime-dir", directory, "--no-login",
+                      "--no-usage-report"])
+                database.assert_not_called()
+                self.assertGreater(platform.return_value.collect_occupancy.call_count, 0)
+                platform.return_value.post_api_json.assert_not_called()
+
     def test_stop_during_cycle_skips_long_poll_wait(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
             stop = Path(directory) / "stop"
@@ -74,6 +114,18 @@ class MonitorLoopTest(unittest.TestCase):
                             min_idle_samples=1))
 
     @staticmethod
+    def _provide_account_snapshot(platform, target):  # 旧转换用例也提供真实接口现在必需的完整个人实例列表。
+        query = platform.get_instance_state.side_effect
+        snapshot = {}
+        def state(*args):
+            result = query(*args)
+            snapshot.update(result)
+            return result
+        platform.get_instance_state.side_effect = state
+        platform.get_account_instances.side_effect = lambda **_kwargs: [dict(
+            snapshot, instance_uuid=target.instance_uuid, machine_name=target.machine_name)]
+
+    @staticmethod
     def _one_free_gpu(machine_name):
         now = datetime.now()
         return [
@@ -82,6 +134,52 @@ class MonitorLoopTest(unittest.TestCase):
             OccupancyRecord(now, "gpu-203", machine_name, 1, "gpu-1", "Tesla V100",
                             True, "aaaaaaaaaa-bbbbbbbb", "other_user", "2026-09-25 00:00:00"),
         ]
+
+    def test_live_loop_releases_other_no_gpu_instances_before_starting_shutdown_target(self):
+        config = self._conversion_config()
+        first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
+        rows = [
+            {"instance_uuid": first.instance_uuid, "machine_name": first.machine_name,
+             "status": "shutdown", "start_mode": "non_gpu"},
+            {"instance_uuid": "1111111111-11111111", "machine_name": "autodl-201-1",
+             "status": "running", "start_mode": "non_gpu"},
+            {"instance_uuid": "2222222222-22222222", "machine_name": "autodl-204-1",
+             "status": "running", "start_mode": "non_gpu"},
+            {"instance_uuid": "3333333333-33333333", "machine_name": "autodl-202-2",
+             "status": "running", "start_mode": "gpu"}]
+        def state(uuid, name):
+            row = next(item for item in rows if item["instance_uuid"] == uuid and item["machine_name"] == name)
+            return dict(row, host_account_gpu_clear=row["status"] == "shutdown" or row["start_mode"] == "non_gpu")
+        def power(path, payload):
+            row = next(item for item in rows if item["instance_uuid"] == payload["instance_uuid"])
+            row["status"] = "shutdown" if path.endswith("power_off") else "running"
+            if path.endswith("power_on"):
+                self.assertTrue(all(item["status"] == "shutdown" for item in rows if item["start_mode"] == "non_gpu"))
+                row["start_mode"] = "gpu"
+            return {"code": "Success"}
+        host = PlatformHost("gpu-203", 1, 2, (first.machine_name, "autodl-203-2"),
+                            ((first.machine_name, 1, 2), ("autodl-203-2", 1, 2)))
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            with patch("autodl_watcher.main.load_config", return_value=config), \
+                 patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                platform.return_value.collect.return_value = [host]
+                platform.return_value.collect_occupancy.side_effect = lambda name, **_kw: self._one_free_gpu(name)
+                platform.return_value.get_instance_state.side_effect = state
+                platform.return_value.get_account_instances.side_effect = lambda **_kw: [dict(item) for item in rows]
+                platform.return_value.post_api_json.side_effect = power
+                telemetry.return_value.collect.side_effect = lambda: [
+                    GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+                main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                      "--live", "--convert-no-gpu", "--max-cycles", "4", "--runtime-dir", directory,
+                      "--no-login", "--no-usage-report"])
+                self.assertEqual(platform.return_value.post_api_json.call_args_list, [
+                    call("/api/v2/instance/power_off", {"instance_uuid": "1111111111-11111111", "release": "now"}),
+                    call("/api/v2/instance/power_off", {"instance_uuid": "2222222222-22222222", "release": "now"}),
+                    call("/api/v2/instance/power_on", {"instance_uuid": first.instance_uuid, "start_mode": "gpu"})])
+                self.assertTrue(any(item.kwargs.get("require_personal_scope") is True
+                                    for item in platform.return_value.get_account_instances.call_args_list))
+            self.assertFalse((Path(directory) / "occupancy.db").exists())
 
     def test_conversion_retries_after_transient_capacity_recheck_failure(self):
         config = self._conversion_config()
@@ -159,6 +257,7 @@ class MonitorLoopTest(unittest.TestCase):
                         platform.return_value.collect_occupancy.side_effect = (
                             lambda machine_name, **kwargs: self._one_free_gpu(machine_name))
                         platform.return_value.get_instance_state.side_effect = instance_state
+                        self._provide_account_snapshot(platform.return_value, first)
                         platform.return_value.post_api_json.side_effect = api_response
                         telemetry.return_value.collect.side_effect = lambda: [
                             GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
@@ -235,6 +334,7 @@ class MonitorLoopTest(unittest.TestCase):
                 platform.return_value.collect.return_value = [host]
                 platform.return_value.collect_occupancy.side_effect = collect_occupancy
                 platform.return_value.get_instance_state.side_effect = instance_state
+                self._provide_account_snapshot(platform.return_value, first)
                 platform.return_value.post_api_json.side_effect = api_response
                 telemetry.return_value.collect.side_effect = lambda: [
                     GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
@@ -323,6 +423,7 @@ class MonitorLoopTest(unittest.TestCase):
                         platform.return_value.collect.side_effect = collect_platform
                         platform.return_value.collect_occupancy.side_effect = collect_occupancy
                         platform.return_value.get_instance_state.side_effect = instance_state
+                        self._provide_account_snapshot(platform.return_value, first)
                         platform.return_value.post_api_json.side_effect = api_response
                         telemetry.return_value.collect.side_effect = lambda: [
                             GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
@@ -420,6 +521,7 @@ class MonitorLoopTest(unittest.TestCase):
                 platform.return_value.collect.return_value = [host]
                 platform.return_value.collect_occupancy.side_effect = collect_occupancy
                 platform.return_value.get_instance_state.side_effect = instance_state
+                self._provide_account_snapshot(platform.return_value, first)
                 platform.return_value.post_api_json.side_effect = api_response
                 telemetry.return_value.collect.side_effect = collect_telemetry
                 main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",

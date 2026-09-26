@@ -36,16 +36,24 @@ def worker_command(task, *args):  # 源码使用当前 Python；发布版使用�
     return [worker_python(), "-u", "-m", module, *(["--discover"] if task == "discover" else []), *args]
 
 
-def log_tag(line):  # 失败优先识别，避免“开机成功验证失败”被误标为成功。
-    lowered = line.lower()
-    if any(word in lowered for word in ("失败", "断连", "断开", "异常", "错误", "error", "traceback", "timeout", "失效", "额度不足", "拒绝")):
+def log_tag(line):  # 配置说明不是故障；实际失败优先于同一行的成功或占用信息。
+    lowered = line.strip().lower()
+    if lowered.startswith("telemetry容错："):
+        return "normal"
+    if any(word in lowered for word in ("失败", "断连", "断开", "异常", "错误", "error", "traceback", "timeout", "超时", "未通过", "失效", "额度不足", "拒绝", "暂时不可用",
+                                        "不允许开机", "无法核对", "暂缓释放额度", "暂停释放无卡实例")):
         return "error"
-    if any(word in lowered for word in ("成功", "已开机", "已连接", "连接正常", "会话有效", "采集恢复")):
+    if "受理" in lowered or "验证成功后" in lowered:
+        return "normal"  # 电源请求受理不等于实例已占用GPU。
+    if any(word in lowered for word in ("已开机", "已连接", "连接正常", "会话有效", "采集恢复", "已占用", "有卡运行",
+                                        "本人 gpu 占用 有", "本人gpu占用 有", "本人占用 有")):
+        return "success"
+    if "成功" in lowered:
         return "success"
     return "normal"
 
 
-def monitor_command(config, entry, user, poll, usage, live, stop_file, convert_no_gpu=False):  # 构造与 CLI 相同的监控命令。
+def monitor_command(config, entry, user, poll, usage, live, stop_file, convert_no_gpu=False, usage_tracking=True):  # 构造与 CLI 相同的监控命令。
     from .cli import normalize_host
     if not entry:  # 没选入口就拒绝启动，避免误用命令行默认主机。
         raise ValueError("请先选择服务器入口")
@@ -62,11 +70,11 @@ def monitor_command(config, entry, user, poll, usage, live, stop_file, convert_n
             "--host", normalize_host(entry), "--entry", entry, "--user", user.strip(),
             "--poll-seconds", str(poll), "--usage-seconds", str(usage),
             "--live" if live else "--dry-run", "--no-login", "--stop-file", str(stop_file))  # 参数列表直接传给进程，不经 shell 拼接。
-    return command + (["--convert-no-gpu"] if convert_no_gpu else [])
+    return command + (["--convert-no-gpu"] if convert_no_gpu else []) + ([] if usage_tracking else ["--no-usage-report"])
 
 
 class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main.run_monitor 执行。
-    def __init__(self, root):  # 先读基础配置和本地偏好，再创建控件与消息轮询。
+    def __init__(self, root, debug=False):  # 先读基础配置和本地偏好，再创建控件与消息轮询。
         self.root = root  # Tk 主窗口及事件循环的拥有者，子线程不直接操作它。
         self.config = load_config(ROOT / "config.yaml")  # YAML 提供目标实例、阈值、浏览器资料和运行路径。
         self.local = ROOT / ".ui"  # 不纳入 Git 的个人偏好、停止信号和启动日志目录。
@@ -79,9 +87,10 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         self.user = tk.StringVar(value=self.config.usage_tracking.self_user)  # StringVar 将输入框内容与 Python 变量绑定。
         self.poll = tk.StringVar(value=str(self.config.monitor.poll_seconds))
         self.usage = tk.StringVar(value=str(self.config.usage_tracking.interval_seconds))
-        self.live = tk.BooleanVar(value=False)  # 每次开窗都默认只读，不从历史偏好恢复付费开机开关。
-        self.convert_no_gpu = tk.BooleanVar(value=False)  # 关机切换每次也需显式选择，不保存为偏好。
-        self.auxiliary = tk.BooleanVar(value=True)  # 默认显示实时日志，让用户直接确认后台是否仍在监控。
+        self.debug = debug  # 普通模式按用户要求真实开机；显式调试模式只读，打开窗口仍不会自动监控。
+        self.live = tk.BooleanVar(value=not debug)
+        self.convert_no_gpu = tk.BooleanVar(value=not debug)
+        self.usage_tracking = tk.BooleanVar(value=True)  # 只控制历史统计与报表，不关闭开机所需占用核验。
         self.status = tk.StringVar(value="未运行 · 选择入口后开始监控")
         self.session_status = "unknown"
         self.session_message = "登录会话尚未核验"
@@ -95,6 +104,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
                 self.poll.set(saved.get("poll", self.poll.get()))
                 self.usage.set(saved.get("usage", self.usage.get()))
                 self.saved_entry = saved.get("entry", "")
+                self.usage_tracking.set(saved.get("usage_tracking", True))
             except (ValueError, OSError, AttributeError):
                 self.status.set("本地偏好读取失败，已使用默认配置")
         self._build()
@@ -113,6 +123,20 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         style.configure("Treeview", rowheight=32, font=("Microsoft YaHei UI", 10))
         style.configure("TButton", padding=(12, 7))
         style.configure("Title.TLabel", font=("Microsoft YaHei UI", 20, "bold"))
+        self.check_images = []  # Tk不会持有Python图片引用；保留它们，防止勾选标记被回收。
+        for selected in (False, True):
+            indicator = tk.PhotoImage(master=self.root, width=16, height=16)
+            indicator.put("#ffffff", to=(1, 1, 15, 15))
+            for border in ((1, 1, 15, 2), (1, 14, 15, 15), (1, 1, 2, 15), (14, 1, 15, 15)):
+                indicator.put("#727272", to=border)
+            if selected:
+                for x, y in ((4, 8), (5, 9), (6, 10), (7, 11), (8, 10), (9, 9), (10, 8), (11, 7), (12, 6), (12, 5)):
+                    indicator.put("#245cc4", to=(x, y, x + 2, y + 2))  # 画✓，替换clam主题默认的X。
+            self.check_images.append(indicator)
+        style.element_create("Watcher.indicator", "image", self.check_images[0], ("selected", self.check_images[1]))
+        style.layout("Watcher.TCheckbutton", [("Checkbutton.padding", {"sticky": "nswe", "children": [
+            ("Watcher.indicator", {"side": "left", "sticky": ""}),
+            ("Checkbutton.focus", {"side": "left", "sticky": "w", "children": [("Checkbutton.label", {"sticky": "nswe"})]})]})])
         frame = ttk.Frame(self.root, padding=20)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="AutoDL GPU Watcher", style="Title.TLabel").pack(anchor="w")
@@ -147,13 +171,14 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
             entry.grid(row=1, column=col, sticky="ew", padx=5, pady=5)
             options.columnconfigure(col, weight=1)
             self.inputs.append(entry)
-        self.live_check = ttk.Checkbutton(options, text="启用真实自动开机（会产生 AutoDL 费用）", variable=self.live)
+        self.live_check = ttk.Checkbutton(options, text="启用真实自动开机（会产生 AutoDL 费用）", variable=self.live, style="Watcher.TCheckbutton",
+                                          command=lambda: self.convert_no_gpu.set(False) if not self.live.get() else None)
         self.live_check.grid(row=2, column=0, columnspan=3, sticky="w", padx=5, pady=5)
-        self.convert_check = ttk.Checkbutton(options, text="空闲时将所选无卡实例关机并改为有卡开机（会中断实例）", variable=self.convert_no_gpu)
+        self.convert_check = ttk.Checkbutton(options, text="空闲达标时关闭本账号全部无卡实例，再有卡开机（会中断其他实例）", variable=self.convert_no_gpu, style="Watcher.TCheckbutton")
         self.convert_check.grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=5)
-        self.auxiliary_check = ttk.Checkbutton(options, text="显示辅助工具（运行日志与占用报表）",
-                                                variable=self.auxiliary, command=self._toggle_auxiliary)
-        self.auxiliary_check.grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+        self.usage_check = ttk.Checkbutton(options, text="启用占用统计与报表（实时监控输出始终显示）",
+                                            variable=self.usage_tracking, command=self._toggle_usage, style="Watcher.TCheckbutton")
+        self.usage_check.grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=5)
         controls = ttk.Frame(frame)
         controls.pack(fill="x", pady=8)
         self.start_button = ttk.Button(controls, text="开始监控", command=self.start)
@@ -168,15 +193,14 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
                                 background="#17202e", foreground="#e2e8f0", padx=10, pady=10)
         self.log.tag_configure("success", foreground="#79e69d")
         self.log.tag_configure("error", foreground="#ff8181")
-        self._toggle_auxiliary()
+        self.log.pack(fill="both", expand=True)  # 日志与统计开关独立，关闭统计也能确认监控运行。
+        self._toggle_usage()
 
-    def _toggle_auxiliary(self):  # 用户可收起日志与报表，核心文件日志不受此开关影响。
-        if self.auxiliary.get():
+    def _toggle_usage(self):  # 统计停用只隐藏历史报表入口。
+        if self.usage_tracking.get():
             self.export_button.pack(side="right")
-            self.log.pack(fill="both", expand=True)
         else:
             self.export_button.pack_forget()
-            self.log.pack_forget()
 
     def _populate(self, rows):  # rows 中每项为 (入口名, 空闲/总数文本, 开机配置状态)。
         selected = self.selected_entry() or self.saved_entry  # 刷新时优先保留本次选择，其次恢复上次保存的入口。
@@ -193,17 +217,17 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
 
     def _command(self):  # 从控件快照生成启动参数；不改写受 Git 管理的 YAML。
         return monitor_command(self.config, self.selected_entry(), self.user.get(), self.poll.get(),
-                               self.usage.get(), self.live.get(), self.stop_file, self.convert_no_gpu.get())
+                               self.usage.get(), self.live.get(), self.stop_file, self.convert_no_gpu.get(), self.usage_tracking.get())
 
     def save(self):  # 保存输入前复用启动校验，避免把明显无效的设置留到下次。
         try:
             self._command()
             preferences = {"entry": self.selected_entry(), "user": self.user.get().strip(),
-                           "poll": self.poll.get(), "usage": self.usage.get()}
+                           "poll": self.poll.get(), "usage": self.usage.get(), "usage_tracking": self.usage_tracking.get()}
             temp = self.local / "preferences.tmp"
             temp.write_text(json.dumps(preferences, ensure_ascii=False, indent=2), encoding="utf-8")
             temp.replace(self.local / "preferences.json")  # 临时文件写完整后替换，降低中断产生半份 JSON 的风险。
-            self.status.set("设置已保存 · 下次启动仍默认只读模式")
+            self.status.set("设置已保存 · 调试模式默认只读" if self.debug else "设置已保存 · 普通模式默认真实开机")
             return True
         except (ValueError, argparse.ArgumentTypeError, OSError) as exc:
             messagebox.showerror("设置无效", str(exc), parent=self.root)
@@ -211,7 +235,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
 
     def _busy(self, value):  # 统一切换操作权限；监控时能停止，登录时能确认同步。
         for button in [self.refresh_button, self.login_button, self.start_button, self.save_button,
-                       self.export_button, self.live_check, self.convert_check, self.auxiliary_check, *self.inputs]:
+                       self.export_button, self.live_check, self.convert_check, self.usage_check, *self.inputs]:
             button.configure(state="disabled" if value else "normal")
         self.stop_button.configure(state="normal" if value and self.job == "monitor" else "disabled")
         self.login_done.configure(state="normal" if value and self.job == "login" else "disabled")
@@ -304,13 +328,12 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
                         if value.startswith("WATCHER_STATUS "):
                             value = value.removeprefix("WATCHER_STATUS ")
                             self.status.set(value.strip())
-                        if self.auxiliary.get():
-                            self.log.configure(state="normal")
-                            self.log.insert("end", value, log_tag(value))
-                            if int(self.log.index("end-1c").split(".")[0]) > 2000:
-                                self.log.delete("1.0", "201.0")
-                            self.log.see("end")
-                            self.log.configure(state="disabled")
+                        self.log.configure(state="normal")
+                        self.log.insert("end", value, log_tag(value))
+                        if int(self.log.index("end-1c").split(".")[0]) > 2000:
+                            self.log.delete("1.0", "201.0")
+                        self.log.see("end")
+                        self.log.configure(state="disabled")
                 except Exception as exc:
                     self.status.set(f"后台消息处理失败：{exc}")
         finally:
@@ -387,8 +410,11 @@ def main():  # 同一模块既可作为桌面入口，也可作为无界面的�
     if "--discover" in sys.argv:
         discover()
         return
+    parser = argparse.ArgumentParser(description="AutoDL GPU Watcher 图形界面")
+    parser.add_argument("--debug", action="store_true", help="调试开发模式，默认只读且不切换无卡实例")
+    args = parser.parse_args()
     root = tk.Tk()
-    WatcherWindow(root)
+    WatcherWindow(root, debug=args.debug)
     root.mainloop()  # Tk 处理用户输入、重绘和 after 回调，直到窗口被销毁。
 
 

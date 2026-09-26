@@ -914,3 +914,75 @@ class InstanceStateCollectorTest(unittest.TestCase):
                     collector.get_instance_state("target", "autodl-203-1")
                 collector.post_api_json.assert_not_called()
                 page.close.assert_called_once()
+
+
+class PersonalInstanceScopeTest(unittest.TestCase):  # 跨入口关机前必须核对身份和普通个人列表边界。
+    def _collector(self, identity=None, browser=None):
+        collector = PlatformBrowserCollector(PlatformClassificationV052Test._config())
+        collector.start = Mock()
+        collector._context = Mock()
+        collector._page = Mock()
+        collector._instance_tenant_uuid = "tenant-123"
+        expected = {"tenant_uuid": "tenant-123", "user_uuid": "user-123"}
+        collector._page.evaluate.return_value = (dict(expected, is_admin=False, is_platform_admin=False)
+                                                 if browser is None else browser)
+        collector.post_api_json = Mock(side_effect=[
+            {"code": "Success", "data": expected if identity is None else identity},
+            {"code": "Success", "data": {"list": [], "result_total": 0}}])
+        return collector
+
+    def test_personal_scope_verified_before_instance_list(self):
+        collector = self._collector()
+        self.assertEqual(collector.get_account_instances(require_personal_scope=True), [])
+        self.assertEqual([args.args[0] for args in collector.post_api_json.call_args_list],
+                         ["/api/v2/user/get", "/api/v2/instance/list"])
+
+    def test_unknown_admin_or_mismatched_identity_blocks_personal_list(self):
+        identity = {"tenant_uuid": "tenant-123", "user_uuid": "user-123"}
+        variants = [None, {}, dict(identity, is_admin=True, is_platform_admin=False),
+                    dict(identity, is_admin=False, is_platform_admin=True),
+                    dict(identity, is_admin=0, is_platform_admin=False),
+                    dict(identity, tenant_uuid="other-tenant", is_admin=False, is_platform_admin=False),
+                    dict(identity, user_uuid="other-user", is_admin=False, is_platform_admin=False)]
+        for browser in variants:
+            with self.subTest(browser=browser):
+                collector = self._collector()
+                collector._page.evaluate.return_value = browser
+                with self.assertRaises(PlatformTransientError):
+                    collector.get_account_instances(require_personal_scope=True)
+                self.assertEqual(collector.post_api_json.call_count, 1)
+
+    def test_missing_or_mismatched_api_identity_blocks_list(self):
+        for identity in ({}, {"tenant_uuid": "wrong", "user_uuid": "user-123"},
+                         {"tenant_uuid": "tenant-123", "user_uuid": ""}):
+            with self.subTest(identity=identity):
+                collector = self._collector(identity=identity)
+                with self.assertRaises(PlatformTransientError):
+                    collector.get_account_instances(require_personal_scope=True)
+                self.assertEqual(collector.post_api_json.call_count, 1)
+
+
+class ApiTransportPrivacyTest(unittest.TestCase):
+    def test_power_transport_errors_hide_authorization_without_retry(self):
+        import traceback
+        from playwright.sync_api import Error
+        for path in ("/api/v2/instance/power_off", "/api/v2/instance/power_on"):
+            for location in ("post", "json"):
+                with self.subTest(path=path, location=location):
+                    collector = PlatformBrowserCollector(PlatformClassificationV052Test._config())
+                    collector.start = Mock()
+                    collector._authorization = "Bearer TEST_PRIVATE_MARKER"
+                    collector._context = Mock()
+                    failure = Error("APIRequestContext.post: timeout\nCall log: Authorization: Bearer TEST_PRIVATE_MARKER")
+                    if location == "post":
+                        collector._context.request.post.side_effect = failure
+                    else:
+                        response = collector._context.request.post.return_value
+                        response.status, response.ok = 200, True
+                        response.json.side_effect = failure
+                    with self.assertRaises(PlatformTransientError) as caught:
+                        collector.post_api_json(path, {"instance_uuid": "target"})
+                    output = "".join(traceback.format_exception(caught.exception))
+                    self.assertNotIn("TEST_PRIVATE_MARKER", output)
+                    self.assertIn("结果未确认", output)
+                    collector._context.request.post.assert_called_once()  # 电源请求超时可能已执行，不能为修日志而重试。

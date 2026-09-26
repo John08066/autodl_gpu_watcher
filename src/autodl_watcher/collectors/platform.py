@@ -388,27 +388,30 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
             raise PlatformTransientError( "当前页面未捕获到 Authorization；没有 401/403 或 /login 证据，" "本轮不按登录失效处理。" )
 
         url = f"{self.config.api_base_url.rstrip('/')}/{path.lstrip('/')}"
-        response = self._context.request.post(
-            url,
-            data=payload,
-            headers={
-                "Accept": "application/json, text/plain, */*",
-                "Authorization": self._authorization,
-                "Origin": self.config.api_base_url.rstrip('/'),
-                "Referer": self.config.page_url,
-            },
-            timeout=self.config.response_timeout_seconds * 1000,
-        )
-        if response.status == 401 or response.status == 403:
-            raise PlatformAuthenticationError( f"AutoDL API 返回 HTTP {response.status}；登录会话可能已失效。" )
-        if not response.ok:
-            raise RuntimeError(f"AutoDL API {path} returned HTTP {response.status}")
-        payload_json = response.json()
+        try:
+            response = self._context.request.post(
+                url,
+                data=payload,
+                headers={
+                    "Accept": "application/json, text/plain, */*",
+                    "Authorization": self._authorization,
+                    "Origin": self.config.api_base_url.rstrip('/'),
+                    "Referer": self.config.page_url,
+                },
+                timeout=self.config.response_timeout_seconds * 1000,
+            )
+            if response.status == 401 or response.status == 403:
+                raise PlatformAuthenticationError( f"AutoDL API 返回 HTTP {response.status}；登录会话可能已失效。" )
+            if not response.ok:
+                raise RuntimeError(f"AutoDL API {path} returned HTTP {response.status}")
+            payload_json = response.json()
+        except PlaywrightError:
+            raise PlatformTransientError(f"AutoDL API {path} 传输或响应读取失败，结果未确认") from None  # 原始Call log可能含Authorization；电源请求不重试。
         if not isinstance(payload_json, dict):
             raise RuntimeError(f"AutoDL API {path} returned non-object JSON")
         return payload_json
 
-    def get_account_instances(self) -> list[dict[str, Any]]:  # 读取当前账号完整实例列表；只有全部分页一致且 UUID 唯一才返回。
+    def get_account_instances(self, *, require_personal_scope: bool = False) -> list[dict[str, Any]]:  # 读取当前账号完整实例列表；只有全部分页一致且 UUID 唯一才返回。
         self.start()
         assert self._context is not None
         if self._instance_tenant_uuid is None:
@@ -438,6 +441,27 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
             if not isinstance(tenant_uuid, str) or not tenant_uuid.strip():
                 raise PlatformTransientError("实例列表请求缺少 tenant_uuid")
             self._instance_tenant_uuid = tenant_uuid
+
+        if require_personal_scope:  # 批量关机扩大了操作范围，不能单凭租户ID认定全部实例属于本人。
+            identity_response = self.post_api_json("/api/v2/user/get", {})
+            identity = identity_response.get("data")
+            if identity_response.get("code") != "Success" or not isinstance(identity, dict):
+                raise PlatformTransientError("无法核验当前账号身份，暂停释放无卡实例")
+            user_uuid, tenant_uuid = identity.get("user_uuid"), identity.get("tenant_uuid")
+            if not isinstance(user_uuid, str) or not user_uuid.strip() or tenant_uuid != self._instance_tenant_uuid:
+                raise PlatformTransientError("当前身份与实例列表租户不一致，暂停释放无卡实例")
+            if self._page is None:
+                raise PlatformTransientError("无法核对浏览器账号身份，暂停释放无卡实例")
+            browser_user = self._page.evaluate("""() => {
+                const u = JSON.parse(localStorage.getItem('user') || 'null');
+                return u && {user_uuid:u.user_uuid, tenant_uuid:u.tenant_uuid,
+                    is_admin:u.is_admin, is_platform_admin:u.is_platform_admin};
+            }""")  # 只读取身份和权限字段，不把本地存储凭据带到日志或笔记。
+            if (not isinstance(browser_user, dict) or browser_user.get("user_uuid") != user_uuid
+                    or browser_user.get("tenant_uuid") != tenant_uuid
+                    or browser_user.get("is_admin") is not False
+                    or browser_user.get("is_platform_admin") is not False):
+                raise PlatformTransientError("未确认普通个人实例列表归属，暂停释放无卡实例")
 
         page_size = 10  # 与官网实例列表默认分页一致；逐页核对后才允许认定目标状态。
         total: int | None = None
