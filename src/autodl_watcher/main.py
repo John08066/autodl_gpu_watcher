@@ -66,23 +66,29 @@ def _green_terminal_text(text: str) -> str:  # 仅在交互式终端中为文本
 
 
 _INSTANCE_UUID = re.compile(r"[0-9a-fA-F]{10}-[0-9a-fA-F]{8}")
-_OCCUPANCY_ID_LINE = re.compile(r"([0-9a-fA-F]{10}-[0-9a-fA-F]{8})(?:[ \t]*\([^()\r\n]*\))?")
+_OCCUPANCY_ID_LINE = re.compile(
+    r"([0-9a-fA-F]{10}-[0-9a-fA-F]{8})(?:[ \t]*(?:\((.*)\)|（(.*)）))?")
 
 
-def _instance_ids_from_cell(value: str) -> tuple[list[str], bool]:  # 每行必须是完整 ID，可附括号标签；畸形片段不能证明本人缺席。
+def _instance_bindings_from_cell(value: str) -> tuple[list[tuple[str, str]], bool]:  # 名字仅用于显示，归属仍核验完整 UUID。
     if not isinstance(value, str):
         return [], False
-    ids: list[str] = []
+    bindings: list[tuple[str, str]] = []
     complete = True
     for line in value.splitlines():
         if not line.strip():
             continue
         match = _OCCUPANCY_ID_LINE.fullmatch(line.strip())
         if match is None:
-            complete = False
+            complete = False  # 畸形或截断 ID 不能证明本人缺席。
         else:
-            ids.append(match.group(1).lower())
-    return ids, complete and bool(ids)
+            name = (match.group(2) or match.group(3) or "").strip()
+            bindings.append((match.group(1).lower(), "" if name in {"-", "—"} else name))
+    return bindings, complete and bool(bindings)
+
+
+def _occupancy_display_name(item) -> str:  # 昵称与 user 身份字段分开，缺名时不把 UUID 填回界面。
+    return item.display_name or "用户名未知"
 
 
 @dataclass(frozen=True, slots=True)
@@ -716,7 +722,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     config.usage_tracking.enabled and time.monotonic() >= next_usage_capture and usage_targets
                 ):
                     raw_occupancy = []  # 每轮重新收集原始入口视图，不把上一轮记录当作本轮证据。
-                    entry_summaries: list[str] = []
+                    entry_summaries: dict[str, str] = {}
                     failed_entries: list[str] = []
                     fast_absence_recheck = False
                     slot_map = (
@@ -728,7 +734,6 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                         if stop_requested():
                             break
                         entry_name = usage_target.machine_name
-                        short_name = entry_name.removeprefix("autodl-")
                         expected_idle = None
                         expected_total = None
                         if entry_name in slot_map:
@@ -741,16 +746,12 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                                 expected_gpu_indices=_fresh_gpu_indices(
                                     selected_gpu_samples, datetime.now(), config.monitor.stale_after_seconds),
                             )
-                            raw_occupancy.extend(entry_records)
-                            occupied_text = ",".join(
-                                f"#{item.gpu_index}:{item.user or '-'}"
-                                for item in entry_records
-                                if item.occupied
-                            ) or "无"
-                            entry_summaries.append(f"{short_name}[{occupied_text}]")
+                            raw_occupancy.extend(replace(item, display_name=item.display_name or item.user)
+                                                 for item in entry_records)  # 旧七列用户名保留为展示名。
+                            entry_summaries[entry_name] = ""  # 拆分多实例后再生成带名字的入口摘要。
                         except Exception as entry_exc:
-                            failed_entries.append(f"{short_name}:{entry_exc}")
-                            entry_summaries.append(f"{short_name}[采集失败]")
+                            failed_entries.append(f"{entry_name.removeprefix('autodl-')}:{entry_exc}")
+                            entry_summaries[entry_name] = "采集失败"
                             logger.exception(
                                 "occupancy entry capture failed host=%s entry=%s",
                                 selected_host,
@@ -762,12 +763,12 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     last_occupancy_failed = bool(failed_entries)
                     unknown_rows = [item for item in raw_occupancy if item.occupied and not item.user.strip()]
                     identity_unresolved_now = False
-                    if unknown_rows:  # 新版六列弹窗无用户名，只能用完整账号实例列表的精确 UUID 归属。
+                    if unknown_rows:  # 六列括号名不是身份证据，仍查询完整账号 UUID 列表。
+                        account_ids: set[str] = set()
                         try:
                             account_rows = platform_collector.get_account_instances()
                             if not isinstance(account_rows, list):
                                 raise PlatformTransientError("账号实例列表不完整")
-                            account_ids: set[str] = set()
                             for row in account_rows:
                                 instance_id = row.get("instance_uuid") if isinstance(row, dict) else None
                                 if not isinstance(instance_id, str) or not _INSTANCE_UUID.fullmatch(instance_id):
@@ -775,26 +776,27 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                                 if instance_id.lower() in account_ids:
                                     raise PlatformTransientError("账号实例列表有重复 UUID")
                                 account_ids.add(instance_id.lower())
-                            identity_label = self_user or "当前账号"
-                            resolved_occupancy = []
-                            for item in raw_occupancy:
-                                if not item.occupied or item.user.strip():  # 旧版七列的明确用户名继续沿用。
-                                    resolved_occupancy.append(item)
-                                    continue
-                                instance_ids, complete_ids = _instance_ids_from_cell(item.instance_id)
-                                for instance_id in instance_ids:
-                                    resolved_occupancy.append(replace(
-                                        item, instance_id=instance_id,
-                                        user=identity_label if instance_id in account_ids else ""))
-                                if not complete_ids:  # 保留原始畸形单元格供日志审计，并阻断缺席判定。
-                                    identity_unresolved_now = True
-                                    resolved_occupancy.append(item)
-                            raw_occupancy = resolved_occupancy
                         except PlatformAuthenticationError:
                             raise
                         except Exception as exc:
+                            account_ids.clear()  # 部分列表不参与本人归属判断。
                             identity_unresolved_now = True
                             logger.warning("occupancy identity query failed host=%s: %s", selected_host, exc)
+                        identity_label = self_user or "当前账号"
+                        resolved_occupancy = []
+                        for item in raw_occupancy:
+                            if not item.occupied or item.user.strip():  # 旧版七列的明确用户名继续沿用。
+                                resolved_occupancy.append(item)
+                                continue
+                            bindings, complete_ids = _instance_bindings_from_cell(item.instance_id)
+                            for instance_id, display_name in bindings:
+                                resolved_occupancy.append(replace(
+                                    item, instance_id=instance_id, display_name=display_name,
+                                    user=identity_label if instance_id in account_ids else ""))
+                            if not complete_ids:  # 原始畸形单元格保留供核验，但不向终端输出 ID。
+                                identity_unresolved_now = True
+                                resolved_occupancy.append(item)
+                        raw_occupancy = resolved_occupancy
                     if identity_unresolved_now:
                         occupancy_identity_unresolved = True
                     try:  # 先判定本人状态，再决定该轮是否允许 SQLite 生成 END_SEEN。 第一次可靠空快照只是“疑似结束”，不会立即关掉 current_instances。
@@ -831,10 +833,9 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                             pending_start_machine = ""
                         elif complete_occupancy_snapshot:
                             if fast_absence_recheck:
-                                entry_summaries.append(
-                                    f"本人状态[疑似结束 {absence_confirmations}/"
-                                    f"{config.usage_tracking.absent_confirmations_required}，待复核]"
-                                )
+                                entry_summaries["本人状态"] = (
+                                    f"疑似结束 {absence_confirmations}/"
+                                    f"{config.usage_tracking.absent_confirmations_required}，待复核")
 
                             if confirmed_absence:  # 连续可靠空快照达到门槛后，才能解除本人占用状态。
                                 if account_occupancy_conflict:
@@ -884,14 +885,21 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                         gpu_rows = aggregate_gpu_occupants(raw_occupancy)
 
                         instance_text = ",".join(
-                            f"#{item.gpu_index}:{item.user or '-'}({item.instance_id})"
+                            f"{item.machine_name.replace('autodl-', '')}#{item.gpu_index}:{_occupancy_display_name(item)}"
                             for item in instance_records
                         ) or "无"
                         gpu_text = ",".join(
                             f"#{row['gpu_index']}:{row['occupant_count']}人"
                             for row in gpu_rows
                         ) or "无"
-                        summary_text = "; ".join(entry_summaries) or "无数据"
+                        for entry, error in entry_summaries.items():
+                            if not error:
+                                entry_summaries[entry] = ",".join(
+                                    f"#{item.gpu_index}:{_occupancy_display_name(item)}"
+                                    for item in raw_occupancy if item.machine_name == entry and item.occupied) or "无"
+                        summary_text = "; ".join(
+                            f"{entry.removeprefix('autodl-')}[{text}]"
+                            for entry, text in entry_summaries.items()) or "无数据"
                         occupancy_line = (
                             f"[{datetime.now():%H:%M:%S}] 占用快照 | "
                             f"{summary_text} | "

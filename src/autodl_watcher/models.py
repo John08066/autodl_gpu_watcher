@@ -82,3 +82,4 @@ class OccupancyRecord:  # 某个 AutoDL 入口内一张 GPU 的占用详情。
     instance_id: str          # 实例 ID
     user: str                 # 使用者标识
     started_at_text: str      # 任务启动时间的原始字符串
+    display_name: str = ""   # 网页展示名字，不作为本人归属或实例身份依据。

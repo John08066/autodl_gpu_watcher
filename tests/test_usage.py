@@ -196,3 +196,61 @@ class UsagePartialSnapshotV050Test(unittest.TestCase):
             )
             self.assertEqual([e["event"] for e in events], ["END_SEEN"])
             self.assertEqual(logger.current_instances(), [])
+
+
+class UsageDisplayNameTest(unittest.TestCase):
+    def test_same_display_name_keeps_distinct_instances_and_identity(self) -> None:
+        now = datetime(2026, 9, 26, 20, 0)
+        records = [
+            OccupancyRecord(now, "gpu-203", "autodl-203-1", 0, "uuid0", "V100", True,
+                            "instance-a", "", "", display_name="同名用户"),
+            OccupancyRecord(now, "gpu-203", "autodl-203-1", 0, "uuid0", "V100", True,
+                            "instance-b", "", "", display_name="同名用户"),
+        ]
+        merged = merge_duplicate_instances(records)
+        self.assertEqual(len(merged), 2)
+        self.assertEqual({item.instance_id for item in merged}, {"instance-a", "instance-b"})
+        self.assertTrue(all(item.user == "" for item in merged))
+        row = aggregate_gpu_occupants(records)[0]
+        self.assertEqual(row["occupant_count"], 2)
+        self.assertEqual(row["active_users"], '["同名用户"]')
+
+    def test_latest_duplicate_keeps_display_name_and_verified_user(self) -> None:
+        now = datetime(2026, 9, 26, 20, 0)
+        records = [
+            OccupancyRecord(now, "gpu-203", "autodl-203-1", 0, "uuid0", "V100", True,
+                            "same-instance", "verified-owner", "", display_name="旧名字"),
+            OccupancyRecord(now + timedelta(seconds=1), "gpu-203", "autodl-203-2", 0,
+                            "uuid0", "V100", True, "same-instance", "verified-owner", "",
+                            display_name="新名字"),
+        ]
+        merged = merge_duplicate_instances(records)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].display_name, "新名字")
+        self.assertEqual(merged[0].user, "verified-owner")
+        self.assertEqual(merged[0].machine_name, "autodl-203-1|autodl-203-2")
+        self.assertEqual(aggregate_gpu_occupants(records)[0]["occupant_count"], 1)
+
+    def test_display_names_do_not_replace_sqlite_identity_fields(self) -> None:
+        now = datetime(2026, 9, 26, 20, 0)
+        records = [
+            OccupancyRecord(now, "gpu-203", "autodl-203-1", 0, "uuid0", "V100", True,
+                            "other-instance", "", "", display_name="外部用户"),
+            OccupancyRecord(now, "gpu-203", "autodl-203-2", 0, "uuid0", "V100", True,
+                            "own-instance", "verified-owner", ""),
+        ]
+        self.assertEqual(records[1].display_name, "")
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "occupancy.db"
+            UsageSqliteLogger(database).record(records)
+            conn = sqlite3.connect(database)
+            try:
+                entries = conn.execute("SELECT instance_id, user FROM entry_snapshots ORDER BY instance_id").fetchall()
+                instances = conn.execute("SELECT instance_id, user FROM instance_snapshots ORDER BY instance_id").fetchall()
+                active_users = conn.execute("SELECT active_users FROM gpu_snapshots").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(entries, [("other-instance", ""), ("own-instance", "verified-owner")])
+            self.assertEqual(instances, entries)
+            self.assertIn("外部用户", active_users)
+            self.assertIn("verified-owner", active_users)

@@ -90,6 +90,7 @@ def merge_duplicate_instances(records: list[OccupancyRecord]) -> list[OccupancyR
                 instance_id=chosen.instance_id,
                 user=chosen.user,
                 started_at_text=chosen.started_at_text,
+                display_name=chosen.display_name,
             )
         )
     return merged
@@ -127,7 +128,7 @@ def aggregate_gpu_occupants(records: list[OccupancyRecord]) -> list[dict[str, An
                 "gpu_name": meta.gpu_name,
                 "occupant_count": len(occupants),  # 这里统计去重后的实例数，未必等于唯一用户名数量。
                 "active_users": json.dumps(
-                    sorted({item.user for item in occupants if item.user}),
+                    sorted({item.display_name or item.user for item in occupants if item.display_name or item.user}),
                     ensure_ascii=False,
                 ),
                 "active_instance_ids": json.dumps(

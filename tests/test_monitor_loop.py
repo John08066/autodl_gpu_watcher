@@ -603,11 +603,112 @@ class MonitorLoopTest(unittest.TestCase):
                       "--live", "--convert-no-gpu", "--max-cycles", "1",
                       "--runtime-dir", directory, "--no-login"])
                 self.assertIn("本人 GPU 占用 有", output.getvalue())
-                self.assertIn(
-                    f"{config.usage_tracking.self_user}({first.instance_uuid})", output.getvalue())
-                self.assertIn("aaaaaaaaaa-bbbbbbbb", output.getvalue())
+                self.assertIn("203-1[#0:other,#0:mine]", output.getvalue())
+                self.assertIn("203-1#0:mine", output.getvalue())
+                self.assertNotIn(first.instance_uuid, output.getvalue())
+                self.assertNotIn("aaaaaaaaaa-bbbbbbbb", output.getvalue())
                 platform.return_value.get_account_instances.assert_called_once()
                 platform.return_value.post_api_json.assert_not_called()
+
+    def test_display_names_do_not_claim_same_named_other_instance(self):
+        config = self._conversion_config()
+        first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
+        host = PlatformHost("gpu-203", 0, 2, (first.machine_name,), ((first.machine_name, 0, 2),))
+        other = OccupancyRecord(datetime.now(), "gpu-203", first.machine_name, 0,
+                                "gpu-0", "Tesla V100", True,
+                                f"aaaaaaaaaa-bbbbbbbb ({config.usage_tracking.self_user})\ncccccccccc-dddddddd（另一位）",
+                                "", "2026-09-25 00:00:00")
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
+            with patch("autodl_watcher.main.load_config", return_value=config), \
+                 patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                platform.return_value.collect.return_value = [host]
+                platform.return_value.collect_occupancy.side_effect = (
+                    lambda name, **_kwargs: [other] if name == first.machine_name else [])
+                platform.return_value.get_account_instances.return_value = [
+                    {"instance_uuid": first.instance_uuid, "machine_name": first.machine_name,
+                     "status": "running", "start_mode": "non_gpu"}]
+                platform.return_value.get_instance_state.return_value = {
+                    "status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True}
+                telemetry.return_value.collect.side_effect = lambda: [
+                    GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+                main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                      "--dry-run", "--max-cycles", "5", "--runtime-dir", directory, "--no-login"])
+                self.assertIn("本人 GPU 占用 无", output.getvalue())
+                self.assertIn(f"203-1[#0:{config.usage_tracking.self_user},#0:另一位]", output.getvalue())
+                self.assertIn("#0:2人", output.getvalue())
+                self.assertNotIn("aaaaaaaaaa-bbbbbbbb", output.getvalue())
+                platform.return_value.get_account_instances.assert_called()
+                platform.return_value.post_api_json.assert_not_called()
+
+    def test_account_failure_keeps_names_visible_without_power(self):
+        config = self._conversion_config()
+        first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
+        host = PlatformHost("gpu-203", 0, 2, (first.machine_name,), ((first.machine_name, 0, 2),))
+        row = OccupancyRecord(datetime.now(), "gpu-203", first.machine_name, 0,
+                              "gpu-0", "Tesla V100", True,
+                              "aaaaaaaaaa-bbbbbbbb (甲(实验))\ncccccccccc-dddddddd\ninvalid-cell", "", "")
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
+            with patch("autodl_watcher.main.load_config", return_value=config), \
+                 patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                platform.return_value.collect.return_value = [host]
+                platform.return_value.collect_occupancy.side_effect = (
+                    lambda name, **_kwargs: [row] if name == first.machine_name else [])
+                platform.return_value.get_account_instances.side_effect = PlatformTransientError("list unavailable")
+                platform.return_value.get_instance_state.return_value = {
+                    "status": "running", "start_mode": "non_gpu", "host_account_gpu_clear": True}
+                telemetry.return_value.collect.side_effect = lambda: [
+                    GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
+                main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                      "--live", "--convert-no-gpu", "--max-cycles", "2",
+                      "--runtime-dir", directory, "--no-login"])
+                self.assertIn("#0:甲(实验)", output.getvalue())
+                self.assertIn("用户名未知", output.getvalue())
+                self.assertIn("占用身份未确认", output.getvalue())
+                self.assertNotIn("本人 GPU 占用 无", output.getvalue())
+                self.assertNotIn("aaaaaaaaaa-bbbbbbbb", output.getvalue())
+                self.assertNotIn("invalid-cell", output.getvalue())
+                platform.return_value.post_api_json.assert_not_called()
+
+    def test_old_user_column_and_missing_web_name_remain_distinct(self):
+        config = self._conversion_config()
+        first = next(item for item in config.auto_start.targets if item.machine_name == "autodl-203-1")
+        host = PlatformHost("gpu-203", 0, 2, (first.machine_name,), ((first.machine_name, 0, 2),))
+        for old_user, name in [("旧版用户名", "旧版用户名"), ("", "用户名未知")]:
+            with self.subTest(old_user=old_user), tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
+                row = OccupancyRecord(datetime.now(), "gpu-203", first.machine_name, 0,
+                                      "gpu-0", "Tesla V100", True, first.instance_uuid, old_user, "")
+                with patch("autodl_watcher.main.load_config", return_value=config), \
+                     patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
+                     patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
+                    platform.return_value.collect.return_value = [host]
+                    platform.return_value.collect_occupancy.side_effect = (
+                        lambda entry, **_kwargs: [row] if entry == first.machine_name else [])
+                    platform.return_value.get_account_instances.return_value = [
+                        {"instance_uuid": first.instance_uuid, "machine_name": first.machine_name}]
+                    telemetry.return_value.collect.return_value = []
+                    main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
+                          "--dry-run", "--max-cycles", "1", "--runtime-dir", directory, "--no-login"])
+                    self.assertIn(f"203-1[#0:{name}]", output.getvalue())
+                    self.assertNotIn(first.instance_uuid, output.getvalue())
+                    platform.return_value.post_api_json.assert_not_called()
+
+    def test_binding_name_parser_preserves_identity_and_parentheses(self):
+        from autodl_watcher.main import _instance_bindings_from_cell
+        for text, expected, complete in [
+            ("aaaaaaaaaa-bbbbbbbb (甲)\ncccccccccc-dddddddd（乙）",
+             [("aaaaaaaaaa-bbbbbbbb", "甲"), ("cccccccccc-dddddddd", "乙")], True),
+            ("AAAAAAAAAA-BBBBBBBB ( 甲(实验) )", [("aaaaaaaaaa-bbbbbbbb", "甲(实验)")], True),
+            ("aaaaaaaaaa-bbbbbbbb（甲（实验））", [("aaaaaaaaaa-bbbbbbbb", "甲（实验）")], True),
+            ("aaaaaaaaaa-bbbbbbbb", [("aaaaaaaaaa-bbbbbbbb", "")], True),
+            ("aaaaaaaaaa-bbbbbbbb (-)", [("aaaaaaaaaa-bbbbbbbb", "")], True),
+            ("aaaaaaaaaa-bbbbbbbbe (甲)", [], False),
+            ("aaaaaaaaaa-bbbbbbbb (甲)\ntruncated", [("aaaaaaaaaa-bbbbbbbb", "甲")], False),
+            ("", [], False),
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(_instance_bindings_from_cell(text), (expected, complete))
 
     def test_unknown_six_column_identity_with_list_failure_blocks_switch(self):
         config = self._conversion_config()
