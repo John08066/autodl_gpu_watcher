@@ -30,6 +30,13 @@ class OccupancySnapshotMismatchError(RuntimeError):  # 占用弹窗与目标入�
     pass
 
 
+def _check_login_response(payload: dict[str, Any]) -> None:  # 平台也会以HTTP 200返回明确的登录超时。
+    message = str(payload.get("msg", "")).replace("登陆", "登录")
+    if payload.get("code") != "Success" and "重新登录" in message and any(
+            term in message for term in ("登录超时", "登录失效", "登录已失效", "登录过期", "会话过期")):
+        raise PlatformAuthenticationError("AutoDL 登录会话已失效，请重新登录")
+
+
 def canonical_host(machine_name: str) -> str:  # 将 AutoDL 入口名映射到对应的物理主机名。
     match = _MACHINE_PATTERN.match(machine_name.strip())
     if match:
@@ -307,6 +314,7 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
             raise PlatformTransientError("AutoDL machine/list 响应体暂时无法读取") from exc
         if not isinstance(payload, dict):
             raise RuntimeError("AutoDL machine/list returned non-object JSON")
+        _check_login_response(payload)
         if payload.get("code") != "Success":
             raise RuntimeError(f"AutoDL machine/list failed: {payload.get('msg', payload)}")
         return parse_platform_payload(payload, aggregation=self.config.aggregation)
@@ -409,6 +417,7 @@ class PlatformBrowserCollector:  # AutoDL 平台数据采集器 — 通过 Playw
             raise PlatformTransientError(f"AutoDL API {path} 传输或响应读取失败，结果未确认") from None  # 原始Call log可能含Authorization；电源请求不重试。
         if not isinstance(payload_json, dict):
             raise RuntimeError(f"AutoDL API {path} returned non-object JSON")
+        _check_login_response(payload_json)
         return payload_json
 
     def get_account_instances(self, *, require_personal_scope: bool = False) -> list[dict[str, Any]]:  # 读取当前账号完整实例列表；只有全部分页一致且 UUID 唯一才返回。

@@ -32,53 +32,46 @@ class MonitorLoopTest(unittest.TestCase):
                 telemetry.return_value.collect.return_value = [GpuSample(
                     "gpu-999", 0, "Test GPU", 10, 1000, 32000, datetime.now())]
                 main(["--config", str(ROOT / "config.yaml"), "--host", "999", "--entry", "1",
-                      "--user", "测试用户", "--poll-seconds", "0.01", "--usage-seconds", "0.01",
+                      "--user", "测试用户", "--poll-seconds", "0.01",
                       "--max-cycles", "2", "--runtime-dir", directory, "--dry-run", "--no-login"])
                 self.assertEqual(platform.return_value.collect.call_count, 2)
                 self.assertEqual(telemetry.return_value.collect.call_count, 2)
                 platform.return_value.post_api_json.assert_not_called()
                 platform.return_value.close.assert_called_once()
-            self.assertEqual(output.getvalue().count("WATCHER_STATUS"), 2)
+            self.assertEqual(output.getvalue().count("监控999-1 |"), 2)
             self.assertTrue((Path(directory) / "state.json").exists())
-            self.assertTrue((Path(directory) / "occupancy.db").exists())
+            self.assertFalse((Path(directory) / "occupancy.db").exists())
 
-    def test_disabled_usage_reports_keep_occupancy_checks_without_database(self):
+    def test_live_occupancy_checks_do_not_create_history_database(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
             with patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
-                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry, \
-                 patch("autodl_watcher.main.UsageSqliteLogger") as database:
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
                 platform.return_value.collect.return_value = [PlatformHost(
                     "gpu-999", 0, 2, ("autodl-999-1",), (("autodl-999-1", 0, 2),))]
                 platform.return_value.collect_occupancy.return_value = []
                 telemetry.return_value.collect.return_value = [GpuSample(
                     "gpu-999", 0, "Test GPU", 10, 1000, 32000, datetime.now())]
                 main(["--config", str(ROOT / "config.yaml"), "--host", "999", "--entry", "1",
-                      "--user", "测试用户", "--poll-seconds", "0.01", "--usage-seconds", "0.01",
-                      "--max-cycles", "2", "--runtime-dir", directory, "--dry-run", "--no-login",
-                      "--no-usage-report"])
-                database.assert_not_called()  # 关闭统计不能只隐藏按钮，必须停止建立历史数据库。
+                      "--user", "测试用户", "--poll-seconds", "0.01",
+                      "--max-cycles", "2", "--runtime-dir", directory, "--dry-run", "--no-login"])
                 self.assertGreater(platform.return_value.collect_occupancy.call_count, 0)
                 platform.return_value.post_api_json.assert_not_called()
-            self.assertIn("占用统计与报表已关闭", output.getvalue())
             self.assertFalse((Path(directory) / "occupancy.db").exists())
             self.assertTrue((Path(directory) / "state.json").exists())
 
-    def test_disabled_usage_reports_still_block_unknown_ownership_in_live_mode(self):
+    def test_missing_live_occupancy_still_blocks_power(self):
         config = self._conversion_config()
         host = PlatformHost("gpu-203", 1, 2, ("autodl-203-1",), (("autodl-203-1", 1, 2),))
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
             with patch("autodl_watcher.main.load_config", return_value=config), \
                  patch("autodl_watcher.main.PlatformBrowserCollector") as platform, \
-                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry, \
-                 patch("autodl_watcher.main.UsageSqliteLogger") as database:
+                 patch("autodl_watcher.main.TelemetryApiCollector") as telemetry:
                 platform.return_value.collect.return_value = [host]
                 platform.return_value.collect_occupancy.side_effect = PlatformTransientError("occupancy timeout")
                 telemetry.return_value.collect.side_effect = lambda: [
                     GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
                 main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
-                      "--live", "--max-cycles", "2", "--runtime-dir", directory, "--no-login",
-                      "--no-usage-report"])
-                database.assert_not_called()
+                      "--live", "--max-cycles", "2", "--runtime-dir", directory, "--no-login"])
                 self.assertGreater(platform.return_value.collect_occupancy.call_count, 0)
                 platform.return_value.post_api_json.assert_not_called()
 
@@ -108,8 +101,6 @@ class MonitorLoopTest(unittest.TestCase):
         return replace(config,
             auto_start=replace(config.auto_start, recheck_delay_seconds=0,
                                post_start_check_seconds=-1),
-            usage_tracking=replace(config.usage_tracking, enabled=True, interval_seconds=1e-6,
-                                   absence_recheck_seconds=1e-6),
             monitor=replace(config.monitor, poll_seconds=0.01, confirmation_seconds=0,
                             min_idle_samples=1))
 
@@ -172,7 +163,7 @@ class MonitorLoopTest(unittest.TestCase):
                     GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
                 main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
                       "--live", "--convert-no-gpu", "--max-cycles", "4", "--runtime-dir", directory,
-                      "--no-login", "--no-usage-report"])
+                      "--no-login"])
                 self.assertEqual(platform.return_value.post_api_json.call_args_list, [
                     call("/api/v2/instance/power_off", {"instance_uuid": "1111111111-11111111", "release": "now"}),
                     call("/api/v2/instance/power_off", {"instance_uuid": "2222222222-22222222", "release": "now"}),
@@ -273,8 +264,8 @@ class MonitorLoopTest(unittest.TestCase):
                         self.assertGreaterEqual(platform.return_value.collect.call_count, 6)
                         self.assertGreaterEqual(telemetry.return_value.collect.call_count, 6)
                         lines = output.getvalue().splitlines()
-                        heartbeat = [line for line in lines if line.startswith("WATCHER_STATUS ")][-1]
-                        status = [line for line in lines if " | 动作=" in line][-1]
+                        heartbeat = [line for line in lines if " | 动作：" in line][-1]
+                        status = [line for line in lines if " | 动作：" in line][-1]
                         self.assertIn("额度不足", heartbeat)
                         self.assertIn("暂停自动开机", status)
                         self.assertNotIn("等待无卡关机", status)
@@ -377,7 +368,7 @@ class MonitorLoopTest(unittest.TestCase):
                                   (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
         mine = OccupancyRecord(datetime.now(), "gpu-203", "autodl-203-1", 0,
                                "gpu-0", "Tesla V100", True, first.instance_uuid,
-                               config.usage_tracking.self_user, "2026-09-25 00:00:00")
+                               config.occupancy.self_user, "2026-09-25 00:00:00")
         for fresh_second in (False, True):
             with self.subTest(fresh_second=fresh_second):
                 phase = {"platform_reads": 0, "state_reads": 0, "occupancy_reads": 0,
@@ -395,7 +386,7 @@ class MonitorLoopTest(unittest.TestCase):
                             return []
                         rows = self._one_free_gpu(machine_name)
                         return [replace(rows[0], occupied=True, instance_id=first.instance_uuid,
-                                        user=config.usage_tracking.self_user), rows[1]]
+                                        user=config.occupancy.self_user), rows[1]]
                     return self._one_free_gpu(machine_name) if machine_name == first.machine_name else []
 
                 def instance_state(*_args):
@@ -448,7 +439,7 @@ class MonitorLoopTest(unittest.TestCase):
                             (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
         mine = OccupancyRecord(datetime.now(), "gpu-203", first.machine_name, 0,
                                "gpu-0", "Tesla V100", True, first.instance_uuid,
-                               config.usage_tracking.self_user, "2026-09-25 00:00:00")
+                               config.occupancy.self_user, "2026-09-25 00:00:00")
         occupancy_reads = 0
 
         def collect_occupancy(machine_name, **_kwargs):
@@ -483,7 +474,7 @@ class MonitorLoopTest(unittest.TestCase):
                             (("autodl-203-1", 1, 2), ("autodl-203-2", 1, 2)))
         mine = OccupancyRecord(datetime.now(), "gpu-203", first.machine_name, 0,
                                "gpu-0", "Tesla V100", True, first.instance_uuid,
-                               config.usage_tracking.self_user, "2026-09-25 00:00:00")
+                               config.occupancy.self_user, "2026-09-25 00:00:00")
         phase = {"occupancy_reads": 0, "telemetry_reads": 0, "off": False, "on": False}
 
         def collect_occupancy(machine_name, **_kwargs):
@@ -602,9 +593,8 @@ class MonitorLoopTest(unittest.TestCase):
                 main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
                       "--live", "--convert-no-gpu", "--max-cycles", "1",
                       "--runtime-dir", directory, "--no-login"])
-                self.assertIn("本人 GPU 占用 有", output.getvalue())
+                self.assertIn("实例状态：有卡运行", output.getvalue())
                 self.assertIn("203-1[#0:other,#0:mine]", output.getvalue())
-                self.assertIn("203-1#0:mine", output.getvalue())
                 self.assertNotIn(first.instance_uuid, output.getvalue())
                 self.assertNotIn("aaaaaaaaaa-bbbbbbbb", output.getvalue())
                 platform.return_value.get_account_instances.assert_called_once()
@@ -616,7 +606,7 @@ class MonitorLoopTest(unittest.TestCase):
         host = PlatformHost("gpu-203", 0, 2, (first.machine_name,), ((first.machine_name, 0, 2),))
         other = OccupancyRecord(datetime.now(), "gpu-203", first.machine_name, 0,
                                 "gpu-0", "Tesla V100", True,
-                                f"aaaaaaaaaa-bbbbbbbb ({config.usage_tracking.self_user})\ncccccccccc-dddddddd（另一位）",
+                                f"aaaaaaaaaa-bbbbbbbb ({config.occupancy.self_user})\ncccccccccc-dddddddd（另一位）",
                                 "", "2026-09-25 00:00:00")
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as output:
             with patch("autodl_watcher.main.load_config", return_value=config), \
@@ -634,9 +624,9 @@ class MonitorLoopTest(unittest.TestCase):
                     GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
                 main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
                       "--dry-run", "--max-cycles", "5", "--runtime-dir", directory, "--no-login"])
-                self.assertIn("本人 GPU 占用 无", output.getvalue())
-                self.assertIn(f"203-1[#0:{config.usage_tracking.self_user},#0:另一位]", output.getvalue())
-                self.assertIn("#0:2人", output.getvalue())
+                self.assertIn("动作：等待GPU空位", output.getvalue())
+                self.assertNotIn("本账号已有有卡实例", output.getvalue())
+                self.assertIn(f"203-1[#0:{config.occupancy.self_user},#0:另一位]", output.getvalue())
                 self.assertNotIn("aaaaaaaaaa-bbbbbbbb", output.getvalue())
                 platform.return_value.get_account_instances.assert_called()
                 platform.return_value.post_api_json.assert_not_called()
@@ -666,7 +656,7 @@ class MonitorLoopTest(unittest.TestCase):
                 self.assertIn("#0:甲(实验)", output.getvalue())
                 self.assertIn("用户名未知", output.getvalue())
                 self.assertIn("占用身份未确认", output.getvalue())
-                self.assertNotIn("本人 GPU 占用 无", output.getvalue())
+                self.assertNotIn("动作：等待GPU空位", output.getvalue())
                 self.assertNotIn("aaaaaaaaaa-bbbbbbbb", output.getvalue())
                 self.assertNotIn("invalid-cell", output.getvalue())
                 platform.return_value.post_api_json.assert_not_called()
@@ -736,7 +726,7 @@ class MonitorLoopTest(unittest.TestCase):
                       "--live", "--convert-no-gpu", "--max-cycles", "2",
                       "--runtime-dir", directory, "--no-login"])
                 self.assertIn("占用身份未确认", output.getvalue())
-                self.assertNotIn("本人 GPU 占用 无", output.getvalue())
+                self.assertNotIn("动作：等待GPU空位", output.getvalue())
                 platform.return_value.post_api_json.assert_not_called()
 
     def test_unknown_six_column_identity_excluded_by_complete_account_list(self):
@@ -762,7 +752,8 @@ class MonitorLoopTest(unittest.TestCase):
                     GpuSample("gpu-203", 0, "Tesla V100", 0, 0, 32000, datetime.now())]
                 main(["--config", str(ROOT / "config.yaml"), "--host", "203", "--entry", "1",
                       "--dry-run", "--max-cycles", "5", "--runtime-dir", directory, "--no-login"])
-                self.assertIn("本人 GPU 占用 无", output.getvalue())
+                self.assertIn("动作：等待GPU空位", output.getvalue())
+                self.assertNotIn("本账号已有有卡实例", output.getvalue())
                 platform.return_value.get_account_instances.assert_called()
                 platform.return_value.post_api_json.assert_not_called()
 
@@ -793,7 +784,7 @@ class MonitorLoopTest(unittest.TestCase):
                       "--live", "--convert-no-gpu", "--max-cycles", "2",
                       "--runtime-dir", directory, "--no-login"])
                 self.assertIn("占用身份未确认", output.getvalue())
-                self.assertNotIn("本人 GPU 占用 无", output.getvalue())
+                self.assertNotIn("动作：等待GPU空位", output.getvalue())
                 platform.return_value.post_api_json.assert_not_called()
 
     def test_missing_configured_instance_id_is_explicit_in_status(self):

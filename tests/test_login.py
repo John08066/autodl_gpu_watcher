@@ -196,3 +196,57 @@ class LoginSessionVerificationTest(unittest.TestCase):
             self.assertIn('"status": "unknown"', output.getvalue())
             self.assertNotIn('"status": "valid"', output.getvalue())
             collector.assert_not_called()
+
+
+class PowerShellPathTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows PowerShell 进程测试")
+    def test_profile_helpers_work_without_powershell_on_path(self):
+        from autodl_watcher.login import edge_process_command_lines, terminate_profile_edge_processes
+        with tempfile.TemporaryDirectory(prefix="autodl-path-regression-") as directory:
+            profile = Path(directory) / "unused-profile"  # 专用空目录，不匹配任何用户浏览器。
+            with patch.dict(os.environ, {"PATH": str(Path(os.environ["SystemRoot"]) / "System32")}):
+                self.assertEqual(edge_process_command_lines(profile), [])
+                terminate_profile_edge_processes(profile)
+
+    @unittest.skipUnless(os.name == "nt", "Windows PowerShell 路径测试")
+    def test_both_profile_helpers_use_system_path_and_hidden_window(self):
+        import subprocess
+        from autodl_watcher.login import edge_process_command_lines, terminate_profile_edge_processes
+        expected = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        with patch("autodl_watcher.login.subprocess.run") as run:
+            run.return_value.returncode, run.return_value.stdout = 0, ""
+            edge_process_command_lines(Path("unused-profile"))
+            terminate_profile_edge_processes(Path("unused-profile"))
+        self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            self.assertEqual(Path(call.args[0][0]), expected)
+            self.assertEqual(call.kwargs["creationflags"], subprocess.CREATE_NO_WINDOW)
+
+    @unittest.skipUnless(os.name == "nt", "Windows PowerShell 缺失测试")
+    def test_missing_powershell_reports_path_before_touching_profile(self):
+        from autodl_watcher.login import LocalStartupError, prepare_profile_for_exclusive_use
+        with patch("autodl_watcher.login.Path.is_file", return_value=False), \
+             patch("autodl_watcher.login.subprocess.run") as run, \
+             patch("autodl_watcher.login.remove_stale_profile_locks") as cleanup:
+            with self.assertRaises(LocalStartupError) as error:
+                prepare_profile_for_exclusive_use(Path("unused-profile"))
+        self.assertIn("powershell.exe", str(error.exception))
+        self.assertIn("未找到 Windows PowerShell", str(error.exception))
+        run.assert_not_called()
+        cleanup.assert_not_called()
+
+    def test_login_reports_local_startup_failure_without_marking_session_expired(self):
+        from contextlib import redirect_stdout
+        import io
+        from autodl_watcher.login import LocalStartupError, main
+        with redirect_stdout(io.StringIO()) as output, \
+             patch("autodl_watcher.login.interactive_login", side_effect=LocalStartupError("未找到 Windows PowerShell：missing/powershell.exe")), \
+             patch("autodl_watcher.collectors.PlatformBrowserCollector") as factory:
+            with self.assertRaises(SystemExit) as error:
+                main()
+        self.assertEqual(error.exception.code, 5)
+        self.assertIn("本地启动失败", output.getvalue())
+        self.assertIn("powershell.exe", output.getvalue())
+        self.assertNotIn('"status": "invalid"', output.getvalue())
+        self.assertNotIn("网络", output.getvalue())
+        factory.assert_not_called()

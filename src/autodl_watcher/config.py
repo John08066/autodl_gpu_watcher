@@ -83,14 +83,9 @@ class AutoStartConfig:  # 自动开机配置。
 
 
 @dataclass(frozen=True, slots=True)
-class UsageTrackingConfig:  # GPU 占用追踪配置。
-    enabled: bool             # 是否启用
-    interval_seconds: float   # 采集间隔（秒），支持小数。
-    database_path: Path       # SQLite 数据库路径
-    export_dir: Path          # CSV 导出目录
+class OccupancyConfig:  # 实时占用读取与本人状态核验，不记录历史。
     self_user: str            # 当前账号在“查看占用”页面显示的用户标识
     absent_confirmations_required: int = 2  # 连续多少次可靠空快照才确认本人已下机
-    absence_recheck_seconds: float = 5.0     # 疑似下机后多久触发快速复核
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +102,7 @@ class AppConfig:  # 顶层应用配置，包含所有子配置。
     telemetry: TelemetryConfig  # 物理 GPU 实时利用率与显存来源。
     notification: NotificationConfig  # 达标事件的通知开关。
     auto_start: AutoStartConfig  # 固定实例映射与真实开机策略。
-    usage_tracking: UsageTrackingConfig  # 本人识别、占用复核及统计存储。
+    occupancy: OccupancyConfig  # 本人识别与实时占用复核。
     runtime: RuntimeConfig  # 连续采样状态与运行日志的落盘位置。
 
 
@@ -135,7 +130,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:  # 读取 YAML �
     telemetry = _required(raw, "telemetry")
     notification = _required(raw, "notification")
     auto_start = raw.get("auto_start", {})
-    usage_tracking = raw.get("usage_tracking", {})
+    occupancy = raw.get("occupancy", raw.get("usage_tracking", {}))  # 沿用旧配置中的用户名和连续确认次数。
     runtime = _required(raw, "runtime")
 
     aggregation = str(platform.get("aggregation", "max")).lower()
@@ -214,22 +209,11 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:  # 读取 YAML �
             max_starts_per_event=int(auto_start.get("max_starts_per_event", 1)),
             targets=targets,
         ),
-        usage_tracking=UsageTrackingConfig(
-            enabled=bool(usage_tracking.get("enabled", True)),
-            interval_seconds=float(usage_tracking.get("interval_seconds", 60)),
-            database_path=_resolve_path(
-                base_dir,
-                usage_tracking.get( "database_path", "runtime/usage/occupancy.db", ),
-            ),
-            export_dir=_resolve_path(
-                base_dir,
-                usage_tracking.get( "export_dir", "runtime/usage/exports", ),
-            ),
-            self_user=str(usage_tracking.get("self_user", "")).strip(),
+        occupancy=OccupancyConfig(
+            self_user=str(occupancy.get("self_user", "")).strip(),
             absent_confirmations_required=max(
-                1, int(usage_tracking.get("absent_confirmations_required", 2))
+                1, int(occupancy.get("absent_confirmations_required", 2))
             ),
-            absence_recheck_seconds=max( 0.0, float(usage_tracking.get("absence_recheck_seconds", 5.0)) ),
         ),
         runtime=RuntimeConfig(
             state_file=_resolve_path(base_dir, runtime["state_file"]),

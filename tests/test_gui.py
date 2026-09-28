@@ -62,13 +62,12 @@ class GuiOptionsTest(unittest.TestCase):
             window.assert_called_once_with(tk_root.return_value, debug=True)
             tk_root.return_value.mainloop.assert_called_once()
 
-    def test_disable_statistics_keeps_usage_safety_parameters(self):
-        command = monitor_command(self.config, "autodl-203-1", "user", 1, 2, True, Path("stop"), True, False)
-        self.assertIn("--no-usage-report", command)
-        self.assertIn("--usage-seconds", command)
+    def test_monitor_uses_one_interval_and_ui_protocol(self):
+        command = monitor_command(self.config, "autodl-203-1", "user", 1, True, Path("stop"), True)
+        self.assertNotIn("--occupancy-seconds", command)
+        self.assertIn("--poll-seconds", command)
+        self.assertIn("--ui", command)
         self.assertIn("--convert-no-gpu", command)
-        self.assertNotIn("--no-usage-report", monitor_command(self.config, "autodl-203-1", "user", 1, 2, True, Path("stop"), True))
-
 
     def test_discover_reports_authentication_and_network_failures_distinctly(self):
         failures = [(PlatformAuthenticationError("HTTP 401"), "invalid"),
@@ -87,6 +86,20 @@ class GuiOptionsTest(unittest.TestCase):
                 factory.return_value.close.assert_called_once()
                 self.assertNotIn("Traceback", output.getvalue())
 
+    def test_discover_reports_missing_component_as_local_error(self):
+        from autodl_watcher.login import LocalStartupError
+        with patch("autodl_watcher.collectors.PlatformBrowserCollector") as factory, \
+             patch("sys.stdout", new_callable=io.StringIO) as output:
+            factory.return_value.collect.side_effect = LocalStartupError("未找到 Windows PowerShell：missing/powershell.exe")
+            with self.assertRaises(SystemExit):
+                discover()
+        self.assertIn("本地启动错误", output.getvalue())
+        self.assertIn("powershell.exe", output.getvalue())
+        self.assertIn('"status": "unknown"', output.getvalue())
+        self.assertNotIn("网络", output.getvalue())
+        self.assertNotIn("登录已失效", output.getvalue())
+        factory.return_value.close.assert_called_once()
+
     def test_discover_marks_session_valid_only_after_collection(self):
         with patch("autodl_watcher.collectors.PlatformBrowserCollector") as factory, \
                 patch("sys.stdout", new_callable=io.StringIO) as output:
@@ -97,6 +110,35 @@ class GuiOptionsTest(unittest.TestCase):
             self.assertEqual([item["status"] for item in messages], ["checking", "valid"])
             self.assertIn("WATCHER_HOSTS []", output.getvalue())
             factory.return_value.close.assert_called_once()
+
+    def test_discover_gpu_failure_does_not_invalidate_confirmed_platform_session(self):
+        from autodl_watcher.models import PlatformHost
+        from autodl_watcher.session import GPU_PREFIX
+        with patch("autodl_watcher.collectors.PlatformBrowserCollector") as platform, \
+             patch("autodl_watcher.collectors.TelemetryApiCollector") as telemetry, \
+             patch("sys.stdout", new_callable=io.StringIO) as output:
+            platform.return_value.collect.return_value = [PlatformHost("gpu-203", 0, 2, ("autodl-203-1",), (("autodl-203-1", 0, 2),))]
+            telemetry.return_value.collect.side_effect = OSError("telemetry unavailable")
+            discover()
+        messages = [json.loads(line[len(SESSION_PREFIX):]) for line in output.getvalue().splitlines() if line.startswith(SESSION_PREFIX)]
+        self.assertEqual([item["status"] for item in messages], ["checking", "valid"])
+        gpu = [json.loads(line[len(GPU_PREFIX):]) for line in output.getvalue().splitlines() if line.startswith(GPU_PREFIX)][0]
+        self.assertEqual(gpu["samples"], [])
+        self.assertIn("失败", gpu["error"])
+        telemetry.return_value.collect.assert_called_once()
+        telemetry.return_value._session.close.assert_called_once()
+
+    def test_gpu_message_includes_visible_full_host_but_excludes_other_hosts(self):
+        from datetime import datetime
+        from autodl_watcher.models import GpuSample, PlatformHost
+        from autodl_watcher.session import GPU_PREFIX, emit_gpu_samples
+        samples = [GpuSample(host, 0, "GPU", 40, 1000, 32000, datetime.now()) for host in ("gpu-203", "gpu-999")]
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            emit_gpu_samples(samples, [PlatformHost("gpu-203", 0, 2)], 90)
+        data = json.loads(output.getvalue()[len(GPU_PREFIX):])
+        self.assertEqual([sample["host"] for sample in data["samples"]], ["gpu-203"])
+        self.assertEqual(data["samples"][0]["util_pct"], 40)
+        self.assertEqual(data["stale_after_seconds"], 90)
 
     def test_discover_cleanup_failure_does_not_mask_authentication_message(self):
         with patch("autodl_watcher.collectors.PlatformBrowserCollector") as factory, \
@@ -114,7 +156,7 @@ class GuiOptionsTest(unittest.TestCase):
     def test_project_local_runtime_paths(self):
         self.assertEqual(self.config.platform.user_data_dir, ROOT / "runtime" / "browser_profile")
         self.assertEqual(self.config.runtime.state_file, ROOT / "runtime" / "state.json")
-        self.assertEqual(self.config.usage_tracking.database_path, ROOT / "runtime" / "usage" / "occupancy.db")
+        self.assertFalse(hasattr(self.config.occupancy, "database_path"))
 
     def test_invalid_intervals_are_rejected(self):
         for value in ("0", "-1", "nan", "inf", "-inf", "", "abc"):
@@ -123,25 +165,24 @@ class GuiOptionsTest(unittest.TestCase):
         self.assertEqual(positive_seconds("0.5"), 0.5)
 
     def test_username_and_large_poll_interval_reach_core(self):
-        args = _build_parser("gpu-203").parse_args(["--user", " 新用户 ", "--poll-seconds", "120",
-                                                   "--usage-seconds", "0.5"])
+        args = _build_parser("gpu-203").parse_args(["--user", " 新用户 ", "--poll-seconds", "120"])
         config = apply_monitor_options(self.config, args)
-        self.assertEqual(config.usage_tracking.self_user, "新用户")
+        self.assertEqual(config.occupancy.self_user, "新用户")
         self.assertEqual(config.monitor.poll_seconds, 120)
         self.assertGreaterEqual(config.monitor.max_sample_gap_seconds, 240)
-        self.assertEqual(config.usage_tracking.interval_seconds, 0.5)
+        self.assertFalse(hasattr(config.occupancy, "interval_seconds"))
 
     def test_unknown_server_allows_monitoring_but_blocks_live_start(self):
-        command = monitor_command(self.config, "autodl-999-1", "测试用户", 1, 2, False, Path("stop"))
+        command = monitor_command(self.config, "autodl-999-1", "测试用户", 1, False, Path("stop"))
         self.assertIn("--dry-run", command)
         self.assertIn("gpu-999", command)
         with self.assertRaises(ValueError):
-            monitor_command(self.config, "autodl-999-1", "测试用户", 1, 2, True, Path("stop"))
+            monitor_command(self.config, "autodl-999-1", "测试用户", 1, True, Path("stop"))
 
     def test_no_gpu_conversion_requires_live_and_fixed_entry(self):
         with self.assertRaises(ValueError):
-            monitor_command(self.config, "autodl-203-1", "user", 1, 2, False, Path("stop"), True)
-        command = monitor_command(self.config, "autodl-203-1", "user", 1, 2, True, Path("stop"), True)
+            monitor_command(self.config, "autodl-203-1", "user", 1, False, Path("stop"), True)
+        command = monitor_command(self.config, "autodl-203-1", "user", 1, True, Path("stop"), True)
         self.assertIn("--convert-no-gpu", command)
         self.assertIn("--entry", command)
         self.assertEqual(command[command.index("--entry") + 1], "autodl-203-1")
@@ -151,12 +192,12 @@ class GuiOptionsTest(unittest.TestCase):
 
     def test_empty_username_is_rejected(self):
         with self.assertRaises(ValueError):
-            monitor_command(self.config, "autodl-203-1", " ", 1, 2, False, Path("stop"))
+            monitor_command(self.config, "autodl-203-1", " ", 1, False, Path("stop"))
 
     def test_live_start_requires_enabled_configuration(self):
         config = replace(self.config, auto_start=replace(self.config.auto_start, enabled=False))
         with self.assertRaises(ValueError):
-            monitor_command(config, "autodl-203-1", "user", 1, 2, True, Path("stop"))
+            monitor_command(config, "autodl-203-1", "user", 1, True, Path("stop"))
 
     def test_stopped_monitor_never_contacts_platform_and_saves_state(self):
         with tempfile.TemporaryDirectory() as directory:

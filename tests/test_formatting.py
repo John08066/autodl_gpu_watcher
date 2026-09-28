@@ -5,11 +5,9 @@ from datetime import datetime
 
 from autodl_watcher.autostart import StartAttemptResult, format_start_result
 from autodl_watcher.main import (
-    _format_owned_entry,
-    _format_owned_indices,
     _owned_instances_from_records,
 )
-from autodl_watcher.models import AvailabilityAlert, ConfirmedGpu, GpuSample, OccupancyRecord
+from autodl_watcher.models import AvailabilityAlert, ConfirmedGpu, OccupancyRecord
 from autodl_watcher.notifiers.formatting import format_alert
 
 
@@ -86,20 +84,7 @@ class FormattingTest(unittest.TestCase):
             ),
         ]
         owned = _owned_instances_from_records(records, "何太急", "gpu-203")
-        samples = [
-            GpuSample(
-                host="gpu-203",
-                gpu_index=0,
-                gpu_name="Tesla V100",
-                util_pct=0,
-                memory_used_mb=2768,
-                memory_total_mb=32768,
-                observed_at=observed_at,
-            )
-        ]
-
-        self.assertEqual(_format_owned_entry(owned), "已占用203-1")
-        self.assertEqual(_format_owned_indices(owned, samples), "#0(30000MB)")
+        self.assertEqual([(item.instance_id, item.gpu_index) for item in owned], [("mine", 0)])
 
 
 if __name__ == "__main__":

@@ -18,8 +18,6 @@ def main():  # console 类型的内部 EXE 由 GUI 隐藏启动，保留 stdin/s
         from autodl_watcher.gui import discover as run
     elif task == "login":
         from autodl_watcher.login import main as run
-    elif task == "export":
-        from autodl_watcher.usage_report import main as run
     else:
         raise ValueError(f"Unknown worker task: {task}")
     run()

@@ -28,10 +28,15 @@ class GuiWindowTest(unittest.TestCase):
         if self.window.process is not None:
             self.window.stop()
             self.pump(lambda: self.window.process is None)
-        self.root.destroy()
+        self.destroy_root()
         self.location.stop()
         self.refresh.stop()
         self.temp.cleanup()
+
+    def destroy_root(self):
+        for timer in self.root.tk.call("after", "info"):
+            self.root.after_cancel(timer)  # 测试反复创建解释器，先取消旧窗口回调再销毁。
+        self.root.destroy()
 
     def pump(self, condition, timeout=5):
         deadline = time.monotonic() + timeout
@@ -97,15 +102,6 @@ class GuiWindowTest(unittest.TestCase):
                 self.assertIn("核验未完成", self.window.status.get())
                 self.assertEqual(str(self.window.login_button["state"]), "normal")
 
-    def test_export_exit_does_not_change_session_status(self):
-        self.window.process, self.window.job = Mock(), "export"
-        self.window._session("checking", "先前的核验状态")
-        self.window._busy(True)
-        self.window.events.put(("exit", 1))
-        self.window._drain()
-        self.assertEqual(self.window.session_status, "checking")
-        self.assertEqual(self.window.session_message, "先前的核验状态")
-
     def test_monitor_pipe_failure_requests_safe_stop_before_waiting(self):
         stdout = Mock()
         stdout.__iter__ = Mock(side_effect=OSError("pipe read failed"))
@@ -164,7 +160,6 @@ class GuiWindowTest(unittest.TestCase):
         self.window.convert_no_gpu.set(False)
         self.window.user.set("任意用户名")
         self.window.poll.set("0.5")
-        self.window.usage.set("75")
         self.assertTrue(self.window.save())
         settings = json.loads((self.folder / ".ui/preferences.json").read_text(encoding="utf-8"))
         self.assertEqual(settings["entry"], "autodl-202-4")
@@ -172,29 +167,87 @@ class GuiWindowTest(unittest.TestCase):
         self.assertEqual(settings["poll"], "0.5")
         self.assertFalse(self.window.live.get())
 
-    def test_statistics_switch_preserves_log_output_and_saves_preference(self):
-        self.assertTrue(self.window.usage_tracking.get())
+    def test_two_line_report_colors_whole_group_and_has_no_statistics_controls(self):
+        self.assertFalse(hasattr(self.window, "export_button"))
+        self.assertFalse(hasattr(self.window, "usage_check"))
         self.assertEqual(self.window.log.frame.winfo_manager(), "pack")
-        self.assertEqual(self.window.export_button.winfo_manager(), "pack")
-        self.window.usage_tracking.set(False)
-        self.window._toggle_usage()
-        self.assertEqual(self.window.log.frame.winfo_manager(), "pack")
-        self.assertEqual(self.window.export_button.winfo_manager(), "")
-        self.window.events.put(("line", "连接正常，实时输出仍然可见\n"))
+        headline = "[12:32:02] 监控203-1 | 实例状态：有卡运行 | 动作：继续监控 | 平台空闲：203-1=0/2"
+        self.window.events.put(("line", gui.REPORT_PREFIX + json.dumps({"lines": [headline, "  203-1[#0:失败也是名字]"], "level": "success"})))
         self.window._drain()
-        self.assertIn("实时输出仍然可见", self.window.log.get("1.0", "end"))
+        self.assertEqual(self.window.status.get(), headline)
+        self.assertEqual(self.window.log.get("1.0", "end").count(headline), 1)
         self.assertIn("success", self.window.log.tag_names("1.0"))
-        self.assertIn("--no-usage-report", self.window._command())
+        self.assertIn("success", self.window.log.tag_names("2.0"))
+        self.assertEqual(str(self.window.status_label.cget("foreground")), "#18733a")
+        self.assertFalse(hasattr(self.window, "usage"))
+        self.assertEqual(len(self.window.inputs), 2)
         self.assertTrue(self.window.save())
         settings = json.loads((self.folder / ".ui/preferences.json").read_text(encoding="utf-8"))
-        self.assertFalse(settings["usage_tracking"])
-        self.root.destroy()
-        self.root = tk.Tk()
-        self.root.withdraw()
-        self.window = gui.WatcherWindow(self.root)
-        self.assertFalse(self.window.usage_tracking.get())
-        self.assertEqual(self.window.log.frame.winfo_manager(), "pack")
-        self.assertEqual(self.window.export_button.winfo_manager(), "")
+        self.assertNotIn("usage", settings)
+
+    def test_report_error_and_normal_levels_cover_both_lines(self):
+        for level in ("error", "normal"):
+            self.window.events.put(("line", gui.REPORT_PREFIX + json.dumps({"lines": [
+                "[12:32:02] 监控203-1 | 实例状态：无卡运行 | 动作：等待", "  203-1[#0:成功]"], "level": level})))
+        self.window._drain()
+        for row, level in ((1, "error"), (2, "error"), (3, "normal"), (4, "normal")):
+            self.assertIn(level, self.window.log.tag_names(f"{row}.0"))
+        self.assertEqual(self.window.log.cget("wrap"), "none")
+
+    def test_default_interval_and_legacy_preferences_migrate_once(self):
+        self.assertEqual(float(self.window.poll.get()), 60)
+        preferences = self.folder / ".ui/preferences.json"
+        preferences.write_text(json.dumps({"poll": "30", "usage": "300", "user": "保留用户名", "entry": "autodl-203-1"}), encoding="utf-8")
+        for expected in ("60", "120"):
+            self.destroy_root()
+            self.root = tk.Tk()
+            self.root.withdraw()
+            self.window = gui.WatcherWindow(self.root, debug=True)
+            self.assertEqual(self.window.poll.get(), expected)
+            self.assertEqual(self.window.user.get(), "保留用户名")
+            self.window.poll.set("120")
+            self.assertTrue(self.window.save())
+        self.assertNotIn("usage", json.loads(preferences.read_text(encoding="utf-8")))
+
+    def test_gpu_bars_use_physical_host_and_mark_stale_or_missing_data(self):
+        from datetime import datetime, timedelta
+        def descendants(widget):
+            return [child for item in widget.winfo_children() for child in [item, *descendants(item)]]
+        samples = [{"host": host, "gpu_index": index, "gpu_name": "测试GPU", "util_pct": 30 + index,
+                    "memory_used_mb": 16000, "memory_total_mb": 32000, "observed_at": datetime.now().isoformat()}
+                   for host, count in (("gpu-203", 2), ("gpu-201", 4)) for index in range(count)]
+        self.window.gpu_snapshot = {"samples": samples, "stale_after_seconds": 90}
+        for entry, count in (("autodl-203-1", 2), ("autodl-203-2", 2), ("autodl-201-1", 4)):
+            self.window.table.selection_set(entry)
+            self.window._render_gpus()
+            bars = [item for item in descendants(self.window.gpu_panel) if isinstance(item, gui.ttk.Progressbar)]
+            self.assertEqual(len(bars), count * 2)
+            self.assertEqual([float(item["value"]) for item in bars], [v for i in range(count) for v in (30 + i, 50)])
+            self.assertEqual(self.window.selected_entry(), entry)
+        self.root.deiconify()
+        self.root.update()
+        import tkinter.font as tkfont
+        font = tkfont.Font(self.root, font=self.window.log.cget("font"))
+        self.assertGreaterEqual(self.window.log.winfo_height() - 2 * int(self.window.log.cget("pady")) - 8, 6 * font.metrics("linespace"))
+        for sample in samples:
+            sample["observed_at"] = (datetime.now() - timedelta(seconds=91)).isoformat()
+        self.window._render_gpus()
+        self.assertFalse(any(isinstance(item, gui.ttk.Progressbar) for item in descendants(self.window.gpu_panel)))
+        self.assertIn("数据已过期", [item.cget("text") for item in descendants(self.window.gpu_panel) if isinstance(item, gui.ttk.Label)])
+        self.window.gpu_snapshot = {"samples": [], "error": "采集失败"}
+        self.window._render_gpus()
+        self.assertEqual(self.window.gpu_panel.winfo_children()[0].cget("text"), "采集失败")
+
+    def test_initial_layout_has_room_for_three_complete_two_line_cycles(self):
+        import tkinter.font as tkfont
+        self.root.deiconify()
+        self.root.update()
+        font = tkfont.Font(self.root, font=self.window.log.cget("font"))
+        available = self.window.log.winfo_height() - 2 * int(self.window.log.cget("pady")) - 8
+        self.assertGreaterEqual(available, 6 * font.metrics("linespace"))
+        self.assertEqual((self.root.winfo_width(), self.root.winfo_height()), (1000, 800))
+        self.assertLess(self.window.table.winfo_width(), 350)
+        self.assertLess(self.window.table.winfo_height(), 170)
 
     def test_normal_mode_defaults_to_live_and_debug_defaults_to_readonly(self):
         self.assertTrue(self.window.live.get())
@@ -205,7 +258,7 @@ class GuiWindowTest(unittest.TestCase):
         self.assertFalse(self.window.live.get())
         self.assertFalse(self.window.convert_no_gpu.get())
         self.assertIn("--dry-run", self.window._command())
-        self.root.destroy()
+        self.destroy_root()
         self.root = tk.Tk()
         self.root.withdraw()
         self.window = gui.WatcherWindow(self.root, debug=True)

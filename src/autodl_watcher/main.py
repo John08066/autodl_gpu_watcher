@@ -1,6 +1,7 @@
 from __future__ import annotations  # 主循环模块 — 程序的"心脏"。
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -26,11 +27,10 @@ from .collectors import (
 )
 from .config import AutoStartTarget, load_config
 from .evaluator import AvailabilityEvaluator, sample_meets_capacity
-from .login import interactive_login
+from .login import LocalStartupError, interactive_login
 from .notifiers import EmailNotifier
 from .state_store import JsonStateStore
-from .session import emit_session
-from .usage import UsageSqliteLogger, aggregate_gpu_occupants, merge_duplicate_instances
+from .session import REPORT_PREFIX, emit_gpu_samples, emit_session
 
 
 _ANSI_BRIGHT_RED = "\033[91m"
@@ -94,7 +94,6 @@ def _occupancy_display_name(item) -> str:  # 昵称与 user 身份字段分开�
 @dataclass(frozen=True, slots=True)
 class _OwnedInstance:  # 当前账号本人已经占用的一个实例摘要。
 
-    machine_name: str
     gpu_index: int
     instance_id: str
 
@@ -120,13 +119,12 @@ def _owned_instances_from_records(
     return sorted(
         (
             _OwnedInstance(
-                machine_name=item.machine_name,
                 gpu_index=item.gpu_index,
                 instance_id=item.instance_id,
             )
             for item in latest_by_instance.values()
         ),
-        key=lambda item: (item.machine_name, item.gpu_index, item.instance_id),
+        key=lambda item: (item.gpu_index, item.instance_id),
     )
 
 
@@ -138,42 +136,17 @@ def _advance_absence_confirmation(
     captured_owned: bool,
     current_streak: int,
     required: int,
-) -> tuple[int, bool, bool]:  # 推进“本人已消失”的连续确认状态。
+) -> tuple[int, bool]:  # 推进“本人已消失”的连续确认状态。
     required = max(1, int(required))
     if captured_owned:
-        return 0, False, False
+        return 0, False
     if not complete_snapshot:  # 缺入口或采集失败不能作为本人下机的证据，并打断连续确认。
-        return 0, False, False
+        return 0, False
     if previous_known and not previous_active:
-        return max(current_streak, required), True, False
+        return max(current_streak, required), True
     streak = current_streak + 1
     confirmed = streak >= required
-    return streak, confirmed, not confirmed  # 返回连续次数、是否确认缺席、是否需要加快复核。
-
-def _format_owned_entry(instances: list[_OwnedInstance]) -> str:  # 格式化本人已占用入口，例如 `已占用203-1`。
-    names = []
-    for item in instances:
-        for name in item.machine_name.split("|"):
-            short_name = name.removeprefix("autodl-")
-            if short_name and short_name not in names:
-                names.append(short_name)
-    return "已占用" + ",".join(names) if names else "已开机"
-
-
-def _format_owned_indices(
-    instances: list[_OwnedInstance],
-    samples,
-) -> str:  # 按本人实际占用的 GPU INDEX 显示当前剩余显存。
-    sample_by_index = {item.gpu_index: item for item in samples}
-    parts = []
-    for gpu_index in sorted({item.gpu_index for item in instances if item.gpu_index >= 0}):
-        sample = sample_by_index.get(gpu_index)
-        if sample is None:
-            parts.append(f"#{gpu_index}")
-        else:
-            parts.append(f"#{gpu_index}({sample.memory_free_mb}MB)")
-    return ",".join(parts) or "无"
-
+    return streak, confirmed  # 每轮均复核，返回连续次数及是否确认缺席。
 
 def _setup_logging(log_file: str) -> logging.Logger:  # 配置滚动日志文件，最大 2MB，保留 3 个备份。
     logger = logging.getLogger("autodl_watcher")
@@ -202,12 +175,11 @@ def _build_parser(default_host: str) -> argparse.ArgumentParser:  # 构建 CLI �
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument("--user", help="占用列表中的本人用户名")
     parser.add_argument("--poll-seconds", type=positive_seconds, help="采样间隔（秒）")
-    parser.add_argument("--usage-seconds", type=positive_seconds, help="占用采集间隔（秒）")
+    parser.add_argument("--ui", action="store_true", help=argparse.SUPPRESS)  # GUI接收图表及整组日志消息。
     parser.add_argument("--stop-file", type=Path, help="UI 的安全停止信号文件")
     parser.add_argument("--max-cycles", type=int, default=0, help="限定轮数，0 为持续运行")
     parser.add_argument("--no-login", action="store_true", help="登录失效时退出，由 UI 完成登录")
     parser.add_argument("--convert-no-gpu", action="store_true", help="目标达标时关闭当前账号全部无卡实例，再有卡开机；需固定 --entry 和 --live。")
-    parser.add_argument("--no-usage-report", action="store_true", help="关闭历史占用统计和报表写入，仍保留开机必需的占用核验。")
     parser.add_argument("--runtime-dir", type=Path, help="独立运行数据目录")
     return parser
 
@@ -224,20 +196,16 @@ def positive_seconds(value: str) -> float:  # 拒绝零、负数和非有限数�
 
 def apply_monitor_options(config, args):  # UI 与 CLI 共用配置转换。
     poll = args.poll_seconds if args.poll_seconds is not None else config.monitor.poll_seconds
-    usage = args.usage_seconds if args.usage_seconds is not None else config.usage_tracking.interval_seconds
     positive_seconds(str(poll))
-    positive_seconds(str(usage))
     config = replace(config,  # 配置对象不可变；用副本承接本次 UI/CLI 覆盖值。
         monitor=replace(config.monitor, poll_seconds=poll,
                         max_sample_gap_seconds=max(config.monitor.max_sample_gap_seconds, poll * 2)),
-        usage_tracking=replace(config.usage_tracking, interval_seconds=usage,
-            self_user=args.user.strip() if args.user is not None else config.usage_tracking.self_user))
-    if args.runtime_dir:  # 测试可隔离日志、状态与数据库，避免混入日常监控数据。
+        occupancy=replace(config.occupancy,
+            self_user=args.user.strip() if args.user is not None else config.occupancy.self_user))
+    if args.runtime_dir:  # 隔离诊断日志及连续采样状态。
         root = args.runtime_dir.resolve()
         config = replace(config, runtime=replace(config.runtime,
-            state_file=root / "state.json", log_file=root / "watcher.log"),
-            usage_tracking=replace(config.usage_tracking, database_path=root / "occupancy.db",
-                                   export_dir=root / "exports"))
+            state_file=root / "state.json", log_file=root / "watcher.log"))
     if args.max_cycles < 0:
         raise ValueError("max-cycles 不能为负数")
     return config
@@ -278,7 +246,7 @@ _STATE_RESTORE_MAX_AGE_SECONDS = 300  # 只续接五分钟内的采样历史，�
 _POWER_ON_CONFIRM_GRACE_SECONDS = 120  # 请求受理后等待实时占用证据的最长宽限期。
 
 
-def _parse_local_iso(value: object) -> datetime | None:  # 解析 state/SQLite 中的本地 ISO 时间；无效值返回 None。
+def _parse_local_iso(value: object) -> datetime | None:  # 解析 state 中的本地 ISO 时间；无效值返回 None。
     if not value:
         return None
     try:
@@ -373,7 +341,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
     persisted = state_store.load()
     target_signature = ",".join(item.machine_name for item in selected_targets)
     capacity_fingerprint = (  # 拼接关键配置形成签名字符串，用于判断历史状态是否仍适用；不是哈希值。
-        f"v0.6|user={config.usage_tracking.self_user}|host={selected_host}|targets={target_signature}|"
+        f"v0.6|user={config.occupancy.self_user}|host={selected_host}|targets={target_signature}|"
         f"util={config.idle_thresholds.gpu_util_check_enabled}:"
         f"{config.idle_thresholds.gpu_util_max_pct}|"
         f"free={config.idle_thresholds.memory_free_min_mb}:"
@@ -409,16 +377,14 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
 
     platform_collector = PlatformBrowserCollector(config.platform)   # 浏览器 → AutoDL 平台
     telemetry_collector = TelemetryApiCollector(config.telemetry)    # HTTP   → Telemetry API
-    usage_report_enabled = config.usage_tracking.enabled and not args.no_usage_report
-    usage_logger = UsageSqliteLogger(config.usage_tracking.database_path) if usage_report_enabled else None  # 历史统计与电源安全核验独立。
-    self_user = config.usage_tracking.self_user.strip()
+    self_user = config.occupancy.self_user.strip()
 
-    owned_instances: list[_OwnedInstance] = []  # v0.5.1：SQLite 只用于历史统计，绝不参与“本人现在是否已开机”的判定。 每次启动都从 UNKNOWN 开始，必须等本进程成功采集“查看占用”后， 才能进入 ACTIVE / ABSENT。这样彻底消除数据库陈旧记录导致的假绿色。
-    self_occupancy_known = False  # 新进程从未知状态开始，不能用历史数据库推断当前已开机。
+    owned_instances: list[_OwnedInstance] = []  # 只采信本进程实时查询到的本人占用。
+    self_occupancy_known = False  # 新进程从未知状态开始。
 
     pending_start_until = 0.0  # power_on=Success 只代表请求被受理。给实例最多 120 秒启动并出现在 “查看占用”中；这段时间不重复发开机请求，也绝不显示“已开机”。
     pending_start_machine = ""
-    usage_targets = sorted(  # 占用核验覆盖该物理主机的所有已启用入口，避免漏掉本人实例。
+    occupancy_targets = sorted(  # 占用核验覆盖该物理主机的所有已启用入口，避免漏掉本人实例。
         (
             item
             for item in config.auto_start.targets
@@ -426,7 +392,6 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
         ),
         key=lambda item: (item.priority, item.machine_name, item.instance_uuid),
     )
-    next_usage_capture = 0.0  # 下次采集占用快照的时间戳（monotonic）
     absence_confirmations = 0  # v0.5.4：空占用快照需要连续确认，避免一次 DOM 空读就把本人误判为关机。
     login_validation_pending = False
     previous_account_clear = False  # 实例列表确认状态变化时重新武装 GPU 空闲事件。
@@ -476,19 +441,9 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
     if config.platform.autodl_direct:
         print( "AutoDL网络：watcher 控制面直连，绕过系统代理；" "Telemetry 仍可使用本机 HTTP_PROXY。" )
     print(f"监控日志：{config.runtime.log_file}")
-    if usage_report_enabled:
-        usage_entry_text = ", ".join(item.machine_name for item in usage_targets) or "无"
-        print(
-            "占用日志：每 "
-            f"{config.usage_tracking.interval_seconds} 秒轮询全部入口[{usage_entry_text}]；"
-            f"SQLite主库={config.usage_tracking.database_path}；"
-            f"CSV导出目录={config.usage_tracking.export_dir}；"
-            f"本人用户={self_user or '未配置'}"
-        )
+    print(f"实时占用：随每轮采样刷新；本人用户={self_user or '未配置'}")
 
-    if not usage_report_enabled:
-        print("占用统计与报表已关闭；开机必需的实时占用核验继续运行。")
-
+    monitor_entry = selected_entry.removeprefix("autodl-") if selected_entry else f"{selected_host}（自动选择）"
     cycles = 0
     stop_requested = lambda: args.stop_file is not None and args.stop_file.exists()
     try:
@@ -514,7 +469,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                 selected_instance_state = None
                 selected_instance_error = False
                 selected_instance_missing = False
-                if args.convert_no_gpu:  # 占用弹窗失败也要独立查询完整实例列表，确认所选无卡实例及同账号其他入口。
+                if selected_entry is not None and selected_targets[0].instance_uuid:  # 所选实例状态按UUID查询，不由弹窗来源推断。
                     target = selected_targets[0]
                     try:
                         selected_instance_state = platform_collector.get_instance_state(
@@ -543,8 +498,8 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     selected_instance_text = (
                         "配置实例不存在或ID已过期" if selected_instance_missing else "查询失败"
                     )
-                elif selected_instance_state is None:
-                    selected_instance_text = "未查询"
+                elif not isinstance(selected_instance_state, dict):
+                    selected_instance_text = "未配置实例" if not selected_targets[0].instance_uuid else "待确认"
                 else:
                     status, mode = selected_instance_state.get("status"), selected_instance_state.get("start_mode")
                     selected_instance_text = (
@@ -568,16 +523,9 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                 platform_host = platform_hosts[0] if platform_hosts else None
                 entry_slots = _format_entry_slots(platform_host)              # 各入口空闲 GPU ID 数
                 ready_samples = _ready_samples(gpu_samples, config.idle_thresholds)  # 显存达标的 GPU
-                ready_indices = _format_ready_indices(gpu_samples, config.idle_thresholds)
-                platform_text = (
-                    "不可见"
-                    if platform_host is None
-                    else f"{platform_host.free_count}/{platform_host.total_count}"
-                )
-
                 self_active = self_occupancy_known and bool(owned_instances) and not selected_account_clear  # 新鲜完整的账号列表可覆盖旧弹窗记录；本轮正向弹窗仍在发送前阻断。
                 occupancy_unknown = (
-                    config.usage_tracking.enabled and bool(usage_targets) and not self_occupancy_known
+                    bool(occupancy_targets) and not self_occupancy_known
                 )
                 occupancy_blocked = (
                     (occupancy_unknown and not selected_account_clear)
@@ -600,7 +548,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                 if self_active or occupancy_blocked or pending_start or starter.pending_switch or starter.quota_blocked:  # 有卡占用、证据不足或切换中均阻止重复开机。
                     trigger_events = []
 
-                planned_target = None  # 根据实时空位预判入口。UNKNOWN 时仍显示预选入口，但不会真正开机。
+                planned_target = None  # 按实时空位选择候选实例；状态未知时不执行开机。
                 if platform_host is not None and not self_active:
                     planned_target = select_target(
                         selected_auto_start,
@@ -608,132 +556,25 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                         platform_slots=platform_host.source_slots,
                     )
 
-                start_ready = bool(
-                    platform_host is not None
-                    and platform_host.free_count > 0       # 平台有空位
-                    and ready_samples                       # 物理显存达标
-                    and planned_target is not None          # 有可匹配的固定实例
-                )
-
                 if trigger_events and planned_target is None and not self_active:  # v0.5.4：evaluator 看到的是物理主机聚合空位。固定 203-2 时， 203-1 有空位也可能生成 trigger；如果当前选定 targets 实际无可用实例， 必须在这里吃掉事件，不能每 10 秒刷“没有可用固定实例”。
                     evaluator.rearm_host(selected_host)
                     trigger_events = []
 
-                if starter.quota_blocked is not None:
-                    planned_text = (starter.quota_blocked.machine_name or "未知入口").removeprefix("autodl-")
-                    start_ready_text = "额度不足"
-                    action_text = "暂停自动开机，请处理租户额度后重新开始监控"
-                elif self_active:
-                    ready_indices = _format_owned_indices(  # 绿色“已开机”只来自本进程实时占用快照的正向证据。
-                        owned_instances,
-                        selected_gpu_samples,
-                    )
-                    planned_text = _format_owned_entry(owned_instances)
-                    start_ready_text = "已开机"
-                    action_text = "已开机，继续监控"
-                elif pending_start:
-                    planned_text = (
-                        pending_start_machine.removeprefix("autodl-")
-                        if pending_start_machine
-                        else (planned_target.machine_name.removeprefix("autodl-") if planned_target else "等待确认")
-                    )
-                    start_ready_text = "请求已受理"
-                    action_text = "等待实例出现在占用详情"
-                elif starter.pending_switch:
-                    planned_text = starter.pending_switch.machine_name.removeprefix("autodl-")
-                    start_ready_text = "等待无卡关机"
-                    action_text = "确认关机后复核 GPU 再开机"
-                elif occupancy_identity_unresolved:
-                    planned_text = selected_targets[0].machine_name.removeprefix("autodl-")
-                    start_ready_text = "占用身份未确认"
-                    action_text = "暂缓切换，等待账号实例列表核实占用"
-                elif account_occupancy_conflict:
-                    planned_text = selected_targets[0].machine_name.removeprefix("autodl-")
-                    start_ready_text = "占用证据冲突"
-                    action_text = "暂停切换，等待占用弹窗确认无卡"
-                elif occupancy_unknown and selected_account_clear:
-                    planned_text = selected_targets[0].machine_name.removeprefix("autodl-")
-                    start_ready_text = "是" if start_ready else "否"
-                    action_text = ("空闲达标，核对占用" if trigger_events and selected_auto_start.enabled
-                                   else "等待平台空位和显存达标" if not start_ready else "继续监控")
-                elif occupancy_unknown:
-                    planned_text = (
-                        planned_target.machine_name.removeprefix("autodl-")
-                        if planned_target is not None
-                        else "待确认"
-                    )
-                    start_ready_text = ("实例查询失败" if selected_instance_error else "同主机账号状态未排除"
-                                        if args.convert_no_gpu else "本人状态未知")
-                    action_text = ("暂缓切换，先核对实例列表" if args.convert_no_gpu
-                                   else "暂缓开机，先确认本人占用")
-                else:
-                    start_ready_text = "是" if start_ready else "否"
-                    if trigger_events and selected_auto_start.enabled:
-                        action_text = "触发自动开机"
-                    elif start_ready:
-                        action_text = "条件已处理，继续监控"
-                    elif platform_host is not None and planned_target is None:
-                        action_text = "固定入口当前无可用实例，继续等待"
-                    else:
-                        action_text = "继续监控"
-
-                    if planned_target is not None:
-                        planned_text = planned_target.machine_name.removeprefix("autodl-")
-                    elif platform_host is None:
-                        planned_text = "不可见"
-                    elif platform_host.free_count <= 0:
-                        planned_text = "等待平台空位"
-                    else:
-                        planned_text = "无匹配实例"
-
-                status_line = (
-                    f"[{now:%H:%M:%S}] {selected_host} | "
-                    f"平台[{entry_slots}] | "
-                    f"物理INDEX={len(selected_gpu_samples)} | "
-                    f"显存达标={ready_indices} | "
-                    f"预选入口={planned_text} | "
-                    f"开机达标={start_ready_text} | "
-                    f"动作={action_text}"
-                )
-                if args.convert_no_gpu:
-                    status_line += f" | 所选实例={selected_instance_text}"
-                if starter.quota_blocked is not None:
-                    status_line = _red_terminal_text(status_line)
-                elif self_active:
-                    status_line = _green_terminal_text(status_line)
-                print(status_line, flush=True)
-                logger.info(  # 结构化日志（用于事后分析）
-                    "target_host=%s entry_mode=%s platform_gpu_ids=%s entries=%s physical_indices=%d ready_indices=%s planned_entry=%s start_ready=%s self_active=%s self_user=%s trigger_events=%d",
-                    selected_host,
-                    "auto" if selected_entry is None else selected_targets[0].machine_name,
-                    platform_text,
-                    entry_slots,
-                    len(selected_gpu_samples),
-                    ready_indices,
-                    planned_target.machine_name if planned_target else "none",
-                    start_ready_text,
-                    self_active,
-                    self_user,
-                    len(trigger_events),
-                )
-
                 fresh_occupancy_positive = False  # 当前轮弹窗若直接看到本人有卡，优先于实例列表的相反结果。
-                if (
-                    config.usage_tracking.enabled and time.monotonic() >= next_usage_capture and usage_targets
-                ):
+                occupancy_summary = "无可核验入口"
+                if occupancy_targets:  # 占用与平台、显存统一按采样间隔读取。
                     raw_occupancy = []  # 每轮重新收集原始入口视图，不把上一轮记录当作本轮证据。
                     entry_summaries: dict[str, str] = {}
                     failed_entries: list[str] = []
-                    fast_absence_recheck = False
                     slot_map = (
                         {name: (idle, total) for name, idle, total in platform_host.source_slots}
                         if platform_host is not None
                         else {}
                     )
-                    for usage_target in usage_targets:  # 逐个入口点击“查看占用”。v0.5.4 会同时校验弹窗标题和 machine/list 的 idle/total，宁可采集失败也不允许 203-2 串到 203-1。
+                    for occupancy_target in occupancy_targets:  # 逐个入口点击“查看占用”。v0.5.4 会同时校验弹窗标题和 machine/list 的 idle/total，宁可采集失败也不允许 203-2 串到 203-1。
                         if stop_requested():
                             break
-                        entry_name = usage_target.machine_name
+                        entry_name = occupancy_target.machine_name
                         expected_idle = None
                         expected_total = None
                         if entry_name in slot_map:
@@ -749,6 +590,8 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                             raw_occupancy.extend(replace(item, display_name=item.display_name or item.user)
                                                  for item in entry_records)  # 旧七列用户名保留为展示名。
                             entry_summaries[entry_name] = ""  # 拆分多实例后再生成带名字的入口摘要。
+                        except PlatformAuthenticationError:
+                            raise
                         except Exception as entry_exc:
                             failed_entries.append(f"{entry_name.removeprefix('autodl-')}:{entry_exc}")
                             entry_summaries[entry_name] = "采集失败"
@@ -799,7 +642,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                         raw_occupancy = resolved_occupancy
                     if identity_unresolved_now:
                         occupancy_identity_unresolved = True
-                    try:  # 先判定本人状态，再决定该轮是否允许 SQLite 生成 END_SEEN。 第一次可靠空快照只是“疑似结束”，不会立即关掉 current_instances。
+                    try:  # 连续可靠空结果才确认本人已下机，瞬时缺行不能作为缺席证据。
                         complete_occupancy_snapshot = not failed_entries and not identity_unresolved_now
                         captured_owned = _owned_instances_from_records(
                             raw_occupancy,
@@ -808,14 +651,14 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                         )
                         previous_known = self_occupancy_known
                         previous_active = self_occupancy_known and bool(owned_instances)
-                        absence_confirmations, confirmed_absence, fast_absence_recheck = (
+                        absence_confirmations, confirmed_absence = (
                             _advance_absence_confirmation(
                                 previous_known=previous_known,
                                 previous_active=previous_active,
                                 complete_snapshot=complete_occupancy_snapshot,
                                 captured_owned=bool(captured_owned),
                                 current_streak=absence_confirmations,
-                                required=config.usage_tracking.absent_confirmations_required,
+                                required=config.occupancy.absent_confirmations_required,
                             )
                         )
 
@@ -832,11 +675,6 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                             pending_start_until = 0.0
                             pending_start_machine = ""
                         elif complete_occupancy_snapshot:
-                            if fast_absence_recheck:
-                                entry_summaries["本人状态"] = (
-                                    f"疑似结束 {absence_confirmations}/"
-                                    f"{config.usage_tracking.absent_confirmations_required}，待复核")
-
                             if confirmed_absence:  # 连续可靠空快照达到门槛后，才能解除本人占用状态。
                                 if account_occupancy_conflict:
                                     account_occupancy_conflict = False
@@ -853,7 +691,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                                     rearm_line = (
                                         f"[{datetime.now():%H:%M:%S}] 本人占用已连续确认结束 | "
                                         f"主机={selected_host} | "
-                                        f"确认={absence_confirmations}/{config.usage_tracking.absent_confirmations_required} | "
+                                        f"确认={absence_confirmations}/{config.occupancy.absent_confirmations_required} | "
                                         f"已清除alerted={rearmed_gpu_count} | "
                                         "自动开机=重新武装"
                                     )
@@ -868,77 +706,25 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                                 elif not previous_known and not pending_still_valid:
                                     evaluator.rearm_host(selected_host)
 
-                        complete_for_db = bool(  # 疑似下机的第一次空快照不允许 SQLite 生成 END_SEEN。
-                            complete_occupancy_snapshot
-                            and (
-                                captured_owned
-                                or confirmed_absence
-                                or (previous_known and not previous_active)
-                            )
-                        )
-                        usage_events = usage_logger.record(
-                            raw_occupancy,
-                            complete_snapshot=complete_for_db,
-                            snapshot_hosts={selected_host},  # 数据库结束事件仅作用于本轮覆盖的主机，其他主机历史不受影响。
-                        ) if usage_logger is not None else []
-                        instance_records = merge_duplicate_instances(raw_occupancy)
-                        gpu_rows = aggregate_gpu_occupants(raw_occupancy)
-
-                        instance_text = ",".join(
-                            f"{item.machine_name.replace('autodl-', '')}#{item.gpu_index}:{_occupancy_display_name(item)}"
-                            for item in instance_records
-                        ) or "无"
-                        gpu_text = ",".join(
-                            f"#{row['gpu_index']}:{row['occupant_count']}人"
-                            for row in gpu_rows
-                        ) or "无"
                         for entry, error in entry_summaries.items():
                             if not error:
                                 entry_summaries[entry] = ",".join(
                                     f"#{item.gpu_index}:{_occupancy_display_name(item)}"
                                     for item in raw_occupancy if item.machine_name == entry and item.occupied) or "无"
-                        summary_text = "; ".join(
+                        occupancy_summary = "; ".join(
                             f"{entry.removeprefix('autodl-')}[{text}]"
                             for entry, text in entry_summaries.items()) or "无数据"
-                        occupancy_line = (
-                            f"[{datetime.now():%H:%M:%S}] 占用快照 | "
-                            f"{summary_text} | "
-                            f"实例保留={instance_text} | "
-                            f"物理GPU并发={gpu_text} | "
-                            f"新增事件={len(usage_events)}"
-                        )
-                        if self_occupancy_known and owned_instances:
-                            occupancy_line = _green_terminal_text(occupancy_line)
-                        print(occupancy_line, flush=True)
-                        logger.info(
-                            "occupancy_snapshot host=%s entries=%s raw_records=%d instances=%d gpu_rows=%d events=%d failures=%s",
-                            selected_host,
-                            ",".join(item.machine_name for item in usage_targets),
-                            len(raw_occupancy),
-                            len(instance_records),
-                            len(gpu_rows),
-                            len(usage_events),
-                            " | ".join(failed_entries),
-                        )
-                    except Exception as usage_exc:
-                        print( f"[{datetime.now():%H:%M:%S}] 占用日志写入失败：{usage_exc}", flush=True, )
-                        logger.exception("occupancy log write failed")
-                    finally:
-                        if fast_absence_recheck:  # 疑似下机时下一轮主循环立即复核；正常情况仍按 60 秒采集。
-                            next_usage_capture = (
-                                time.monotonic()
-                                + config.usage_tracking.absence_recheck_seconds
-                            )
-                        else:
-                            next_usage_capture = (
-                                time.monotonic() + config.usage_tracking.interval_seconds
-                            )
+                    except Exception:
+                        occupancy_summary = "占用信息处理失败，本轮不可用"
+                        last_occupancy_failed = True
+                        occupancy_identity_unresolved = True
+                        logger.exception("live occupancy processing failed")
 
                 pending_start = (  # 占用状态发生变化后再次做安全门控。首次 UNKNOWN、本人 ACTIVE、 或 power_on 等待确认期间都不允许发送新的开机请求。
                     pending_start_until > 0 and time.monotonic() < pending_start_until
                 )
                 if (
-                    (config.usage_tracking.enabled and usage_targets and not self_occupancy_known
+                    (occupancy_targets and not self_occupancy_known
                      and not selected_account_clear)
                     or fresh_occupancy_positive
                     or account_occupancy_conflict
@@ -973,7 +759,6 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                                 time.monotonic() + _POWER_ON_CONFIRM_GRACE_SECONDS
                             )
                             pending_start_machine = result.machine_name or ""
-                            next_usage_capture = 0.0  # 开机请求受理后尽快读取占用详情，核实是否真正出现实例。
                             logger.info(
                                 "gpu start pending occupancy confirmation status=%s host=%s machine=%s instance=%s grace=%ss",
                                 result.status,
@@ -1011,24 +796,52 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                         "evaluator": evaluator.export_state(),
                     }
                 )
-                self_gpu_text = ('有（本轮弹窗）' if fresh_occupancy_positive
-                                 else '待复核（占用证据冲突）' if account_occupancy_conflict
-                                 else '待确认（占用身份未确认）' if occupancy_identity_unresolved
-                                 else '无（实例列表）' if selected_account_clear
-                                 else '有' if owned_instances else '无' if self_occupancy_known else '待确认')
-                detail = (f" · 所选实例 {selected_instance_text}" if args.convert_no_gpu else "")
                 if starter.quota_blocked is not None:
-                    detail += " · 额度不足，暂停自动开机"  # 保留实时监控心跳，同时明确电源操作已被阻断。
-                if last_occupancy_failed:
-                    detail += " · GPU 占用弹窗采集失败"
-                print(f"WATCHER_STATUS {now:%H:%M:%S} · {selected_host} · 平台 {entry_slots} · "
-                      f"物理 GPU {len(selected_gpu_samples)} 张 · 本人 GPU 占用 {self_gpu_text}{detail}", flush=True)
+                    action_text = "额度不足，暂停自动开机"
+                elif account_occupancy_conflict:
+                    action_text = "占用证据冲突，暂停开机并复核"
+                elif occupancy_identity_unresolved:
+                    action_text = "占用身份未确认，暂停开机并复核"
+                elif starter.pending_switch:
+                    action_text = "等待无卡实例关机，复核后有卡开机"
+                elif pending_start_until > time.monotonic():
+                    action_text = "开机已受理，等待有卡运行确认"
+                elif last_occupancy_failed:
+                    action_text = "占用采集失败，等待重试"
+                elif selected_instance_text == "有卡运行":
+                    action_text = "继续监控"
+                elif selected_instance_error:
+                    action_text = "实例查询失败，等待重试"
+                elif self_occupancy_known and owned_instances and not selected_account_clear:
+                    action_text = "本账号已有有卡实例，继续监控"
+                elif platform_host is not None and (dict((name, idle) for name, idle, _ in platform_host.source_slots).get(selected_entry, platform_host.free_count) == 0):
+                    action_text = "等待GPU空位"
+                elif not ready_samples:
+                    action_text = "等待显存达标"
+                elif not self_occupancy_known and not selected_account_clear:
+                    action_text = "核对本人占用，暂缓开机"
+                else:
+                    action_text = "继续监控"
+                status_line = (f"[{now:%H:%M:%S}] 监控{monitor_entry} | 实例状态：{selected_instance_text} | 动作：{action_text} | "
+                               f"平台空闲：{entry_slots} | 显存达标：{_format_ready_indices(selected_gpu_samples, config.idle_thresholds)}")
+                level = ("error" if starter.quota_blocked is not None or any(term in action_text for term in ("失败", "冲突", "未确认"))
+                         else "success" if selected_instance_text == "有卡运行" else "normal")
+                lines = [status_line, f"  {occupancy_summary}"]
+                if args.ui:
+                    emit_gpu_samples(all_gpu_samples, all_platform_hosts, config.monitor.stale_after_seconds)
+                    print(REPORT_PREFIX + json.dumps({"lines": lines, "level": level}, ensure_ascii=False), flush=True)
+                else:
+                    text = "\n".join(lines)
+                    print(_red_terminal_text(text) if level == "error" else _green_terminal_text(text) if level == "success" else text, flush=True)
+                logger.info("monitor entry=%s instance_state=%s action=%s", monitor_entry, selected_instance_text, action_text)
             except PlatformAuthenticationError as exc:
+                if args.ui:
+                    emit_gpu_samples([], [], config.monitor.stale_after_seconds, "本轮采集不可用")
                 emit_session("invalid", f"登录会话失效，请重新登录：{exc}")
                 if args.no_login:
-                    print("WATCHER_STATUS 登录会话失效 · 监控已停止，请在主界面重新登录", flush=True)
+                    print(_red_terminal_text(f"[{datetime.now():%H:%M:%S}] 监控{monitor_entry} | 登录已失效 | 动作：监控已停止，请重新登录"), flush=True)
                     raise SystemExit(3) from None  # GUI收到明确状态，避免预期认证失败变成PyInstaller堆栈。
-                now = datetime.now()  # v0.5.2：只有明确 /login 或 HTTP 401/403 才进入人工登录恢复。
+                now = datetime.now()  # v0.5.2：明确登录页、HTTP认证状态或业务登录超时才进入人工登录恢复。
                 print(f"[{now:%H:%M:%S}] 登录会话确认失效：{exc}", flush=True)
                 logger.warning("platform authentication expired: %s", exc)
                 platform_collector.close()
@@ -1042,23 +855,31 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                     pending_start_until = 0.0
                     pending_start_machine = ""
                     evaluator.rearm_host(selected_host)
-                    next_usage_capture = 0.0  # 登录恢复后的下一轮尽快重采占用，解除未知状态。
                 except Exception as login_exc:
                     print( f"[{datetime.now():%H:%M:%S}] 登录恢复失败：{login_exc}", flush=True, )
                     logger.exception("interactive login recovery failed")
+            except LocalStartupError as exc:
+                if args.ui:
+                    emit_gpu_samples([], [], config.monitor.stale_after_seconds, "本轮采集不可用")
+                emit_session("unknown", f"本地启动失败：{exc}")
+                print(_red_terminal_text(f"[{datetime.now():%H:%M:%S}] 监控{monitor_entry} | 本地启动失败 | 动作：监控已停止：{exc}"), flush=True)
+                logger.error("local startup failed: %s", exc)
+                raise SystemExit(5) from None  # 缺少系统组件须先修复，持续重试没有作用。
             except PlatformTransientError as exc:
+                if args.ui:
+                    emit_gpu_samples([], [], config.monitor.stale_after_seconds, "本轮采集不可用")
                 if not platform_session_verified:  # 后续入口或数据故障不否定本轮已成功的会话核验。
                     emit_session("unknown", f"平台请求异常，无法确认会话：{exc}")
-                print(f"WATCHER_STATUS 平台采集暂时失败 · 等待重试：{exc}", flush=True)
                 now = datetime.now()  # 页面/API 慢、超时、429、5xx 都属于数据采集瞬时故障。 不弹登录窗口，不修改本人占用状态，也绝不发送开机请求。
-                print( f"[{now:%H:%M:%S}] AutoDL 主机接口暂时不可用：{exc} | " "本轮跳过开机，保持登录状态并自动重试。", flush=True, )
+                print(_red_terminal_text(f"[{now:%H:%M:%S}] 监控{monitor_entry} | 本轮采集暂时失败 | 动作：跳过开机，等待重试：{exc}"), flush=True)
                 logger.warning("platform transient failure: %s", exc)
             except Exception as exc:
+                if args.ui:
+                    emit_gpu_samples([], [], config.monitor.stale_after_seconds, "本轮采集不可用")
                 if not platform_session_verified:
                     emit_session("unknown", f"主机接口核验失败，无法确认会话：{exc}")
-                print(f"WATCHER_STATUS 本轮采集失败 · 等待重试：{exc}", flush=True)
                 now = datetime.now()  # 本轮任意环节抛异常 → 打日志，不中断循环
-                print(f"[{now:%H:%M:%S}] 本轮失败：{exc}", flush=True)
+                print(_red_terminal_text(f"[{now:%H:%M:%S}] 监控{monitor_entry} | 本轮采集失败 | 动作：等待重试：{exc}"), flush=True)
                 logger.exception("collection/auto-start cycle failed")
 
             cycles += 1  # 控制循环间隔：睡眠到距离上次开始正好 poll_seconds

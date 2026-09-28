@@ -72,12 +72,23 @@ def _edge_process_query_script(user_data_dir: Path, *, kill: bool) -> str:  # �
     )
 
 
+class LocalStartupError(RuntimeError):  # 本地组件缺失不代表网络故障或登录失效。
+    pass
+
+
+def _powershell_executable() -> str:  # 使用系统绝对路径，GUI继承精简PATH时也可启动辅助进程。
+    executable = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if not executable.is_file():
+        raise LocalStartupError(f"未找到 Windows PowerShell：{executable}；请修复系统组件后重试")
+    return str(executable)
+
+
 def edge_process_command_lines(user_data_dir: Path) -> list[str]:  # 读取使用指定 profile 的 Edge 进程命令行；非 Windows 返回空列表。
     if os.name != "nt":
         return []
     completed = subprocess.run(
         [
-            "powershell.exe",
+            _powershell_executable(),
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
@@ -100,7 +111,7 @@ def terminate_profile_edge_processes(user_data_dir: Path) -> None:  # 静默关�
         return
     subprocess.run(
         [
-            "powershell.exe",
+            _powershell_executable(),
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
@@ -275,6 +286,9 @@ def main() -> None:
         collector = PlatformBrowserCollector(config.platform)
         collector.collect()  # 复制Cookie不是登录成功，必须由真实主机接口确认。
         emit_session("valid", "登录会话有效，已通过实际接口核验")
+    except LocalStartupError as exc:
+        emit_session("unknown", f"本地启动失败：{exc}")
+        raise SystemExit(5) from None
     except PlatformAuthenticationError as exc:
         emit_session("invalid", f"登录会话失效，请重新登录：{exc}")
         raise SystemExit(3) from None

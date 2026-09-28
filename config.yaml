@@ -10,10 +10,10 @@
 # stale_after_seconds: 采样超过此秒数视为过期
 # reset_busy_samples:  连续忙碌多少次后重置告警状态
 monitor:
-  poll_seconds: 10
+  poll_seconds: 60
   confirmation_seconds: 0
   min_idle_samples: 1
-  max_sample_gap_seconds: 20
+  max_sample_gap_seconds: 120
   stale_after_seconds: 90
   reset_busy_samples: 1
 
@@ -95,19 +95,11 @@ auto_start:
       priority: 10
       enabled: true
 
-usage_tracking:
-  enabled: true
-  interval_seconds: 60
+occupancy:
   # 本人在“查看占用”弹窗中的用户标识；用于识别“已经成功开机”状态。
   self_user: "姜wen"
   # v0.5.4：一次空弹窗不再判定本人已关机；必须连续两次可靠空快照。
   absent_confirmations_required: 2
-  # 第一次疑似下机后下一轮立即复核，而不是再等完整 60 秒。
-  absence_recheck_seconds: 5
-  # SQLite 是实时写入的唯一事实源。WPS/Excel 打开 CSV 不会再阻塞监控。
-  database_path: "runtime/usage/occupancy.db"
-  # python -m autodl_watcher.usage_report 每次导出到独立时间戳目录。
-  export_dir: "runtime/usage/exports"
 
 notification:
   console_enabled: true
