@@ -187,14 +187,14 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         servers = ttk.Frame(left)
         servers.pack(fill="x")
         self.table = ttk.Treeview(servers, columns=("entry", "slots", "target", "training"), show="headings", height=5, selectmode="browse")
-        for column, title, width in [("entry", "服务器", 100), ("slots", "空闲/总数", 65), ("target", "自动开机", 78), ("training", "训练SSH", 85)]:
+        for column, title, width in [("entry", "服务器", 100), ("slots", "空闲/总数", 65), ("target", "自动开机", 78), ("training", "训练SSH·设置", 90)]:
             self.table.heading(column, text=title)
             self.table.column(column, width=width, stretch=False)
         self.table.pack(side="left", fill="y")
         scroll = ttk.Scrollbar(servers, orient="vertical", command=self.table.yview)
         scroll.pack(side="right", fill="y")
         self.table.configure(yscrollcommand=scroll.set)
-        self.table.bind("<Button-1>", lambda event: "break" if self.process is not None else None)
+        self.table.bind("<Button-1>", self._table_click)
         self.table.bind("<Key>", lambda event: "break" if self.process is not None else None)
         self.table.bind("<<TreeviewSelect>>", lambda event: self._render_gpus())
         self.gpu_panel = ttk.LabelFrame(left, text="物理 GPU", padding=(4, 3))
@@ -256,8 +256,15 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
             pane.select(server.id)
             self.external_panes[server.id] = (page, title, pane)
 
-    def configure_training(self):
-        entry = self.selected_entry()
+    def _table_click(self, event):
+        entry = self.table.identify_row(event.y)
+        if entry and self.table.identify_column(event.x) == "#4":
+            self.configure_training(entry)  # 编辑点击行；不改变正在监控的入口或正在查看的训练连接。
+            return "break"
+        return "break" if self.process is not None else None
+
+    def configure_training(self, entry=None):
+        entry = entry or self.selected_entry()
         if not entry:
             return
         server = next((item for item in self.servers if item.entry == entry), None)
@@ -279,22 +286,20 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
             ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=4)
             values[key] = tk.StringVar(value=str(getattr(server, key)))
             ttk.Entry(form, textvariable=values[key], width=42).grid(row=row, column=1, sticky="ew", pady=4)
-        ttk.Label(form, text="使用已有SSH密钥和已核验主机；不会保存密码，也不会修改远端训练。\n首次连接请先在终端确认SSH可用。正常测试可能较长，无新日志不等于死锁。", wraplength=570).grid(row=6, column=0, columnspan=2, sticky="w", pady=8)
+        ttk.Label(form, text="使用已有SSH密钥和已核验主机；不会保存密码，也不会修改远端训练。\n首次连接请先在终端确认SSH可用。监控中可保存，新配置下次启动本服务器训练监控时生效。", wraplength=570).grid(row=6, column=0, columnspan=2, sticky="w", pady=8)
         reason = ttk.Label(form, foreground="#b42318", wraplength=570)
         reason.grid(row=7, column=0, columnspan=2, sticky="w")
         def apply():
             try:
                 updated = replace(server, **{key: value.get().strip() for key, value in values.items() if key != "stalled_minutes"},
                                   stalled_minutes=float(values["stalled_minutes"].get())).validate()
-                existing = self.training.states.get(server.id)
-                if existing and (existing["active"] or existing["busy"]):
-                    raise ValueError("请先停止此服务器的训练监控，等当前采集结束后再保存")
                 servers = [updated if item.id == server.id else item for item in self.servers]
                 if not any(item.id == server.id for item in self.servers):
                     servers.append(updated)
                 save_servers(self.server_file, servers)
                 self.servers = servers
                 self.training.register(updated)
+                self._training_columns()
                 self._server_tabs()
                 if updated.id in self.external_panes:
                     page, title, pane = self.external_panes[updated.id]
@@ -371,6 +376,8 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
             return "未配置"
         state = self.training.states[server.id]
         snapshot = state["snapshot"]
+        if state.get("pending"):
+            return "已存待用"
         if snapshot and snapshot.get("error"):
             return "连接失败"
         if state["active"]:

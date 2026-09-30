@@ -75,7 +75,7 @@ class TrainingWindowTest(unittest.TestCase):
                 if level == "success":
                     state["snapshot"]["cards"][0].update(level="success", status="正在测试")
                 pane.render()
-                self.assertIn(label, self.texts(pane))
+                self.assertTrue(any(label in text for text in self.texts(pane)))
                 card = pane.content.winfo_children()[-1]
                 self.assertEqual(card.cget("background"), COLORS[level][0])
                 self.assertTrue(any("AUC 0.8800" in value for value in self.texts(pane)))
@@ -145,6 +145,69 @@ class TrainingWindowTest(unittest.TestCase):
         state.update(active=True, snapshot=state["tracker"].update(snapshot()))
         window._training_columns()
         self.assertEqual(window.table.set("autodl-203-1", "training"), "已连接")
+
+    def test_pending_config_can_be_saved_while_platform_and_training_are_running(self):
+        from unittest.mock import Mock
+        from autodl_watcher.training import load_servers
+        window = self.window
+        state = window.training.states["s"]
+        state.update(active=True, busy=True, snapshot=state["tracker"].update(snapshot(now=time.time())))
+        window.process, window.job = Mock(), "monitor"
+        old = state["server"]
+        window.configure_training("autodl-203-1")
+        dialog = next(child for child in self.root.winfo_children() if isinstance(child, tk.Toplevel))
+        fields = [child for child in descendants(dialog) if isinstance(child, gui.ttk.Entry)]
+        fields[1].delete(0, "end"); fields[1].insert(0, "replacement")
+        next(child for child in descendants(dialog) if isinstance(child, gui.ttk.Button) and child.cget("text") == "保存连接").invoke()
+        self.assertFalse(dialog.winfo_exists())
+        self.assertEqual(load_servers(window.server_file)[0].ssh_alias, "replacement")
+        self.assertEqual(state["server"], old)
+        self.assertTrue(state["active"] and state["busy"])
+        self.assertEqual(state["pending"].ssh_alias, "replacement")
+        self.assertEqual(window.table.set("autodl-203-1", "training"), "已存待用")
+        self.assertIn("下次启动训练监控生效", window.training_pane.summary.cget("text"))
+        window.process = None; state["busy"] = False
+
+    def test_ssh_cell_opens_clicked_server_without_switching_running_entry(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        window = self.window
+        window.process = Mock()
+        with patch.object(window.table, "identify_row", return_value="autodl-203-2"), patch.object(window.table, "identify_column", return_value="#4"), patch.object(window, "edit_server") as editor:
+            self.assertEqual(window._table_click(SimpleNamespace(x=0, y=0)), "break")
+            editor.assert_called_once_with(None, "autodl-203-2")
+        self.assertEqual(window.selected_entry(), "autodl-203-1")
+        self.assertEqual(window.training_pane.server_id, "s")
+        window.process = None
+
+    def test_failed_config_write_does_not_change_running_or_saved_settings(self):
+        window = self.window
+        state = window.training.states["s"]
+        state["active"] = True
+        before = window.server_file.read_bytes()
+        window.edit_server("s")
+        dialog = next(child for child in self.root.winfo_children() if isinstance(child, tk.Toplevel))
+        with patch.object(gui, "save_servers", side_effect=OSError("模拟写入失败")):
+            next(child for child in descendants(dialog) if isinstance(child, gui.ttk.Button) and child.cget("text") == "保存连接").invoke()
+        self.assertTrue(dialog.winfo_exists())
+        self.assertEqual(window.server_file.read_bytes(), before)
+        self.assertIsNone(state["pending"])
+        self.assertTrue(state["active"])
+        self.assertTrue(any("模拟写入失败" in text for text in self.texts(dialog)))
+        dialog.destroy()
+
+    def test_card_packs_status_timestamp_and_memory_into_existing_rows(self):
+        pane = self.window.training_pane
+        state = self.window.training.states["s"]
+        value = snapshot(now=time.time()); value["tasks"][0]["gpu_memory_mb"] = 6144
+        state.update(active=True, snapshot=state["tracker"].update(value))
+        state["snapshot"]["cards"][0].update(status="正在测试", level="success", advanced_at=time.time())
+        pane.render()
+        labels = [child.cget("text") for child in pane.content.winfo_children()[-1].winfo_children() if isinstance(child, tk.Label)]
+        self.assertIn(state["snapshot"]["cards"][0]["name"], labels[0])
+        self.assertIn("正在测试", labels[0]); self.assertIn("最近进展", labels[0])
+        self.assertIn("PID", labels[1]); self.assertIn("用户", labels[1]); self.assertIn("GPU", labels[1]); self.assertIn("显存 6.00 GiB", labels[1])
+        self.assertFalse(any(line.startswith(("最近进展", "本任务显存")) for line in labels))
 
     def test_malformed_json_metrics_cannot_break_following_progress(self):
         text = '{"event":"train","metrics":null}\n' + '{"event":"train","epoch":3,"metrics":{"loss":0.5}}'

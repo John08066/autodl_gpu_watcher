@@ -19,14 +19,20 @@ class TrainingService:  # 每台服务器最多一个只读请求；线程只投
     def register(self, server):
         state = self.states.get(server.id)
         if state and (state["active"] or state["busy"]):
-            raise ValueError("请先停止此服务器的训练监控并等待当前请求结束")
+            state["pending"] = server if server != state["server"] else None  # 只保存下次使用的连接，本轮SSH请求继续使用原配置。
+            return
         self.states[server.id] = dict(server=server, tracker=TrainingTracker(server), active=False, busy=False,
-                                      generation=(state["generation"] + 1 if state else 0), due=0, interval=60, snapshot=None)
+                                      generation=(state["generation"] + 1 if state else 0), due=0, interval=60, snapshot=None, pending=None)
 
     def start(self, server_id, interval):
         state = self.states[server_id]
         if state["busy"] and not state["active"]:
             raise ValueError("前一次采集尚未结束，请稍后再开始")
+        if state["active"]:
+            return
+        if state.get("pending"):
+            self.register(state["pending"])  # 已结束旧请求后才换连接、清空旧来源的快照。
+            state = self.states[server_id]
         state.update(active=True, interval=interval, due=0)
 
     def stop(self, server_id):
@@ -118,10 +124,10 @@ def gpu_table(snapshot, name):
 def task_memory(card):
     value = card.get("gpu_memory_mb")
     if not card.get("alive"):
-        return "本任务显存：—（进程已退出）"
+        return "显存 —（已退出）"
     if value is None:
-        return "本任务显存：无法核验（不使用整卡显存代替）"
-    return f"本任务显存：{value/1024:.2f} GiB · {value:.0f} MiB（进程统计）"
+        return "显存 无法核验"
+    return f"显存 {value/1024:.2f} GiB"
 
 class TrainingPane(ttk.Frame):
     def __init__(self, parent, service, configure_server, interval, show_gpus=True):
@@ -136,7 +142,8 @@ class TrainingPane(ttk.Frame):
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(bar, text="停止", command=self.stop)
         self.stop_button.pack(side="left", padx=4)
-        ttk.Button(bar, text="设置连接", command=configure_server).pack(side="right")
+        self.configure_button = ttk.Button(bar, text="设置连接", command=configure_server)
+        self.configure_button.pack(side="right")
         self.summary = ttk.Label(self, text="尚未配置训练连接", wraplength=560)
         self.summary.pack(fill="x", pady=(0, 5))
         if show_gpus:
@@ -144,7 +151,7 @@ class TrainingPane(ttk.Frame):
             output.pack(fill="x", pady=(0, 5))
             horizontal = ttk.Scrollbar(output, orient="horizontal")
             horizontal.pack(side="bottom", fill="x")
-            self.gpu_log = ScrolledText(output, height=5, wrap="none", state="disabled", font=("Consolas", 9),
+            self.gpu_log = ScrolledText(output, height=5, width=1, wrap="none", state="disabled", font=("Consolas", 9),
                                        background="#0e151d", foreground="#8bf0ad", xscrollcommand=horizontal.set, padx=5, pady=3)
             self.gpu_log.pack(fill="x")
             horizontal.configure(command=self.gpu_log.xview)
@@ -201,7 +208,8 @@ class TrainingPane(ttk.Frame):
         snapshot = state["snapshot"] if state else None
         expired = bool(snapshot and time.time() - snapshot["received_at"] > max(90, state["interval"] * 2))
         key = (self.server_id, state["active"] if state else False, state["busy"] if state else False,
-               snapshot["received_at"] if snapshot else None, expired)
+               snapshot["received_at"] if snapshot else None, expired, state.get("pending") if state else None,
+               state["generation"] if state else None)
         if key == self.render_key:
             return
         self.render_key = key
@@ -218,6 +226,8 @@ class TrainingPane(ttk.Frame):
             text = f"{state['server'].name} · SSH用户 {snapshot.get('user', '—')} · 最近采集 {datetime.fromtimestamp(snapshot['received_at']):%H:%M:%S}"
         else:
             text = "正在连接，读取本人训练进程与日志…"
+        if state and state.get("pending"):
+            text += " · 新连接已保存，下次启动训练监控生效"
         self.summary.configure(text=text, foreground="#9a6700" if warning else "#245c45")
         position = self.canvas.yview()[0]
         for child in self.content.winfo_children():
@@ -240,11 +250,12 @@ class TrainingPane(ttk.Frame):
         for card in cards:
             level = "error" if card["level"] == "error" else "warning" if warning or not state["active"] else card["level"]
             frame = self._card(level)
-            self._label(frame, card["name"], bold=True)
-            self._label(frame, card["status"] + (" · 最近结果" if warning or not state["active"] else ""), color=COLORS[level][1])
-            gpu = ",".join(f"#{index}" for index in card.get("gpu_indices", [])) or "关联未确认"
-            self._label(frame, f"PID {card['pid']} · 用户 {card.get('user', '—')} · GPU {gpu}")
-            self._label(frame, task_memory(card) + (" · 上次采样" if warning or not state["active"] else ""), bold=True)
+            when = datetime.fromtimestamp(card["advanced_at"]).strftime("%m-%d %H:%M:%S")
+            suffix = " · 最近结果" if warning or not state["active"] else ""
+            self._label(frame, f"{card['name']} · {card['status']} · 最近进展 {when}{suffix}", bold=True, color=COLORS[level][1])
+            gpu = ",".join(f"#{index}" for index in card.get("gpu_indices", [])) or "待确认"
+            self._label(frame, f"PID {card['pid']} · 用户 {card.get('user', '—')} · GPU {gpu} · {task_memory(card)}"
+                        + (" · 上次采样" if warning or not state["active"] else ""))
             progress = card["progress"]
             epoch, total = progress.get("epoch"), progress.get("total_epochs")
             raw = f" · 日志Epoch {progress['raw_epoch']}" if progress.get("raw_epoch") is not None else ""
@@ -257,8 +268,6 @@ class TrainingPane(ttk.Frame):
                 self._label(frame, f"测试 {dataset}（第{summary.get('epoch', '—')}轮，Step {summary.get('step', '—')}）：{metrics_text(summary)}")
             if progress.get("error"):
                 self._label(frame, progress["error"], color=COLORS["error"][1])
-            when = datetime.fromtimestamp(card["advanced_at"]).strftime("%m-%d %H:%M:%S")
-            self._label(frame, f"最近进展 {when}")
             ttk.Button(frame, text="日志详情", command=lambda item=card: self.details(item)).pack(anchor="e", padx=8, pady=(2, 6))
 
         self.content.update_idletasks()
