@@ -35,3 +35,9 @@
 - Windows辅助PowerShell必须使用`SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe`绝对路径。仅给`subprocess.run(env=...)`删PATH不足以复现Windows程序查找故障，须限制父进程PATH或让成品EXE实际继承该环境；窗口出现也不能代替刷新/登录验收。v0.7.0首版曾因交付窗口继承精简PATH触发WinError 2，同版已修复。2026-09-28实际验证精简PATH下刷新、原生登录与同步核验、只读监控及停止；`login.py`、`tests/test_login.py`、`runtime/validation/v0.7.0-path-repair/gui-live-verification.json`。
 - 普通GUI默认真实开机，`--debug`默认只读；打开窗口只核验会话，仍需点击开始监控。停止使用自有stop文件并等worker安全退出，再正常关窗，不强杀共享浏览器。显示高度1000x800沿用用户设置。
 - 改写Git说明前保存`git bundle --all`及原refs，逐提交验证代码树、作者时间、映射后的父关系不变；本地改写不代表远程已同步。v0.7.0备份`.tools/backups/v0.7.0-before/history.bundle`。
+
+## 训练进度与SSH只读采集
+
+- v0.8.0用已有SSH别名，`BatchMode=yes`、`ClearAllForwardings=yes`、严格主机校验；通过stdin执行标准库探针，不落远端文件。本人UID的训练根进程按boot_id/PID/start_ticks识别，DataLoader子进程不重复统计，日志从打开的fd关联。读取无关SSH/systemd进程cwd可能PermissionError，不能因此认定训练列表残缺；仅Python进程读取cwd。代码`remote_probe.py`；2026-09-30实际只读验证203-1及4090，证据`runtime/validation/v0.8.0/gui-live-verification.json`。
+- DeepfakeBench当前`training/train.py`使用`range(start_epoch,nEpochs+1)`：0..30共31轮；`Epoch[1]`是显示第2轮。`Test Done!`不等于整体完成；各测试集更新时刻不同，保留各自epoch/step，不能统一标成当前轮次。DFDC测试曾实际观察约49分钟无新日志，因此默认120分钟仅提示待核查。代码`training.py`；2026-09-30实际日志/源码核验，OOM、未知退出及重复打印由`tests/test_training.py`模拟验证。
+- 203容器的GPU宿主PID可能在容器/proc中不存在；整卡利用率不能证明本人进程占用。v0.8.0容器统一显示GPU关联未确认，裸机仅在本人PID与GPU UUID直接相符时展示索引。当前203一项训练、4090两项训练实际只读验证；不把该验证扩展为所有容器或所有训练框架的保证。

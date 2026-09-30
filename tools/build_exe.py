@@ -8,19 +8,20 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def main():  # 只收集应用代码和依赖，绝不把 runtime、.ui 或 .env 加入发行包。
+def main(stage_only=False):  # 只收集应用代码和依赖，绝不把 runtime、.ui 或 .env 加入发行包。
     folder = ROOT / ".tools" / "build"
     folder.mkdir(parents=True, exist_ok=True)
     spec = folder / "AutoDLWatcher.spec"
     library_bin = Path(sys.prefix) / "Library" / "bin"
     binaries = [(str(library_bin / name), ".") for name in
                 ("libssl-3-x64.dll", "libcrypto-3-x64.dll") if (library_bin / name).is_file()]
+    datas = [(str(ROOT / "src/autodl_watcher/remote_probe.py"), "autodl_watcher")]  # SSH仅发送这份只读标准库探针。
     env = os.environ.copy()
     if library_bin.is_dir():
         env["PATH"] = str(library_bin) + os.pathsep + env.get("PATH", "")  # Conda DLL 必须与打包解释器一致。
     spec.write_text(f"""a = Analysis(
     [{str(ROOT / 'tools/gui_entry.py')!r}, {str(ROOT / 'tools/worker_entry.py')!r}],
-    pathex=[{str(ROOT / 'src')!r}], binaries={binaries!r}, datas=[], hiddenimports=[],
+    pathex=[{str(ROOT / 'src')!r}], binaries={binaries!r}, datas={datas!r}, hiddenimports=[],
     hookspath=[], hooksconfig={{}}, runtime_hooks=[], excludes=[])
 pyz = PYZ(a.pure)
 gui = EXE(pyz, a.scripts[:-2] + [a.scripts[-2]], [], exclude_binaries=True,
@@ -37,6 +38,9 @@ COLLECT(gui, a.binaries, a.datas, [('AutoDLWorker.exe', worker.name, 'BINARY')],
                     str(spec)], cwd=ROOT, env=env, check=True)
     release = ROOT  # 主程序直接放项目根目录，沿用已有配置和运行资料。
     staged = folder / "release" / "AutoDLWatcher"
+    if stage_only:
+        print(f"暂存构建：{staged}")
+        return staged  # 验证通过后才替换正在使用的主程序。
     shutil.copyfile(staged / "AutoDLWatcher.exe", release / "AutoDLWatcher.exe")
     shutil.copytree(staged / "_internal", release / "_internal", dirs_exist_ok=True)  # 只合并生成依赖，保留用户配置、登录资料与日志。
     print(f"GUI: {release / 'AutoDLWatcher.exe'}")
@@ -44,4 +48,7 @@ COLLECT(gui, a.binaries, a.datas, [('AutoDLWorker.exe', worker.name, 'BINARY')],
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stage-only", action="store_true", help="仅生成暂存发行包，保留正在运行的版本")
+    main(stage_only=parser.parse_args().stage_only)

@@ -66,7 +66,8 @@ class PackageLayoutTest(unittest.TestCase):
 
     def test_build_entry_uses_explicit_files_without_personal_data(self):
         source = (self.root / "tools/build_exe.py").read_text(encoding="utf-8")
-        self.assertIn("datas=[]", source)
+        self.assertIn("src/autodl_watcher/remote_probe.py", source)
+        self.assertNotIn("collect_data_files", source)
         self.assertIn("gui_entry.py", source)
         self.assertIn("worker_entry.py", source)
         self.assertNotIn("--collect-all", source)
@@ -88,10 +89,12 @@ class PackageLayoutTest(unittest.TestCase):
                 path.write_text(content, encoding="utf-8")
             def fake_build(*args, **kwargs):
                 staged = root / ".tools/build/release/AutoDLWatcher"
-                (staged / "_internal").mkdir(parents=True)
+                (staged / "_internal").mkdir(parents=True, exist_ok=True)
                 (staged / "AutoDLWatcher.exe").write_bytes(b"gui")
                 (staged / "_internal/AutoDLWorker.exe").write_bytes(b"worker")
             with patch.dict(build.__globals__, ROOT=root), patch("subprocess.run", side_effect=fake_build):
+                build(stage_only=True)
+                self.assertFalse((root / "AutoDLWatcher.exe").exists())
                 build()
             self.assertEqual(profile.read_text(encoding="utf-8"), "user data")
             self.assertEqual((release / "config.yaml").read_text(encoding="utf-8"), "user settings")

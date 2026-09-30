@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import threading
+import uuid
 import tkinter as tk
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -20,6 +21,8 @@ from .cli import normalize_host
 from .config import load_config
 from .login import LocalStartupError
 from .main import positive_seconds
+from .training import TrainingServer, load_servers, save_servers
+from .training_ui import TrainingPane, TrainingService
 from .session import GPU_PREFIX, REPORT_PREFIX, SESSION_PREFIX, emit_gpu_samples, emit_session
 
 ROOT = (Path(os.environ.get("AUTODL_APP_ROOT", Path(sys.executable).parent)).resolve()
@@ -100,6 +103,16 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         self.gpu_snapshot = {"samples": [], "error": "尚未采样"}
         self._gpu_render_key = None
         self.saved_entry = ""
+        self.training = TrainingService(self.events)
+        self.server_file = self.local / "servers.json"
+        self.servers, self.external_panes = [], {}
+        self.title_text = tk.StringVar(value="AutoDL 平台")
+        try:
+            self.servers = load_servers(self.server_file)
+            for server in self.servers:
+                self.training.register(server)
+        except (OSError, ValueError, TypeError) as exc:
+            self.status.set(f"训练连接配置读取失败：{exc}")
         preferences = self.local / "preferences.json"
         if preferences.exists():
             try:
@@ -122,12 +135,12 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         self.root.minsize(820, 660)  # 限制手动缩小时的最小尺寸，避免控件完全挤出窗口。
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure("Treeview", rowheight=24, font=("Microsoft YaHei UI", 9))
+        style.configure("Treeview", rowheight=22, font=("Microsoft YaHei UI", 9))
         style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9))
         style.configure("TButton", padding=(10, 5))
         style.configure("GPU.Horizontal.TProgressbar", background="#397ca8")
         style.configure("Memory.Horizontal.TProgressbar", background="#34865b")
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 16, "bold"))
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 14, "bold"))
         self.check_images = []  # Tk不会持有Python图片引用；保留它们，防止勾选标记被回收。
         for selected in (False, True):
             indicator = tk.PhotoImage(master=self.root, width=16, height=16)
@@ -142,80 +155,163 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         style.layout("Watcher.TCheckbutton", [("Checkbutton.padding", {"sticky": "nswe", "children": [
             ("Watcher.indicator", {"side": "left", "sticky": ""}),
             ("Checkbutton.focus", {"side": "left", "sticky": "w", "children": [("Checkbutton.label", {"sticky": "nswe"})]})]})])
-        frame = ttk.Frame(self.root, padding=12)
+        frame = ttk.Frame(self.root, padding=8)
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="AutoDL GPU Watcher", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(frame, text="选择服务器 · 配置监控 · 查看实时状态").pack(anchor="w", pady=(2, 6))
-        toolbar = ttk.Frame(frame)
-        toolbar.pack(fill="x", pady=(0, 6))
+        self.notebook = ttk.Notebook(frame)
+        self.notebook.pack(fill="both", expand=True, pady=(3, 0))
+        self.auto_page = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(self.auto_page, text="AutoDL 平台")
+        page = self.auto_page
+        ttk.Label(page, textvariable=self.title_text, style="Title.TLabel").pack(anchor="w")
+        toolbar = ttk.Frame(page)
+        toolbar.pack(fill="x", pady=4)
         self.refresh_button = ttk.Button(toolbar, text="刷新服务器", command=self.refresh)
         self.refresh_button.pack(side="left")
         self.login_button = ttk.Button(toolbar, text="登录 / 更新会话", command=self.login)
-        self.login_button.pack(side="left", padx=8)
+        self.login_button.pack(side="left", padx=5)
         self.login_done = ttk.Button(toolbar, text="已登录并关闭浏览器", command=self.finish_login, state="disabled")
         self.login_done.pack(side="left")
-        self.session_label = ttk.Label(frame, textvariable=self.session_text, foreground="#7a5a18", wraplength=900)
-        self.session_label.pack(anchor="w", pady=(0, 6))
-        frame.bind("<Configure>", lambda event: self.session_label.configure(wraplength=max(200, event.width - 40)))
-        dashboard = ttk.Frame(frame)
-        dashboard.pack(fill="x")
-        servers = ttk.Frame(dashboard)
-        servers.pack(side="left", fill="y")
+        ttk.Button(toolbar, text="＋ 添加服务器", command=lambda: self.edit_server()).pack(side="right")
+        self.session_label = ttk.Label(page, textvariable=self.session_text, foreground="#7a5a18", wraplength=920)
+        self.session_label.pack(anchor="w", pady=(0, 4))
+        page.bind("<Configure>", lambda event: self.session_label.configure(wraplength=max(200, event.width - 20)))
+        body = ttk.Frame(page)
+        body.pack(fill="x")
+        left = ttk.Frame(body, width=330)
+        left.pack(side="left", fill="y")
+        right = ttk.LabelFrame(body, text="我的训练任务", padding=6)
+        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        self.training_pane = TrainingPane(right, self.training, self.configure_training, self.poll.get)
+        self.training_pane.pack(fill="both", expand=True)
+        servers = ttk.Frame(left)
+        servers.pack(fill="x")
         self.table = ttk.Treeview(servers, columns=("entry", "slots", "target"), show="headings", height=5, selectmode="browse")
-        for column, title, width in [("entry", "服务器入口", 120), ("slots", "空闲 / 总数", 90), ("target", "自动开机", 90)]:
+        for column, title, width in [("entry", "服务器", 115), ("slots", "空闲 / 总数", 88), ("target", "自动开机", 93)]:
             self.table.heading(column, text=title)
             self.table.column(column, width=width, stretch=False)
         self.table.pack(side="left", fill="y")
         scroll = ttk.Scrollbar(servers, orient="vertical", command=self.table.yview)
         scroll.pack(side="right", fill="y")
         self.table.configure(yscrollcommand=scroll.set)
-        self.table.bind("<Button-1>", lambda event: "break" if self.process is not None else None)  # 运行中锁定监控入口。
+        self.table.bind("<Button-1>", lambda event: "break" if self.process is not None else None)
         self.table.bind("<Key>", lambda event: "break" if self.process is not None else None)
         self.table.bind("<<TreeviewSelect>>", lambda event: self._render_gpus())
-        self.gpu_panel = ttk.LabelFrame(dashboard, text="物理 GPU", padding=(8, 4))
-        self.gpu_panel.pack(side="left", fill="both", expand=True, padx=(10, 0))
-        ttk.Label(frame, text="右侧为所选入口的物理 GPU；203-1、203-2 共用同一主机。未配置实例的入口可只读监控。",
-                  font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=4)
-        options = ttk.LabelFrame(frame, text="监控设置", padding=6)
-        options.pack(fill="x", pady=4)
+        self.gpu_panel = ttk.LabelFrame(left, text="物理 GPU", padding=(4, 3))
+        self.gpu_panel.pack(fill="x", pady=4)
+        options = ttk.LabelFrame(left, text="AutoDL 监控设置", padding=4)
+        options.pack(fill="x", pady=3)
         self.inputs = []
-        for col, (label, value) in enumerate([("本人用户名", self.user), ("采样间隔（秒）", self.poll)]):
-            ttk.Label(options, text=label).grid(row=0, column=col, sticky="w", padx=5)
-            entry = ttk.Entry(options, textvariable=value, width=24)
-            entry.grid(row=1, column=col, sticky="ew", padx=5, pady=3)
-            options.columnconfigure(col, weight=1)
+        for col, (label, value) in enumerate([("用户", self.user), ("间隔/秒", self.poll)]):
+            ttk.Label(options, text=label).grid(row=0, column=col * 2, sticky="w", padx=2)
+            entry = ttk.Entry(options, textvariable=value, width=12 if col == 0 else 6)
+            entry.grid(row=0, column=col * 2 + 1, sticky="ew", padx=2, pady=3)
+            options.columnconfigure(col * 2 + 1, weight=1)
             self.inputs.append(entry)
-        self.live_check = ttk.Checkbutton(options, text="启用真实自动开机（会产生 AutoDL 费用）", variable=self.live, style="Watcher.TCheckbutton",
+        self.live_check = ttk.Checkbutton(options, text="启用真实自动开机（会产生费用）", variable=self.live, style="Watcher.TCheckbutton",
                                           command=lambda: self.convert_no_gpu.set(False) if not self.live.get() else None)
-        self.live_check.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=3)
-        self.convert_check = ttk.Checkbutton(options, text="空闲达标时关闭本账号全部无卡实例，再有卡开机（会中断其他实例）", variable=self.convert_no_gpu, style="Watcher.TCheckbutton")
-        self.convert_check.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=3)
-        controls = ttk.Frame(frame)
-        controls.pack(fill="x", pady=5)
-        self.start_button = ttk.Button(controls, text="开始监控", command=self.start)
+        self.live_check.grid(row=1, column=0, columnspan=4, sticky="w", pady=2)
+        self.convert_check = ttk.Checkbutton(options, text="关闭本账号全部无卡实例（会中断）", variable=self.convert_no_gpu, style="Watcher.TCheckbutton")
+        self.convert_check.grid(row=2, column=0, columnspan=4, sticky="w", pady=2)
+        controls = ttk.Frame(left)
+        controls.pack(fill="x", pady=4)
+        self.start_button = ttk.Button(controls, text="开始监控", command=self.start, width=8)
         self.start_button.pack(side="left")
-        self.stop_button = ttk.Button(controls, text="停止监控", command=self.stop, state="disabled")
-        self.stop_button.pack(side="left", padx=8)
-        self.save_button = ttk.Button(controls, text="保存设置", command=self.save)
+        self.stop_button = ttk.Button(controls, text="停止监控", command=self.stop, state="disabled", width=8)
+        self.stop_button.pack(side="left", padx=4)
+        self.save_button = ttk.Button(controls, text="保存设置", command=self.save, width=8)
         self.save_button.pack(side="left")
-        self.status_label = ttk.Label(frame, textvariable=self.status, foreground="#245cc4")
+        self.status_label = ttk.Label(page, textvariable=self.status, foreground="#245cc4")
         self.status_label.pack(anchor="w", fill="x", pady=4)
         self.status.trace_add("write", lambda *_: self.status_label.configure(
             foreground={"success": "#18733a", "error": "#b42318"}.get(log_tag(self.status.get()), "#245cc4")))
-        log_frame = ttk.Frame(frame)
+        log_frame = ttk.Frame(page)
         log_frame.pack(fill="both", expand=True)
         horizontal = ttk.Scrollbar(log_frame, orient="horizontal")
         horizontal.pack(side="bottom", fill="x")
-        self.log = ScrolledText(log_frame, height=12, wrap="none", state="disabled", font=("Microsoft YaHei UI", 9),
-                                xscrollcommand=horizontal.set,
-                                background="#17202e", foreground="#e2e8f0", padx=10, pady=10)
+        self.log = ScrolledText(log_frame, height=8, wrap="none", state="disabled", font=("Microsoft YaHei UI", 9),
+                                xscrollcommand=horizontal.set, background="#17202e", foreground="#e2e8f0", padx=8, pady=6)
         horizontal.configure(command=self.log.xview)
         self.log.tag_configure("success", foreground="#79e69d")
         self.log.tag_configure("error", foreground="#ff8181")
-        self.log.pack(fill="both", expand=True)  # 横向滚动保留每轮两行，纵向空间优先分给日志。
+        self.log.pack(fill="both", expand=True)
+        self._server_tabs()
+
+    def _server_tabs(self):
+        for server in self.servers:
+            if server.entry or server.id in self.external_panes:
+                continue
+            page = ttk.Frame(self.notebook, padding=10)
+            self.notebook.add(page, text=server.name)
+            title = ttk.Label(page, text=server.name, style="Title.TLabel")
+            title.pack(anchor="w")
+            options = ttk.Frame(page)
+            options.pack(fill="x", pady=4)
+            ttk.Label(options, text="采样间隔（秒）").pack(side="left")
+            ttk.Button(options, text="＋ 添加服务器", command=lambda: self.edit_server()).pack(side="right")
+            interval = tk.StringVar(value="60")
+            ttk.Entry(options, textvariable=interval, width=9).pack(side="left", padx=5)
+            pane = TrainingPane(page, self.training, lambda key=server.id: self.edit_server(key), interval.get, show_gpus=True)
+            pane.pack(fill="both", expand=True)
+            pane.select(server.id)
+            self.external_panes[server.id] = (page, title, pane)
+
+    def configure_training(self):
+        entry = self.selected_entry()
+        if not entry:
+            return
+        server = next((item for item in self.servers if item.entry == entry), None)
+        self.edit_server(server.id if server else None, entry)
+
+    def edit_server(self, server_id=None, entry=""):
+        from dataclasses import replace
+        server = next((item for item in self.servers if item.id == server_id), None)
+        server = server or TrainingServer(entry or uuid.uuid4().hex, entry.removeprefix("autodl-") or "新服务器", "", entry=entry)
+        dialog = tk.Toplevel(self.root)
+        dialog.title("训练监控连接 · 只读SSH")
+        dialog.transient(self.root)
+        form = ttk.Frame(dialog, padding=14)
+        form.pack(fill="both", expand=True)
+        values = {}
+        fields = [("name", "显示名称"), ("ssh_alias", "SSH别名（用户.ssh/config）"), ("python", "远程Python路径"),
+                  ("project", "项目目录（可选，绝对路径）"), ("scripts", "训练脚本名（英文逗号分隔）"), ("stalled_minutes", "无进展提醒（分钟）")]
+        for row, (key, label) in enumerate(fields):
+            ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=4)
+            values[key] = tk.StringVar(value=str(getattr(server, key)))
+            ttk.Entry(form, textvariable=values[key], width=42).grid(row=row, column=1, sticky="ew", pady=4)
+        ttk.Label(form, text="使用已有SSH密钥和已核验主机；不会保存密码，也不会修改远端训练。\n首次连接请先在终端确认SSH可用。正常测试可能较长，无新日志不等于死锁。", wraplength=570).grid(row=6, column=0, columnspan=2, sticky="w", pady=8)
+        reason = ttk.Label(form, foreground="#b42318", wraplength=570)
+        reason.grid(row=7, column=0, columnspan=2, sticky="w")
+        def apply():
+            try:
+                updated = replace(server, **{key: value.get().strip() for key, value in values.items() if key != "stalled_minutes"},
+                                  stalled_minutes=float(values["stalled_minutes"].get())).validate()
+                existing = self.training.states.get(server.id)
+                if existing and (existing["active"] or existing["busy"]):
+                    raise ValueError("请先停止此服务器的训练监控，等当前采集结束后再保存")
+                servers = [updated if item.id == server.id else item for item in self.servers]
+                if not any(item.id == server.id for item in self.servers):
+                    servers.append(updated)
+                save_servers(self.server_file, servers)
+                self.servers = servers
+                self.training.register(updated)
+                self._server_tabs()
+                if updated.id in self.external_panes:
+                    page, title, pane = self.external_panes[updated.id]
+                    self.notebook.tab(page, text=updated.name)
+                    title.configure(text=updated.name)
+                    pane.render_key = None
+                    pane.render()
+                self._render_gpus()
+                dialog.destroy()
+            except (ValueError, OSError) as exc:
+                reason.configure(text=str(exc))
+        ttk.Button(form, text="保存连接", command=apply).grid(row=8, column=1, sticky="e", pady=8)
 
     def _render_gpus(self):  # 使用采样消息更新条形图；此处不发起网络查询。
         entry = self.selected_entry()
+        self.title_text.set(entry.removeprefix("autodl-") or "AutoDL 平台")
+        server = next((item for item in self.servers if item.entry == entry), None)
+        self.training_pane.select(server.id if server else None)
         host = normalize_host(entry) if entry else ""
         samples = sorted((item for item in self.gpu_snapshot["samples"] if item["host"] == host),
                          key=lambda item: item["gpu_index"])
@@ -242,18 +338,18 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         grid = ttk.Frame(self.gpu_panel)
         grid.pack(fill="both", expand=True)
         for col, title in enumerate(("GPU", "GPU 利用率", "显存占用率")):
-            ttk.Label(grid, text=title).grid(row=0, column=col, sticky="w", padx=4)
+            ttk.Label(grid, text=title, font=("Microsoft YaHei UI", 8)).grid(row=0, column=col, sticky="w", padx=4)
         grid.columnconfigure(1, weight=1)
         grid.columnconfigure(2, weight=1)
         for row, (index, name, stamp, stale, valid, util, used, total) in enumerate(rows, 1):
             ttk.Label(grid, text=f"#{index}").grid(row=row, column=0, padx=4, sticky="w")
             for col, value, label in ((1, util, f"{util:.0f}%"), (2, used / total * 100 if total else 0, f"{used / total * 100 if total else 0:.0f}% · {used:.0f}/{total:.0f} MB")):
                 cell = ttk.Frame(grid)
-                cell.grid(row=row, column=col, sticky="ew", padx=4, pady=3)
+                cell.grid(row=row, column=col, sticky="ew", padx=3, pady=1)
                 if stale or not valid:
                     ttk.Label(cell, text="数据已过期" if stale else "数据不可用", foreground="#7a5a18").pack(anchor="w")
                 else:
-                    ttk.Progressbar(cell, value=value, maximum=100, length=80,
+                    ttk.Progressbar(cell, value=value, maximum=100, length=35,
                                     style="GPU.Horizontal.TProgressbar" if col == 1 else "Memory.Horizontal.TProgressbar").pack(side="left", fill="x", expand=True)
                     ttk.Label(cell, text=label, font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(4, 0))
         ttk.Label(self.gpu_panel, text=f"{rows[0][1]} · 数据时间 {min(row[2] for row in rows)[11:19]}",
@@ -357,7 +453,9 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
                 except queue.Empty:
                     break
                 try:
-                    if kind == "exit":
+                    if kind == "training":
+                        self.training.receive(value)
+                    elif kind == "exit":
                         process, self.process = self.process, None  # 真实退出先解除任务锁，流清理异常不再卡住按钮。
                         self._busy(False)
                         if process is not None:
@@ -370,7 +468,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
                             self._session("unknown", "核验未完成，后台任务失败，请重试" if value else "核验未完成，后台任务已结束，请重试")
                         self.status.set(self.session_message if self.session_status in {"invalid", "unknown"}
                                         else "任务已结束" if value == 0 else "任务失败 · 请查看日志并重试")
-                        if self.closing:
+                        if self.closing and not self.training.busy():
                             reschedule = False
                             self.root.destroy()
                             return
@@ -409,6 +507,14 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
                     self.status.set(f"后台消息处理失败：{exc}")
         finally:
             if reschedule:
+                if self.closing and self.process is None and not self.training.busy():
+                    self.root.destroy()
+                    return
+                if not self.closing:
+                    self.training.tick()
+                self.training_pane.render()
+                for _, _, pane in self.external_panes.values():
+                    pane.render()
                 try:
                     self._render_gpus()
                 except (KeyError, TypeError, ValueError) as exc:
@@ -420,8 +526,12 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
             return
         self.stop_file.unlink(missing_ok=True)  # 清除该窗口上一次停止留下的信号，否则新进程会立即退出。
         self._launch(self._command(), "monitor")
+        if self.process is not None and self.training_pane.server_id:
+            self.training_pane.start()
 
     def stop(self):  # 请求协作退出，不强杀正在操作浏览器或数据库的进程。
+        if self.training_pane.server_id:
+            self.training_pane.stop()
         if self.process is not None and self.job == "monitor":
             self.stop_file.touch()  # 核心在采集步骤之间及轮询等待期间检查文件是否存在。
             self.stop_button.configure(state="disabled")
@@ -444,14 +554,16 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
                 self.status.set(f"登录同步失败：{exc}")
 
     def close(self):  # 空闲时立即关闭；任务运行中等待资源释放；登录中提示先完成同步。
-        if self.process is None:
-            self.root.destroy()
-        elif self.job == "login":
+        if self.process is not None and self.job == "login":
             messagebox.showinfo("登录尚未完成", "请先关闭登录浏览器并点击“已登录并关闭浏览器”。", parent=self.root)
         else:
             self.closing = True
+            self.training.stop_all()
             self.stop()
-            self.status.set("正在等待后台任务安全结束后关闭窗口…")
+            if self.process is None and not self.training.busy():
+                self.root.destroy()
+            else:
+                self.status.set("正在等待后台任务安全结束后关闭窗口…")
 
 
 def discover():  # 子进程模式：采集结果编码为一行 JSON，供父进程更新服务器表格。
