@@ -108,7 +108,7 @@ class TrainingTest(unittest.TestCase):
         self.assertEqual(later["level"], "warning")
 
     def test_process_exit_requires_error_or_completion_evidence(self):
-        for suffix, level, label in [("", "warning", "结果未确认"), ("RuntimeError: CUDA out of memory", "error", "异常中止"),
+        for suffix, level, label in [("", "error", "未确认正常完成"), ("RuntimeError: CUDA out of memory", "error", "异常中止"),
                                      ("Stop Training on best Testing metric .9", "idle", "已完成")]:
             with self.subTest(level=level):
                 card = TrainingTracker(self.server).update(snapshot(LOG+suffix, False))["cards"][0]

@@ -108,6 +108,44 @@ class TrainingWindowTest(unittest.TestCase):
         self.assertIsNone(state["snapshot"])
         self.assertFalse(any(state["active"] for state in self.window.training.states.values()))
 
+    def test_black_gpu_log_and_failure_card_stay_visible_after_disconnect_and_stop(self):
+        pane = self.window.training_pane
+        state = self.window.training.states["s"]
+        state["active"] = True
+        value = snapshot(LOG + "RuntimeError: CUDA out of memory")
+        value["tasks"][0]["gpu_memory_mb"] = 6144
+        state["snapshot"] = state["tracker"].update(value)
+        pane.render()
+        self.assertTrue(any("6.00 GiB" in text for text in self.texts(pane)))
+        self.assertEqual(pane.gpu_log.cget("wrap"), "none")
+        self.assertIn("VRAM整卡", pane.gpu_log.get("1.0", "end"))
+        first = pane.gpu_log.get("1.0", "end")
+        state["busy"] = True
+        pane.render()
+        self.assertEqual(pane.gpu_log.get("1.0", "end"), first)  # 请求进行中不能重复追加旧快照。
+        self.window.training.receive(("s", state["generation"], None, "SSH断连"))
+        pane.render()
+        self.assertEqual(pane.content.winfo_children()[-1].cget("background"), COLORS["error"][0])
+        pane.stop()
+        self.assertEqual(pane.content.winfo_children()[-1].cget("background"), COLORS["error"][0])
+        self.assertIn("上次数据不作为当前状态", pane.gpu_log.get("1.0", "end"))
+
+    def test_instance_and_ssh_columns_are_independent_and_unknown_is_readonly(self):
+        window = self.window
+        window._populate([("autodl-203-1", "0/2", "可开机"), ("autodl-203-2", "0/2", "可开机"), ("autodl-202-2", "3/3", "无实例")])
+        self.assertEqual(window.table.set("autodl-203-1", "training"), "待连接")
+        self.assertEqual(window.table.set("autodl-203-2", "training"), "未配置")
+        window.live.set(True); window.convert_no_gpu.set(True)
+        window.table.selection_set("autodl-202-2")
+        self.assertIn("--dry-run", window._command())
+        self.assertNotIn("--convert-no-gpu", window._command())
+        window.table.selection_set("autodl-203-1")
+        self.assertIn("--live", window._command())
+        state = window.training.states["s"]
+        state.update(active=True, snapshot=state["tracker"].update(snapshot()))
+        window._training_columns()
+        self.assertEqual(window.table.set("autodl-203-1", "training"), "已连接")
+
     def test_malformed_json_metrics_cannot_break_following_progress(self):
         text = '{"event":"train","metrics":null}\n' + '{"event":"train","epoch":3,"metrics":{"loss":0.5}}'
         result = parse_progress(text)

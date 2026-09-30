@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import threading
 import time
+import unicodedata
 import tkinter as tk
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
@@ -79,12 +80,56 @@ def metrics_text(summary):
     return " · ".join(f"{names.get(name, name)} {value:.4f}" for name, value in metrics.items() if name in names) or "—"
 
 
+
+def _column(value, width):  # 中文姓名按显示宽度补空格，黑框列对齐且不截断原始采集数据。
+    result, used = "", 0
+    for char in str(value).replace("\n", " ").replace("\r", " "):
+        size = 2 if unicodedata.east_asian_width(char) in "WF" else 1
+        if used + size > width:
+            break
+        result, used = result + char, used + size
+    return result + " " * (width - used)
+
+
+def gpu_table(snapshot, name):
+    stamp = datetime.fromtimestamp(snapshot["received_at"]).strftime("%H:%M:%S")
+    lines = [f"===== {stamp} | {name} | 显存：整卡 / 进程分列 =====",
+             "GPU   VRAM整卡(GiB)  UTIL  TEMP  USER                 PID       进程GiB  PROCESS / CONFIG"]
+    for gpu in snapshot.get("gpus", []):
+        rows = [row for row in snapshot.get("gpu_processes", []) if row.get("gpu_index") == gpu["index"]]
+        for row in rows or [{}]:
+            total = f"{gpu['memory_used']/1024:.2f}/{gpu['memory_total']/1024:.2f}"
+            memory = row.get("memory_used")
+            process = row.get("process", "未读到GPU进程")
+            if row.get("config"):
+                process += " [" + row["config"] + "]"
+            lines.append(_column(("容器" if snapshot.get("container") else "GPU") + str(gpu["index"]), 6) + _column(total, 15) + _column(f"{gpu['util']:.0f}%", 6)
+                         + _column(f"{gpu['temperature']:.0f}°C", 6) + _column(row.get("user", "—"), 21)
+                         + _column(row.get("pid", "—"), 10) + _column(f"{memory/1024:.2f}" if memory is not None else "—", 9) + process)
+    if snapshot.get("gpu_error"):
+        lines.append(snapshot["gpu_error"])
+    if snapshot.get("container"):
+        lines.append("容器编号不等于平台INDEX；宿主PID与用户归属未确认。")
+    if not snapshot.get("gpus"):
+        lines.append("GPU数据不可用")
+    return "\n".join(lines) + "\n"
+
+
+def task_memory(card):
+    value = card.get("gpu_memory_mb")
+    if not card.get("alive"):
+        return "本任务显存：—（进程已退出）"
+    if value is None:
+        return "本任务显存：无法核验（不使用整卡显存代替）"
+    return f"本任务显存：{value/1024:.2f} GiB · {value:.0f} MiB（进程统计）"
+
 class TrainingPane(ttk.Frame):
-    def __init__(self, parent, service, configure_server, interval, show_gpus=False):
+    def __init__(self, parent, service, configure_server, interval, show_gpus=True):
         super().__init__(parent)
         self.service, self.configure_server, self.interval = service, configure_server, interval
         self.show_gpus, self.server_id = show_gpus, None
         self.render_key = None
+        self.gpu_log_key = None
         bar = ttk.Frame(self)
         bar.pack(fill="x", pady=(0, 5))
         self.start_button = ttk.Button(bar, text="开始训练监控", command=self.start)
@@ -94,6 +139,17 @@ class TrainingPane(ttk.Frame):
         ttk.Button(bar, text="设置连接", command=configure_server).pack(side="right")
         self.summary = ttk.Label(self, text="尚未配置训练连接", wraplength=560)
         self.summary.pack(fill="x", pady=(0, 5))
+        if show_gpus:
+            output = ttk.Frame(self)
+            output.pack(fill="x", pady=(0, 5))
+            horizontal = ttk.Scrollbar(output, orient="horizontal")
+            horizontal.pack(side="bottom", fill="x")
+            self.gpu_log = ScrolledText(output, height=5, wrap="none", state="disabled", font=("Consolas", 9),
+                                       background="#0e151d", foreground="#8bf0ad", xscrollcommand=horizontal.set, padx=5, pady=3)
+            self.gpu_log.pack(fill="x")
+            horizontal.configure(command=self.gpu_log.xview)
+            self.gpu_log.tag_configure("error", foreground="#ff9ca8")
+            self.gpu_log.tag_configure("warning", foreground="#ffe09a")
         self.canvas = tk.Canvas(self, background="#17202e", highlightthickness=0, width=300, height=180)
         scroll = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         scroll.pack(side="right", fill="y")
@@ -115,7 +171,11 @@ class TrainingPane(ttk.Frame):
 
     def select(self, server_id):
         if self.server_id != server_id:
-            self.server_id, self.render_key = server_id, None
+            self.server_id, self.render_key, self.gpu_log_key = server_id, None, None
+            if self.show_gpus:
+                self.gpu_log.configure(state="normal")
+                self.gpu_log.delete("1.0", "end")
+                self.gpu_log.configure(state="disabled")
             self.canvas.yview_moveto(0)
         self.render()
 
@@ -163,31 +223,34 @@ class TrainingPane(ttk.Frame):
         for child in self.content.winfo_children():
             child.destroy()
         if self.show_gpus and snapshot:
-            frame = self._card("idle")
-            self._label(frame, "GPU 状态（整卡）", bold=True)
-            if snapshot.get("gpu_error") or expired or warning:
-                self._label(frame, "GPU数据不可用或已过期", color=COLORS["warning"][1])
-            else:
-                for gpu in snapshot["gpus"]:
-                    self._label(frame, f"GPU {gpu['index']} · {gpu['name']} · {gpu['temperature']:.0f}°C")
-                    self._label(frame, f"利用率 {gpu['util']:.0f}%   显存 {gpu['memory_used']/1024:.2f}/{gpu['memory_total']/1024:.2f} GiB")
+            log_key = (snapshot["received_at"], warning)
+            if log_key != self.gpu_log_key:
+                self.gpu_log_key = log_key
+                text = f"[{datetime.now():%H:%M:%S}] {warning}；上次数据不作为当前状态。\n" if warning else gpu_table(snapshot, state["server"].name)
+                self.gpu_log.configure(state="normal")
+                self.gpu_log.insert("end", text, "warning" if warning else "normal")
+                if int(self.gpu_log.index("end-1c").split(".")[0]) > 1000:
+                    self.gpu_log.delete("1.0", "201.0")
+                self.gpu_log.see("end")
+                self.gpu_log.configure(state="disabled")
         cards = snapshot.get("cards", []) if snapshot else []
         if not cards:
             frame = self._card("warning" if warning else "idle")
             self._label(frame, "无法确认训练状态" if warning else "无匹配训练进程" if snapshot and state["active"] else "等待训练采集", bold=True)
         for card in cards:
-            level = "warning" if warning or not state["active"] else card["level"]
+            level = "error" if card["level"] == "error" else "warning" if warning or not state["active"] else card["level"]
             frame = self._card(level)
             self._label(frame, card["name"], bold=True)
             self._label(frame, card["status"] + (" · 最近结果" if warning or not state["active"] else ""), color=COLORS[level][1])
             gpu = ",".join(f"#{index}" for index in card.get("gpu_indices", [])) or "关联未确认"
             self._label(frame, f"PID {card['pid']} · 用户 {card.get('user', '—')} · GPU {gpu}")
+            self._label(frame, task_memory(card) + (" · 上次采样" if warning or not state["active"] else ""), bold=True)
             progress = card["progress"]
             epoch, total = progress.get("epoch"), progress.get("total_epochs")
             raw = f" · 日志Epoch {progress['raw_epoch']}" if progress.get("raw_epoch") is not None else ""
             self._label(frame, f"轮次 {epoch if epoch is not None else '—'}/{total if total is not None else '—'}{raw} · 全局Step {progress.get('step') if progress.get('step') is not None else '—'}")
             if epoch is not None and total and total > 0:
-                ttk.Progressbar(frame, maximum=total, value=total if progress.get("completed") else min(total, max(0, epoch - 1)), style="Memory.Horizontal.TProgressbar").pack(fill="x", padx=8, pady=3)  # 条形仅表示此前已完成轮次，不猜当前轮内进度。
+                ttk.Progressbar(frame, maximum=total, value=total if progress.get("completed") else min(total, max(0, epoch - 1)), style="Error.Horizontal.TProgressbar" if level == "error" else "Memory.Horizontal.TProgressbar").pack(fill="x", padx=8, pady=3)  # 条形仅表示此前已完成轮次，不猜当前轮内进度。
             train = progress.get("train", {})
             self._label(frame, f"训练（第{train.get('epoch', '—')}轮，Step {train.get('step', '—')}）：{metrics_text(train)}")
             for dataset, summary in progress.get("tests", {}).items():

@@ -252,6 +252,8 @@ class GuiWindowTest(unittest.TestCase):
     def test_normal_mode_defaults_to_live_and_debug_defaults_to_readonly(self):
         self.assertTrue(self.window.live.get())
         self.assertTrue(self.window.convert_no_gpu.get())
+        self.assertIn("--dry-run", self.window._command())  # 未核验真实实例前不启用电源。
+        self.window.table.set(self.window.selected_entry(), "target", "可开机")
         self.assertIn("--live", self.window._command())
         self.assertIn("全部无卡实例", self.window.convert_check["text"])
         self.window.live_check.invoke()  # 取消真实开机也取消无卡关机，避免不一致的只读参数。

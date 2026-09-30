@@ -86,7 +86,7 @@ def collect_remote(server, previous=()):
 
 
 _NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
-_FATAL = re.compile(r"(?:CUDA out of memory|OutOfMemoryError|(?:Runtime|Value|Assertion|FloatingPoint|Memory|NCCL|ChildFailed)Error:|Segmentation fault|Traceback \(most recent call last\))", re.I)
+_FATAL = re.compile(r"(?:CUDA out of memory|OutOfMemoryError|[\w.]*(?:Error|Exception)\s*:|Segmentation fault|CUDA error:|\bSIG(?:KILL|SEGV|ABRT)\b|^\s*Killed\s*$|\[(?:ERROR|FATAL|CRITICAL)\]|Traceback \(most recent call last\))", re.I | re.M)
 _TIMESTAMP = re.compile(r"(\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d)")
 
 
@@ -165,12 +165,12 @@ def parse_progress(text, utc_offset="+0000"):  # DeepfakeBench适配器及通用
                 result["tests"][dataset[1]] = summary
             elif phase == "train":
                 result["train"] = summary
-            result.update(phase=phase, error="", completed=False)
+            result.update(phase=phase, completed=False)
             advanced = True
         if "Stop Training on best Testing metric" in line or "Experiment summary saved to" in line:
             result.update(completed=True, error="")
             advanced = True
-        if _FATAL.search(line):
+        if _FATAL.search(line) or re.search(r"(?:training|testing)-(?:loss|metric),\s*\w+:\s*[-+]?(?:nan|inf)\b", line, re.I):
             result.update(error=line.strip()[-500:], completed=False)
             advanced = True
         if advanced and stamp is not None:
@@ -207,11 +207,12 @@ class TrainingTracker:
             for log in logs:
                 text = log_text(log)
                 details.extend([log["path"], *text.splitlines()[-12:]])
-                if log is not primary and log["modified_at"] >= (primary["modified_at"] if primary else 0):
+                if log is not primary:
                     extra = parse_progress(text, snapshot.get("utc_offset", "+0000"))
-                    if extra["error"] and log["modified_at"] >= task.get("started_at", 0):
+                    if extra["error"] and log["modified_at"] >= task.get("started_at", 0) and (
+                            extra["progress_at"] is None or extra["progress_at"] >= task.get("started_at", 0) - 1):
                         progress["error"] = extra["error"]
-                    if extra["completed"]:
+                    if extra["completed"] and log["modified_at"] >= (primary["modified_at"] if primary else task.get("started_at", 0)):
                         progress["completed"] = True
             indicator = {k: progress[k] for k in ("phase", "epoch", "step", "completed", "error")}
             indicator["train"] = {k: v for k, v in progress["train"].items() if k != "time"}
@@ -220,13 +221,15 @@ class TrainingTracker:
             advanced_at = progress["progress_at"] or (primary["modified_at"] if primary else task.get("started_at", now))
             if previous.get("marker") == marker:
                 advanced_at = previous["advanced_at"]  # 重复打印同一指标不是训练进展。
+            if previous.get("progress", {}).get("error"):
+                progress["error"] = previous["progress"]["error"]  # 同一进程已确认的错误保留为红色，滚动日志或随后断连不能抹掉。
             alive = task.get("alive", False)
             if progress["error"]:
                 level, status = "error", "错误已记录 · 进程仍存活" if alive else "异常中止"
             elif progress["completed"]:
                 level, status = "idle", "已完成 · 收尾中" if alive else "已完成"
             elif not alive:
-                level, status = "warning", "进程已退出 · 结果未确认"
+                level, status = "error", "进程已退出 · 未确认正常完成"
             elif not primary or progress["phase"] == "unknown":
                 level, status = "warning", "进程存活 · 训练进度不可读"
             elif now - advanced_at > self.server.stalled_minutes * 60:
@@ -242,6 +245,8 @@ class TrainingTracker:
             cards.append(card)
         if not snapshot["scan_ok"]:
             existing = {card["key"] for card in cards}
-            cards.extend(dict(card, level="warning", status="进程列表不完整 · 状态待确认") for key, card in self.known.items() if key not in existing)
+            cards.extend(dict(card, level="error" if card["level"] == "error" else "warning",
+                              status=card["status"] if card["level"] == "error" else "进程列表不完整 · 状态待确认")
+                         for key, card in self.known.items() if key not in existing)
         return dict(snapshot, cards=sorted(cards, key=lambda card: (not card.get("alive", False), -card.get("started_at", 0))),
                     received_at=time.time(), error="" if snapshot["scan_ok"] else "进程列表读取不完整")

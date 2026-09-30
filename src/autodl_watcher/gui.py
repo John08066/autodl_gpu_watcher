@@ -123,7 +123,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
             except (ValueError, OSError, AttributeError):
                 self.status.set("本地偏好读取失败，已使用默认配置")
         self._build()
-        self._populate([(item.machine_name, "待刷新", "已配置")
+        self._populate([(item.machine_name, "待刷新", "未核验")
                         for item in self.config.auto_start.targets if item.enabled])
         self.root.after(100, self._drain)  # 将首次消息处理排入 Tk 事件队列，而不是阻塞等待后台输出。
         self.root.after(0, self.refresh)  # 启动后只读核验，不开始监控或打开登录浏览器。
@@ -140,6 +140,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         style.configure("TButton", padding=(10, 5))
         style.configure("GPU.Horizontal.TProgressbar", background="#397ca8")
         style.configure("Memory.Horizontal.TProgressbar", background="#34865b")
+        style.configure("Error.Horizontal.TProgressbar", background="#b43b48")
         style.configure("Title.TLabel", font=("Microsoft YaHei UI", 14, "bold"))
         self.check_images = []  # Tk不会持有Python图片引用；保留它们，防止勾选标记被回收。
         for selected in (False, True):
@@ -185,8 +186,8 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         self.training_pane.pack(fill="both", expand=True)
         servers = ttk.Frame(left)
         servers.pack(fill="x")
-        self.table = ttk.Treeview(servers, columns=("entry", "slots", "target"), show="headings", height=5, selectmode="browse")
-        for column, title, width in [("entry", "服务器", 115), ("slots", "空闲 / 总数", 88), ("target", "自动开机", 93)]:
+        self.table = ttk.Treeview(servers, columns=("entry", "slots", "target", "training"), show="headings", height=5, selectmode="browse")
+        for column, title, width in [("entry", "服务器", 100), ("slots", "空闲/总数", 65), ("target", "自动开机", 78), ("training", "训练SSH", 85)]:
             self.table.heading(column, text=title)
             self.table.column(column, width=width, stretch=False)
         self.table.pack(side="left", fill="y")
@@ -359,18 +360,39 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         selected = self.selected_entry() or self.saved_entry  # 刷新时优先保留本次选择，其次恢复上次保存的入口。
         self.table.delete(*self.table.get_children())
         for entry, slots, target in rows:
-            self.table.insert("", "end", iid=entry, values=(entry, slots, target))  # 用入口名作行 ID，选择结果可直接作为监控参数。
+            self.table.insert("", "end", iid=entry, values=(entry, slots, target, self._training_status(entry)))  # 用入口名作行 ID，选择结果可直接作为监控参数。
         entries = self.table.get_children()
         if entries:
             self.table.selection_set(selected if selected in entries else entries[0])
+
+    def _training_status(self, entry):
+        server = next((item for item in self.servers if item.entry == entry), None)
+        if not server:
+            return "未配置"
+        state = self.training.states[server.id]
+        snapshot = state["snapshot"]
+        if snapshot and snapshot.get("error"):
+            return "连接失败"
+        if state["active"]:
+            return "已连接" if snapshot else "连接中"
+        return "已停止" if snapshot else "待连接"
+
+    def _training_columns(self):
+        for entry in self.table.get_children():
+            value = self._training_status(entry)
+            if self.table.set(entry, "training") != value:
+                self.table.set(entry, "training", value)
 
     def selected_entry(self):  # Treeview 返回选中 ID 元组；单选表最多有一项。
         selection = self.table.selection()
         return selection[0] if selection else ""
 
     def _command(self):  # 从控件快照生成启动参数；不改写受 Git 管理的 YAML。
-        return monitor_command(self.config, self.selected_entry(), self.user.get(), self.poll.get(),
-                               self.live.get(), self.stop_file, self.convert_no_gpu.get())
+        entry = self.selected_entry()
+        verified = bool(entry and self.table.set(entry, "target") == "可开机")
+        live = self.live.get() and verified  # 本地旧UUID不代表实际存在容器；未核验入口始终只读。
+        return monitor_command(self.config, entry, self.user.get(), self.poll.get(), live,
+                               self.stop_file, self.convert_no_gpu.get() and live)
 
     def save(self):  # 保存输入前复用启动校验，避免把明显无效的设置留到下次。
         try:
@@ -512,6 +534,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
                     return
                 if not self.closing:
                     self.training.tick()
+                self._training_columns()
                 self.training_pane.render()
                 for _, _, pane in self.external_panes.values():
                     pane.render()
@@ -566,6 +589,28 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
                 self.status.set("正在等待后台任务安全结束后关闭窗口…")
 
 
+
+def discovery_rows(config, hosts, instances):  # 只有账号真实实例UUID与入口/配置同时相符，才显示可开机资格。
+    targets = {item.machine_name: item for item in config.auto_start.targets if item.enabled and item.instance_uuid}
+    rows = []
+    for host in hosts:
+        for name, idle, total in host.source_slots:
+            existing = [item for item in (instances or []) if item.get("machine_name") == name]
+            target = targets.get(name)
+            if instances is None:
+                label = "未核验"
+            elif not existing:
+                label = "无实例"
+            elif not target or not config.auto_start.enabled:
+                label = "待配置"
+            elif not any(item.get("instance_uuid") == target.instance_uuid for item in existing):
+                label = "实例已变更"
+            else:
+                label = "可开机"
+            rows.append((name, f"{idle}/{total}", label))
+    return rows
+
+
 def discover():  # 子进程模式：采集结果编码为一行 JSON，供父进程更新服务器表格。
     from .collectors import PlatformBrowserCollector, TelemetryApiCollector
     from .collectors.platform import PlatformAuthenticationError
@@ -573,10 +618,17 @@ def discover():  # 子进程模式：采集结果编码为一行 JSON，供父�
     collector = PlatformBrowserCollector(config.platform)
     try:
         emit_session("checking", "正在核验真实主机接口")
-        configured = {item.machine_name for item in config.auto_start.targets if item.enabled and item.instance_uuid}
         hosts = collector.collect()
-        rows = [(name, f"{idle}/{total}", "已配置" if name in configured else "只读监控")
-                for host in hosts for name, idle, total in host.source_slots]
+        try:
+            instances = collector.get_account_instances()
+            if not isinstance(instances, list):
+                raise ValueError("实例列表格式错误")
+        except PlatformAuthenticationError:
+            raise
+        except Exception:
+            instances = None
+            print("容器实例查询失败，自动开机资格未核验；平台仍可只读监控。", flush=True)
+        rows = discovery_rows(config, hosts, instances)
         print(DATA_PREFIX + json.dumps(rows, ensure_ascii=False), flush=True)
         emit_session("valid", "主机接口核验成功")
         if hosts:

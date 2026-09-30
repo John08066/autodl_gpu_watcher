@@ -36,8 +36,10 @@
 - 普通GUI默认真实开机，`--debug`默认只读；打开窗口只核验会话，仍需点击开始监控。停止使用自有stop文件并等worker安全退出，再正常关窗，不强杀共享浏览器。显示高度1000x800沿用用户设置。
 - 改写Git说明前保存`git bundle --all`及原refs，逐提交验证代码树、作者时间、映射后的父关系不变；本地改写不代表远程已同步。v0.7.0备份`.tools/backups/v0.7.0-before/history.bundle`。
 
+- v0.8.1“可开机”是当前完整实例列表中入口/UUID与已启用配置匹配，不能仅检查本地targets；2026-09-30实际列表只有201-1、203-1、203-2，202-2旧UUID已无实例。训练SSH是否配置独立判断。代码`gui.py:discovery_rows`，证据`runtime/validation/v0.8.1/platform-evidence.json`；实际只读及模拟回归。
+
 ## 训练进度与SSH只读采集
 
 - v0.8.0用已有SSH别名，`BatchMode=yes`、`ClearAllForwardings=yes`、严格主机校验；通过stdin执行标准库探针，不落远端文件。本人UID的训练根进程按boot_id/PID/start_ticks识别，DataLoader子进程不重复统计，日志从打开的fd关联。读取无关SSH/systemd进程cwd可能PermissionError，不能因此认定训练列表残缺；仅Python进程读取cwd。代码`remote_probe.py`；2026-09-30实际只读验证203-1及4090，证据`runtime/validation/v0.8.0/gui-live-verification.json`。
 - DeepfakeBench当前`training/train.py`使用`range(start_epoch,nEpochs+1)`：0..30共31轮；`Epoch[1]`是显示第2轮。`Test Done!`不等于整体完成；各测试集更新时刻不同，保留各自epoch/step，不能统一标成当前轮次。DFDC测试曾实际观察约49分钟无新日志，因此默认120分钟仅提示待核查。代码`training.py`；2026-09-30实际日志/源码核验，OOM、未知退出及重复打印由`tests/test_training.py`模拟验证。
-- 203容器的GPU宿主PID可能在容器/proc中不存在；整卡利用率不能证明本人进程占用。v0.8.0容器统一显示GPU关联未确认，裸机仅在本人PID与GPU UUID直接相符时展示索引。当前203一项训练、4090两项训练实际只读验证；不把该验证扩展为所有容器或所有训练框架的保证。
+- 203容器的GPU宿主PID可能在容器/proc中不存在；整卡利用率不能证明本人进程占用。v0.8.1容器仍显示GPU关联/本人显存无法核验，裸机按本人PID、启动时间、GPU UUID直接相符后统计进程显存。当前203的NVML仅返回宿主PID；已查instance/list、Telemetry及官网监控按钮，未找到进程专属显存来源，不能把系统mem_usage或整卡显存当作任务显存。代码`remote_probe.py`；2026-09-30实际只读，证据`runtime/validation/v0.8.1/platform-evidence.json`与`*-current.json`。其他用户只读取GPU进程元信息，不读取其日志。

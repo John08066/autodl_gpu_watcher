@@ -84,7 +84,7 @@ def task_files(process):
 def query_gpu():
     fields = "index,uuid,name,utilization.gpu,memory.used,memory.total,temperature.gpu"
     gpus, apps, errors = [], [], []
-    for query in (f"--query-gpu={fields}", "--query-compute-apps=gpu_uuid,pid,used_memory"):
+    for query in (f"--query-gpu={fields}", "--query-compute-apps=gpu_uuid,pid,process_name,used_memory"):
         try:
             response = subprocess.run(["nvidia-smi", query, "--format=csv,noheader,nounits"],
                                       capture_output=True, text=True, timeout=8)
@@ -96,13 +96,42 @@ def query_gpu():
                         gpus.append(dict(index=int(row[0]), uuid=row[1], name=row[2], util=float(row[3]),
                                          memory_used=float(row[4]), memory_total=float(row[5]), temperature=float(row[6])))
                     else:
-                        apps.append(dict(uuid=row[0], pid=int(row[1]), memory_used=float(row[2])))
+                        memory = float(row[3]) if re.fullmatch(r"\d+(?:\.\d+)?", row[3].strip()) else None
+                        apps.append(dict(uuid=row[0], pid=int(row[1]), process_name=row[2], memory_used=memory))
                 except (ValueError, IndexError):
                     errors.append("部分GPU字段不可用")
         except (OSError, ValueError, subprocess.TimeoutExpired):
             errors.append("GPU查询不可用")
     return gpus, apps, "; ".join(dict.fromkeys(errors))
 
+
+
+def public_gpu_processes(gpus, apps, container):  # 其他用户只读系统允许的进程元信息，不读取其训练日志或环境变量。
+    rows = []
+    devices = {gpu["uuid"]: gpu["index"] for gpu in gpus}
+    for app in apps:
+        row = dict(app, gpu_index=devices.get(app["uuid"]), user="未知", process=Path(app.get("process_name", "未知")).name, config="", own=False)
+        if not container:  # 容器NVML返回宿主PID，同号容器PID也不能证明归属。
+            path = Path("/proc") / str(app["pid"])
+            try:
+                uid = path.stat().st_uid
+                before = (path / "stat").read_text().rsplit(")", 1)[1].split()[19]
+                row.update(user=pwd.getpwuid(uid).pw_name, own=uid == os.getuid(), start_ticks=int(before))
+                args = (path / "cmdline").read_bytes()[:16384].decode("utf-8", "replace").split("\0")
+                row["process"] = next((Path(arg).name for arg in args if arg.endswith(".py")), row["process"])
+                for index, arg in enumerate(args):
+                    if arg in {"--task_target", "--detector_path", "--config"} and index + 1 < len(args):
+                        row["config"] = Path(args[index + 1]).name  # 不展示其他命令行参数，避免泄露令牌。
+                        if arg == "--task_target":
+                            break
+                if before != (path / "stat").read_text().rsplit(")", 1)[1].split()[19]:
+                    row.update(user="未知", own=False, process="进程已变化", config="")
+            except (OSError, ValueError, IndexError, KeyError):
+                row["config"] = ""  # 权限不足仍显示NVML已返回的GPU/PID/显存，用户名可能已可核验。
+        else:
+            row.update(user="宿主用户未知", process="宿主进程", config="容器内归属未确认")
+        rows.append(row)
+    return rows
 
 def collect(request):  # 整次远端请求仅扫描本人进程和已关联日志，无写入、信号或GPU计算。
     boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
@@ -129,13 +158,17 @@ def collect(request):  # 整次远端请求仅扫描本人进程和已关联日�
         container = container or bool(re.search("docker|kubepods|lxc|containerd", Path("/proc/1/cgroup").read_text()))
     except OSError:
         container = True  # 无法核验命名空间时不猜GPU进程归属。
+    process_rows = public_gpu_processes(gpus, apps, container)
     tasks = []
     for item in roots[:32]:
         try:
             current = read_process(Path("/proc") / str(item["pid"]), boot_id, boot_time, ticks)
             if not current or current["key"] != item["key"]:
                 continue
+        except FileNotFoundError:
+            continue
         except OSError:
+            restricted += 1
             continue
         args = item.pop("args")
         def option(name):
@@ -149,18 +182,20 @@ def collect(request):  # 整次远端请求仅扫描本人进程和已关联日�
         item.update(name=option("--task_target") or Path(detector).stem or next((Path(arg).name for arg in args[1:] if arg.endswith(".py")), "训练进程"),
                     config=detector, alive=True, user=pwd.getpwuid(os.getuid()).pw_name)
         item["logs"] = [read_log(path) for path in task_files(item)]
-        item["gpu_indices"] = sorted({gpu["index"] for app in apps for gpu in gpus
-                                      if not container and app["pid"] == item["pid"] and app["uuid"] == gpu["uuid"]})
-        item["gpu_memory_mb"] = sum(app["memory_used"] for app in apps if not container and app["pid"] == item["pid"]) if item["gpu_indices"] else None
+        matched = [app for app in process_rows if not container and app["pid"] == item["pid"] and app["own"]
+                   and app.get("start_ticks") == item["start_ticks"] and app["gpu_index"] is not None]
+        item["gpu_indices"] = sorted({app["gpu_index"] for app in matched})
+        item["gpu_memory_mb"] = sum(app["memory_used"] for app in matched) if matched and all(app["memory_used"] is not None for app in matched) else None
+        item["gpu_memory_by_device"] = [{"gpu_index": app["gpu_index"], "memory_mb": app["memory_used"]} for app in matched]
         tasks.append(item)
     keys = {item["key"] for item in tasks}
     scan_ok = restricted == 0 and len(roots) <= 32
     if scan_ok:
         for previous in request.get("previous", [])[:32]:
             if previous["key"] not in keys:
-                tasks.append(dict(previous, alive=False, logs=[read_log(path) for path in previous.get("log_paths", [])[:4]]))
+                tasks.append(dict(previous, alive=False, gpu_memory_mb=None, gpu_memory_by_device=[], logs=[read_log(path) for path in previous.get("log_paths", [])[:4]]))
     return {"observed_at": time.time(), "tasks": tasks, "gpus": gpus, "gpu_error": gpu_error,
-            "scan_ok": scan_ok, "utc_offset": time.strftime("%z"), "container": container, "user": pwd.getpwuid(os.getuid()).pw_name}
+            "gpu_processes": process_rows, "scan_ok": scan_ok, "utc_offset": time.strftime("%z"), "container": container, "user": pwd.getpwuid(os.getuid()).pw_name}
 
 
 if __name__ == "__main__":
