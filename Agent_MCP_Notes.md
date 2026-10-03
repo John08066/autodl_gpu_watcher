@@ -44,3 +44,11 @@
 - v0.8.0用已有SSH别名，`BatchMode=yes`、`ClearAllForwardings=yes`、严格主机校验；通过stdin执行标准库探针，不落远端文件。本人UID的训练根进程按boot_id/PID/start_ticks识别，DataLoader子进程不重复统计，日志从打开的fd关联。读取无关SSH/systemd进程cwd可能PermissionError，不能因此认定训练列表残缺；仅Python进程读取cwd。代码`remote_probe.py`；2026-09-30实际只读验证203-1及4090，证据`runtime/validation/v0.8.0/gui-live-verification.json`。
 - DeepfakeBench当前`training/train.py`使用`range(start_epoch,nEpochs+1)`：0..30共31轮；`Epoch[1]`是显示第2轮。`Test Done!`不等于整体完成；各测试集更新时刻不同，保留各自epoch/step，不能统一标成当前轮次。DFDC测试曾实际观察约49分钟无新日志，因此默认120分钟仅提示待核查。代码`training.py`；2026-09-30实际日志/源码核验，OOM、未知退出及重复打印由`tests/test_training.py`模拟验证。
 - 203容器的GPU宿主PID可能在容器/proc中不存在；整卡利用率不能证明本人进程占用。v0.8.1容器仍显示GPU关联/本人显存无法核验，裸机按本人PID、启动时间、GPU UUID直接相符后统计进程显存。当前203的NVML仅返回宿主PID；v0.8.2再次核对NSpid仅有容器PID，GPU fdinfo只有常规文件信息，当时的旧训练日志无显存统计（`runtime/validation/v0.8.2/container-memory-evidence.json`）；已查instance/list、Telemetry及官网监控按钮，未找到进程专属显存来源，不能把系统mem_usage或整卡显存当作任务显存；2026-10-03新P03脚本已提供日志峰值，见上一条，旧任务“无日志统计”结论不适用于它。代码`remote_probe.py`；2026-09-30实际只读，证据`runtime/validation/v0.8.1/platform-evidence.json`与`*-current.json`。其他用户只读取GPU进程元信息，不读取其日志。
+
+## SSH接入故障定位
+
+- 2026-10-03实际只读确认203出现`Exceeded MaxStartups`：有效配置`10:30:100`，未认证连接11—12个，btmp从19:17起激增到约250—300次/分钟、多用户名轮换，符合自动化口令扫描。容器对端与失败日志仅见127.0.0.1，不能按此地址封禁；需在平台转发前核查原始来源。该证据解释新连接/重连拒绝，不单独解释已认证VS Code连接最初的25秒失联。内存约8.4/40 GiB且OOM=0，训练继续；不得把握手前拒绝当作探针或日志解析BUG。证据`runtime/validation/ssh-203-20261003/诊断报告.md`与`login-timeline-*.json`。当时未修改SSH认证、代理或训练；客户端保活不能修复服务端准入拒绝。
+
+- 2026-10-03经授权在203-1新增`/etc/ssh/sshd_config.d/00-autodl-watcher-key-only.conf`：AuthenticationMethods publickey、PasswordAuthentication/KbdInteractiveAuthentication no、PermitRootLogin prohibit-password、LoginGraceTime 20、MaxAuthTries 3，MaxStartups保持10:30:100。先核验主机/配置hash与公钥，启动独立180秒回退守护，`sshd -t/-T -C`验证后向监听PID813发SIGHUP；两个新公钥连接和原会话/训练启动标识复核成功后提交。备份`/root/.autodl-watcher-backups/ssh-20261003-v084/sshd_config.before`，恢复只移除该专用文件、先校验再向当前已核验监听PID重载（不能盲用历史PID）；服务器重建/平台覆盖后须重新核验。该防护未自动部署到4090或新增服务器；证据`runtime/validation/v0.8.4/ssh-hardening.json`，实际验证。
+
+- v0.8.4的训练采样在一个已认证OpenSSH进程内按行发送只读请求，连接故障只由主调度60/120/240/300秒退避；不得叠加线程内重拨。停止只关闭本对象的SSH，不能杀共享SSH/VS Code。MaxStartups横幅需要`-v`才进入stderr，仅读取限量内存诊断；每60秒采集不等于重新认证，15秒保活也不是登录。203/4090真实三轮均1连接3采样，20秒未认证释放实测通过；2026-10-03，证据`runtime/validation/v0.8.4/`及`tests/test_v084.py`。

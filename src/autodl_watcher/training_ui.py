@@ -8,7 +8,7 @@ import tkinter as tk
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 
-from .training import TrainingTracker, collect_remote
+from .training import TrainingTracker, TrainingConnection
 
 
 class TrainingService:  # 每台服务器最多一个只读请求；线程只投递结果，不接触Tk控件。
@@ -21,8 +21,11 @@ class TrainingService:  # 每台服务器最多一个只读请求；线程只投
         if state and (state["active"] or state["busy"]):
             state["pending"] = server if server != state["server"] else None  # 只保存下次使用的连接，本轮SSH请求继续使用原配置。
             return
+        if state:
+            state["connection"].close()
         self.states[server.id] = dict(server=server, tracker=TrainingTracker(server), active=False, busy=False,
-                                      generation=(state["generation"] + 1 if state else 0), due=0, interval=60, snapshot=None, pending=None)
+                                      generation=(state["generation"] + 1 if state else 0), due=0, interval=60, snapshot=None, pending=None,
+                                      connection=TrainingConnection(server), failures=0)
 
     def start(self, server_id, interval):
         state = self.states[server_id]
@@ -33,22 +36,28 @@ class TrainingService:  # 每台服务器最多一个只读请求；线程只投
         if state.get("pending"):
             self.register(state["pending"])  # 已结束旧请求后才换连接、清空旧来源的快照。
             state = self.states[server_id]
-        state.update(active=True, interval=interval, due=0)
+        if any(other["active"] and other["server"].ssh_alias.casefold() == state["server"].ssh_alias.casefold()
+               for key, other in self.states.items() if key != server_id):
+            raise ValueError("此SSH连接已在另一服务器页面监控，请先停止那一页")
+        if state["connection"].closed:
+            state["connection"] = TrainingConnection(state["server"])
+        state.update(active=True, interval=interval, due=state["due"] if state["failures"] else 0)
 
     def stop(self, server_id):
         state = self.states[server_id]
         state.update(active=False, generation=state["generation"] + 1)
+        state["connection"].close()
 
     def tick(self):
         now = time.monotonic()
         for server_id, state in self.states.items():
             if state["active"] and not state["busy"] and now >= state["due"]:
                 state.update(busy=True, due=now + state["interval"])
-                threading.Thread(target=self._collect, args=(server_id, state["server"], state["generation"], state["tracker"].previous()), daemon=True).start()
+                threading.Thread(target=self._collect, args=(server_id, state["generation"], state["tracker"].previous(), state["connection"]), daemon=True).start()
 
-    def _collect(self, server_id, server, generation, previous):
+    def _collect(self, server_id, generation, previous, connection):
         try:
-            result, error = collect_remote(server, previous), ""
+            result, error = connection.collect(previous), ""
         except Exception as exc:
             result, error = None, f"{type(exc).__name__}：{exc}"
         self.events.put(("training", (server_id, generation, result, error)))
@@ -62,11 +71,15 @@ class TrainingService:  # 每台服务器最多一个只读请求；线程只投
         if not error:
             try:
                 state["snapshot"] = state["tracker"].update(result)
+                state.update(failures=0, due=time.monotonic() + state["interval"])
                 return
             except Exception as exc:
                 error = f"训练信息解析失败：{exc}"
+        state["failures"] += 1
+        delay = max(state["interval"], min(300, 60 * 2 ** min(state["failures"] - 1, 3)))
+        state["due"] = time.monotonic() + delay  # 单次失败只退避，不在采集线程内重拨。
         old = state["snapshot"] or {"cards": [], "gpus": []}
-        state["snapshot"] = dict(old, error=error, received_at=time.time())  # 断连保留最近摘要并标黄，不能变成“无训练”。
+        state["snapshot"] = dict(old, error=f"{error}；{delay:g}秒后重试", received_at=time.time())  # 断连保留最近摘要并标黄，不能变成“无训练”。
 
     def busy(self):
         return any(state["busy"] for state in self.states.values())
@@ -231,6 +244,9 @@ class TrainingPane(ttk.Frame):
             text = f"{state['server'].name} · SSH用户 {snapshot.get('user', '—')} · 最近采集 {datetime.fromtimestamp(snapshot['received_at']):%H:%M:%S}"
         else:
             text = "正在连接，读取本人训练进程与日志…"
+        if state and state["active"]:
+            connection = state["connection"]
+            text += f" · 采集{connection.samples}次 / 连接尝试{connection.attempts}次"
         if state and state.get("pending"):
             text += " · 新连接已保存，下次启动训练监控生效"
         self.summary.configure(text=text, foreground="#9a6700" if warning else "#245c45")

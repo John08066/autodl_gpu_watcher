@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from autodl_watcher.remote_probe import training_roots
-from autodl_watcher.training import TrainingServer, TrainingTracker, collect_remote, load_servers, log_text, parse_progress, save_servers
+from autodl_watcher.training import TrainingServer, TrainingTracker, load_servers, log_text, parse_progress, save_servers
 from autodl_watcher.training_ui import TrainingService
 
 
@@ -150,22 +150,22 @@ class TrainingTest(unittest.TestCase):
                 TrainingServer('s','s','host',stalled_minutes=float('nan')).validate()
 
     def test_ssh_uses_no_forwarding_no_prompts_and_only_stdin_probe(self):
-        with patch('autodl_watcher.training.ssh_executable',return_value='ssh'),patch('autodl_watcher.training.subprocess.run') as run:
-            run.return_value.returncode=0;run.return_value.stdout=json.dumps(snapshot())
-            collect_remote(self.server)
-            args=run.call_args.args[0]
-            self.assertIn('ClearAllForwardings=yes',args)
-            self.assertIn('StrictHostKeyChecking=yes',args)
-            self.assertIn('BatchMode=yes',args)
-            self.assertNotIn('shell',run.call_args.kwargs)
-            self.assertLessEqual(run.call_args.kwargs['timeout'],35)
+        from autodl_watcher.training import TrainingConnection
+        connection=TrainingConnection(self.server)
+        with patch('autodl_watcher.training.ssh_executable',return_value='ssh'):
+            args=connection._command()
+        for option in ('-v','ClearAllForwardings=yes','StrictHostKeyChecking=yes','BatchMode=yes',
+                       'PreferredAuthentications=publickey','PasswordAuthentication=no','ConnectionAttempts=1',
+                       'ServerAliveInterval=15','ServerAliveCountMax=3'):
+            self.assertIn(option,args)
+        self.assertLessEqual(connection.TIMEOUT,35)
 
     def test_connection_failure_preserves_last_snapshot_as_unknown(self):
         service=TrainingService(queue.Queue());service.register(self.server);service.start('s',60)
         service.receive(('s',0,snapshot(),''))
         service.receive(('s',0,None,'SSH timeout'))
         state=service.states['s']
-        self.assertEqual(state['snapshot']['error'],'SSH timeout')
+        self.assertIn('SSH timeout；60秒后重试',state['snapshot']['error'])
         self.assertEqual(len(state['snapshot']['cards']),1)
 
     def test_late_response_after_stop_cannot_reactivate_monitor(self):

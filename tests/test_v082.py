@@ -24,9 +24,10 @@ class PendingConnectionTest(unittest.TestCase):
         self.assertEqual(state["pending"], self.new)
         self.service.receive(("s", 0, snapshot(), ""))
         self.assertIsNotNone(state["snapshot"])
-        with patch("autodl_watcher.training_ui.threading.Thread") as thread:
+        with patch("autodl_watcher.training_ui.threading.Thread") as thread, \
+             patch("autodl_watcher.training_ui.time.monotonic", return_value=state["due"]):
             self.service.tick()
-            self.assertEqual(thread.call_args.kwargs["args"][1], self.old)
+            self.assertEqual(thread.call_args.kwargs["args"][-1].server, self.old)
         self.service.stop("s")
         with self.assertRaises(ValueError):
             self.service.start("s", 60)
@@ -40,7 +41,7 @@ class PendingConnectionTest(unittest.TestCase):
         self.assertEqual(current["interval"], 30)
         with patch("autodl_watcher.training_ui.threading.Thread") as thread:
             self.service.tick()
-            self.assertEqual(thread.call_args.kwargs["args"][1], self.new)
+            self.assertEqual(thread.call_args.kwargs["args"][-1].server, self.new)
 
     def test_last_saved_connection_wins_and_reverting_clears_pending(self):
         self.service.register(self.new)
