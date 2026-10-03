@@ -81,9 +81,13 @@ COLORS = {"success": ("#10372a", "#8bf0ad"), "error": ("#481f26", "#ff9ca8"),
 
 
 def metrics_text(summary):
-    names = {"loss": "Loss", "acc": "ACC", "auc": "AUC", "video_auc": "视频AUC", "eer": "EER", "ap": "AP"}
+    names = {"loss": "Loss", "acc": "ACC", "auc": "AUC", "video_auc": "视频AUC", "eer": "EER", "ap": "AP", "ce": "CE"}
     metrics = summary.get("metrics", {})
-    return " · ".join(f"{names.get(name, name)} {value:.4f}" for name, value in metrics.items() if name in names) or "—"
+    parts = []
+    for name, value in metrics.items():
+        metric, separator, branch = name.partition("/")
+        parts.append(f"{names.get(metric, metric)}{separator}{branch} {value:.4f}")
+    return " · ".join(parts) or "—"
 
 
 
@@ -126,7 +130,8 @@ def task_memory(card):
     if not card.get("alive"):
         return "显存 —（已退出）"
     if value is None:
-        return "显存 无法核验"
+        peak = card.get("progress", {}).get("peak_memory_bytes")
+        return f"显存峰值 {peak/1024**3:.2f} GiB（日志）" if peak is not None else "显存 无法核验"
     return f"显存 {value/1024:.2f} GiB"
 
 class TrainingPane(ttk.Frame):
@@ -247,6 +252,8 @@ class TrainingPane(ttk.Frame):
         if not cards:
             frame = self._card("warning" if warning else "idle")
             self._label(frame, "无法确认训练状态" if warning else "无匹配训练进程" if snapshot and state["active"] else "等待训练采集", bold=True)
+            if snapshot and state["active"] and not warning:
+                self._label(frame, f"脚本匹配：{state['server'].scripts} · 目录：{state['server'].project or '当前SSH用户'}；可在设置连接中修改。")
         for card in cards:
             level = "error" if card["level"] == "error" else "warning" if warning or not state["active"] else card["level"]
             frame = self._card(level)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from fnmatch import fnmatchcase
 import io
 import json
 import os
@@ -29,7 +30,10 @@ def training_roots(processes, script_names, project):  # 仅识别Python训练�
         args = item["args"]
         if not args or not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(args[0]).name):
             continue
-        if next((Path(arg).name for arg in args[1:] if arg.endswith(".py")), "") not in script_names:
+        script_index = next((i for i, arg in enumerate(args[1:], 1) if arg.endswith(".py")), None)
+        if script_index is None or any(arg in {"-c", "-m"} for arg in args[1:script_index]):
+            continue  # 模块启动器、内联命令不因参数中出现训练文件名就被计为训练主进程。
+        if not any(fnmatchcase(Path(args[script_index]).name, pattern) for pattern in script_names):
             continue
         if project and not (item["cwd"] == project.rstrip("/") or item["cwd"].startswith(project.rstrip("/") + "/")):
             continue
@@ -151,7 +155,7 @@ def collect(request):  # 整次远端请求仅扫描本人进程和已关联日�
             restricted += 1
         except (OSError, ValueError, IndexError):
             continue
-    roots = training_roots(processes, request.get("scripts", ["train.py", "trainer.py", "train_net.py"]), request.get("project", ""))
+    roots = training_roots(processes, request.get("scripts", ["train.py", "trainer.py", "train_*.py"]), request.get("project", ""))
     gpus, apps, gpu_error = query_gpu()
     container = Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
     try:

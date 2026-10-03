@@ -13,6 +13,9 @@ import subprocess
 import time
 
 
+DEFAULT_SCRIPTS = "train.py,trainer.py,train_*.py"
+
+
 @dataclass(frozen=True)
 class TrainingServer:  # SSH凭据仍由用户的OpenSSH管理，本地配置只保存连接别名与读取范围。
     id: str
@@ -21,7 +24,7 @@ class TrainingServer:  # SSH凭据仍由用户的OpenSSH管理，本地配置只
     python: str = "python3"
     project: str = ""
     entry: str = ""  # 非空时绑定AutoDL入口；空值表示独立服务器页。
-    scripts: str = "train.py,trainer.py,train_net.py"
+    scripts: str = DEFAULT_SCRIPTS
     stalled_minutes: float = 120
 
     def validate(self):
@@ -42,6 +45,9 @@ def load_servers(path):
     if not Path(path).exists():
         return []
     data = json.loads(Path(path).read_text(encoding="utf-8"))
+    for item in data:
+        if {name.strip() for name in item.get("scripts", "").split(",")} == {"train.py", "trainer.py", "train_net.py"}:
+            item["scripts"] = DEFAULT_SCRIPTS  # 仅迁移旧默认值，不放宽用户自定义范围，也不改写文件。
     servers = [TrainingServer(**item).validate() for item in data]
     if len({item.id for item in servers}) != len(servers) or len({item.entry for item in servers if item.entry}) != sum(bool(item.entry) for item in servers):
         raise ValueError("服务器ID或AutoDL绑定入口重复")
@@ -87,10 +93,46 @@ def collect_remote(server, previous=()):
 
 _NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 _FATAL = re.compile(r"(?:CUDA out of memory|OutOfMemoryError|[\w.]*(?:Error|Exception)\s*:|Segmentation fault|CUDA error:|\bSIG(?:KILL|SEGV|ABRT)\b|^\s*Killed\s*$|\[(?:ERROR|FATAL|CRITICAL)\]|Traceback \(most recent call last\))", re.I | re.M)
-_TIMESTAMP = re.compile(r"(\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d)")
+_TIMESTAMP = re.compile(r"(\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:?\d\d)?)")
 
 
-def parse_progress(text, utc_offset="+0000"):  # DeepfakeBench适配器及通用JSONL事件协议；指标总是携带各自epoch/step。
+def _structured_event(line):  # 把带前缀JSON日志转成已有事件协议；普通批次追踪JSON不当成训练证据。
+    match = re.search(r"(?:^|\s)(TRAIN|TEST|EVAL|EVALUATED|TRAINING_STARTED|TRAINING_COMPLETE|SMOKE_PASS|TRAINING_FAILED|ERROR)\s+(?:(\S+)\s+)?(\{.*\})\s*$", line)
+    try:
+        event = json.loads(match[3] if match else line)
+    except ValueError:
+        return {}
+    if not isinstance(event, dict):
+        return {}
+    if match:
+        kind = match[1]
+        if kind == "EVALUATED":
+            return {"event": "test", "datasets": {f"{match[2] or 'test'}/{name}": values for name, values in event.items() if isinstance(values, dict)}}
+        event["event"] = {"TRAIN": "train", "TEST": "test", "EVAL": "test", "TRAINING_STARTED": "train",
+                          "TRAINING_COMPLETE": "completed", "SMOKE_PASS": "completed", "TRAINING_FAILED": "error", "ERROR": "error"}[kind]
+        event["smoke"] = kind == "SMOKE_PASS"
+        if "steps_per_arm" in event:
+            event["step"] = event["steps_per_arm"]
+            raw = event.get("epoch")
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(raw) and raw >= 0:
+                event.update(raw_epoch=raw, epoch=raw + 1)  # 此协议Epoch从0开始；没有提供总轮数时保持未知。
+        if event.get("status") in {"failed", "error", "aborted"}:
+            event["event"] = "error"
+    if "loss" in event:
+        event["metrics"] = {**(event.get("metrics") if isinstance(event.get("metrics"), dict) else {}), "loss": event["loss"]}
+    return event
+
+
+def _flat_metrics(values):  # 保留分支名，paired与rolled不合并成一个平均指标。
+    result = {}
+    for name, value in (values.items() if isinstance(values, dict) else ()):
+        for branch, number in (value.items() if isinstance(value, dict) else [("", value)]):
+            if isinstance(number, (int, float)) and not isinstance(number, bool):
+                result[f"{name}/{branch}" if branch else str(name)] = number
+    return result
+
+
+def parse_progress(text, utc_offset="+0000", expected_pid=None):  # DeepfakeBench适配器及通用JSONL事件协议；指标总是携带各自epoch/step。
     result = {"phase": "unknown", "epoch": None, "total_epochs": None, "raw_epoch": None, "step": None,
               "train": {}, "tests": {}, "error": "", "completed": False, "progress_at": None}
     deepfake = bool(re.search(r"Epoch\[\d+\]|training-metric,|nEpochs:", text))
@@ -104,37 +146,46 @@ def parse_progress(text, utc_offset="+0000"):  # DeepfakeBench适配器及通用
         match = _TIMESTAMP.search(line)
         if match:
             try:
-                stamp = datetime.strptime(match[1].replace("T", " ") + utc_offset, "%Y-%m-%d %H:%M:%S%z").timestamp()
+                parsed_time = datetime.fromisoformat(match[1].replace("Z", "+00:00"))
+                stamp = (parsed_time if parsed_time.tzinfo else parsed_time.replace(tzinfo=datetime.strptime(utc_offset, "%z").tzinfo)).timestamp()
             except ValueError:
                 stamp = None
         advanced = False
-        if line.lstrip().startswith("{"):
-            try:
-                event = json.loads(line)
-            except ValueError:
-                event = {}
-            if not isinstance(event, dict):
-                event = {}
-            if event.get("event") in {"train", "test", "progress", "completed", "error"}:
-                phase = event.get("phase", event["event"])
-                if phase in {"train", "test"}:
-                    result["phase"] = phase
-                for key in ("epoch", "total_epochs", "step"):
-                    value = event.get(key)
-                    if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
-                        result[key] = value
-                values = event.get("metrics", {})
-                metrics = {str(key): value for key, value in (values.items() if isinstance(values, dict) else ())
-                           if isinstance(value, (int, float)) and math.isfinite(value)}
+        event = _structured_event(line)
+        if expected_pid is not None and event.get("pid", expected_pid) != expected_pid:
+            continue  # 合并日志中的其他PID不能提供本任务进度或显存。
+        if event.get("event") in {"train", "test", "progress", "completed", "error"}:
+            phase = event.get("phase", event["event"])
+            if phase in {"train", "test"}:
+                result["phase"] = phase
+            for key in ("epoch", "total_epochs", "raw_epoch", "step"):
+                value = event.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+                    result[key] = value
+            groups = event.get("datasets") if isinstance(event.get("datasets"), dict) else {str(event.get("dataset", "test")): event.get("metrics", {})}
+            invalid = False
+            for dataset, values in groups.items():
+                metrics = _flat_metrics(values)
+                invalid |= any(not math.isfinite(value) for value in metrics.values())
+                metrics = {key: value for key, value in metrics.items() if math.isfinite(value)}
                 if metrics:
                     summary = {"metrics": metrics, "epoch": result["epoch"], "step": result["step"], "time": stamp}
                     if phase == "test":
-                        result["tests"][str(event.get("dataset", "test"))] = summary
+                        result["tests"][str(dataset)] = summary
                     else:
                         result["train"] = summary
-                result["completed"] = event["event"] == "completed"
-                result["error"] = str(event.get("message", "训练错误"))[:500] if event["event"] == "error" else ""
-                advanced = True
+            result["completed"] = event["event"] == "completed"
+            result["smoke"] = event.get("smoke", False)
+            if event["event"] == "error" or invalid:
+                result.update(error="训练指标出现NaN/Inf" if invalid else str(event.get("message", "训练错误"))[:500], completed=False)
+            peak = event.get("peak_gpu_allocated")
+            if expected_pid is not None and event.get("pid") == expected_pid and isinstance(peak, (int, float)) and not isinstance(peak, bool) and math.isfinite(peak) and peak >= 0:
+                result["peak_memory_bytes"] = peak  # 仅接受本进程明确上报的PyTorch峰值，不替代NVML实时用量。
+            advanced = True
+        boundary = re.search(r"\bEPOCH_END\s+(\d+)\s+steps_per_arm\s+(\d+)\b", line)
+        if boundary:
+            result.update(raw_epoch=int(boundary[1]), epoch=int(boundary[1]) + 1, step=int(boundary[2]), phase="between")
+            advanced = True
         epoch = re.search(r"Epoch\[(\d+)\]\s+start", line)
         generic = re.search(r"\bEpoch\s*[:= ]\s*(\d+)\s*/\s*(\d+)", line, re.I)
         if epoch:
@@ -201,14 +252,13 @@ class TrainingTracker:
             key = task["key"]
             previous = self.known.get(key, {})
             logs = [item for item in task.get("logs", []) if "error" not in item]
-            primary = next((item for item in logs if Path(item["path"]).name == "training.log"), logs[0] if logs else None)
-            progress = parse_progress(log_text(primary), snapshot.get("utc_offset", "+0000")) if primary else previous.get("progress", parse_progress(""))
+            parsed = [(log, parse_progress(log_text(log), snapshot.get("utc_offset", "+0000"), expected_pid=task["pid"])) for log in logs]
+            primary, progress = max(parsed, key=lambda pair: (pair[1]["phase"] != "unknown", Path(pair[0]["path"]).name == "training.log", pair[0]["modified_at"])) if parsed else (None, previous.get("progress", parse_progress("")))
             details = []
-            for log in logs:
+            for log, extra in parsed:
                 text = log_text(log)
                 details.extend([log["path"], *text.splitlines()[-12:]])
                 if log is not primary:
-                    extra = parse_progress(text, snapshot.get("utc_offset", "+0000"))
                     if extra["error"] and log["modified_at"] >= task.get("started_at", 0) and (
                             extra["progress_at"] is None or extra["progress_at"] >= task.get("started_at", 0) - 1):
                         progress["error"] = extra["error"]
@@ -227,9 +277,11 @@ class TrainingTracker:
             if progress["error"]:
                 level, status = "error", "错误已记录 · 进程仍存活" if alive else "异常中止"
             elif progress["completed"]:
-                level, status = "idle", "已完成 · 收尾中" if alive else "已完成"
+                level, status = "idle", ("冒烟检查已完成" if progress.get("smoke") else "已完成") + (" · 收尾中" if alive else "")
             elif not alive:
                 level, status = "error", "进程已退出 · 未确认正常完成"
+            elif progress["phase"] == "between":
+                level, status = "warning", "轮次结束 · 等待后续日志"
             elif not primary or progress["phase"] == "unknown":
                 level, status = "warning", "进程存活 · 训练进度不可读"
             elif now - advanced_at > self.server.stalled_minutes * 60:

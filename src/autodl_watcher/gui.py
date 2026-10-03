@@ -281,7 +281,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         form.pack(fill="both", expand=True)
         values = {}
         fields = [("name", "显示名称"), ("ssh_alias", "SSH别名（用户.ssh/config）"), ("python", "远程Python路径"),
-                  ("project", "项目目录（可选，绝对路径）"), ("scripts", "训练脚本名（英文逗号分隔）"), ("stalled_minutes", "无进展提醒（分钟）")]
+                  ("project", "项目目录（可选，绝对路径）"), ("scripts", "脚本名/通配符（英文逗号分隔）"), ("stalled_minutes", "无进展提醒（分钟）")]
         for row, (key, label) in enumerate(fields):
             ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=4)
             values[key] = tk.StringVar(value=str(getattr(server, key)))

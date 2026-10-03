@@ -209,6 +209,30 @@ class TrainingWindowTest(unittest.TestCase):
         self.assertIn("PID", labels[1]); self.assertIn("用户", labels[1]); self.assertIn("GPU", labels[1]); self.assertIn("显存 6.00 GiB", labels[1])
         self.assertFalse(any(line.startswith(("最近进展", "本任务显存")) for line in labels))
 
+    def test_structured_branch_metrics_peak_memory_and_error_color(self):
+        from test_v083 import TRAIN, NOW
+        pane = self.window.training_pane
+        state = self.window.training.states["s"]
+        state["active"] = True
+        state["snapshot"] = state["tracker"].update(snapshot(TRAIN, now=NOW))
+        pane.render()
+        self.assertEqual(pane.content.winfo_children()[-1].cget("background"), COLORS["success"][0])
+        texts = self.texts(pane)
+        self.assertTrue(any("Loss/paired" in text and "Loss/rolled" in text for text in texts))
+        self.assertTrue(any("PID" in text and "显存峰值" in text and "日志" in text for text in texts))
+        state["snapshot"] = state["tracker"].update(snapshot(TRAIN.replace('1.0937', 'NaN'), now=NOW+1))
+        pane.render()
+        self.assertEqual(pane.content.winfo_children()[-1].cget("background"), COLORS["error"][0])
+        self.assertTrue(any("NaN/Inf" in text for text in self.texts(pane)))
+
+    def test_empty_match_explains_current_script_and_directory_filters(self):
+        pane = self.window.training_pane
+        state = self.window.training.states["s"]
+        value = snapshot(); value["tasks"] = []
+        state.update(active=True, snapshot=state["tracker"].update(value))
+        pane.render()
+        self.assertTrue(any("脚本匹配" in text and "train_*.py" in text for text in self.texts(pane)))
+
     def test_malformed_json_metrics_cannot_break_following_progress(self):
         text = '{"event":"train","metrics":null}\n' + '{"event":"train","epoch":3,"metrics":{"loss":0.5}}'
         result = parse_progress(text)
