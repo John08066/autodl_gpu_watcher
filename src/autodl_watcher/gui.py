@@ -17,6 +17,7 @@ from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from . import __version__
+from .app_icon import IconManager
 from .cli import normalize_host
 from .config import load_config
 from .login import LocalStartupError
@@ -124,6 +125,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
                 self.saved_entry = saved.get("entry", "")
             except (ValueError, OSError, AttributeError):
                 self.status.set("本地偏好读取失败，已使用默认配置")
+        self.icons = IconManager(root, self.local)
         self._build()
         self._populate([(item.machine_name, "待刷新", "未核验")
                         for item in self.config.auto_start.targets if item.enabled])
@@ -165,6 +167,8 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         style.configure("GlobalAI.TButton", padding=(7, 1))
         self.ai_settings_button = ttk.Button(frame, text="全局 AI 设置", style="GlobalAI.TButton", command=self.training.ai.configure)
         self.ai_settings_button.place(relx=1, y=0, anchor="ne")  # 全局入口位于标签栏右侧，不挤占监控日志高度。
+        self.icon_settings_button = ttk.Button(frame, text="应用图标", style="GlobalAI.TButton", command=self.icons.configure)
+        self.icon_settings_button.place(relx=1, x=-105, y=0, anchor="ne")
         self.auto_page = ttk.Frame(self.notebook, padding=6)
         self.notebook.add(self.auto_page, text="AutoDL 平台")
         page = self.auto_page
@@ -677,6 +681,9 @@ def main():  # 同一模块既可作为桌面入口，也可作为无界面的�
     parser = argparse.ArgumentParser(description="AutoDL GPU Watcher 图形界面")
     parser.add_argument("--debug", action="store_true", help="调试开发模式，默认只读且不切换无卡实例")
     args = parser.parse_args()
+    if os.name == "nt":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("AutoDL.GPUWatcher")
     root = tk.Tk()
     WatcherWindow(root, debug=args.debug)
     root.mainloop()  # Tk 处理用户输入、重绘和 after 回调，直到窗口被销毁。

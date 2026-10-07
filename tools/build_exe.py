@@ -8,10 +8,17 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def main(stage_only=False):  # 只收集应用代码和依赖，绝不把 runtime、.ui 或 .env 加入发行包。
+def main(stage_only=False, icon=None):  # 只收集应用代码和依赖，绝不把 runtime、.ui 或 .env 加入发行包。
     folder = ROOT / ".tools" / "build"
     folder.mkdir(parents=True, exist_ok=True)
     spec = folder / "AutoDLWatcher.spec"
+    icon_path = None
+    if icon:
+        sys.path.insert(0, str(ROOT / "src"))
+        from autodl_watcher.app_icon import load_icon
+        data, _, _ = load_icon(icon)
+        icon_path = folder / "application.ico"
+        icon_path.write_bytes(data)
     library_bin = Path(sys.prefix) / "Library" / "bin"
     binaries = [(str(library_bin / name), ".") for name in
                 ("libssl-3-x64.dll", "libcrypto-3-x64.dll") if (library_bin / name).is_file()]
@@ -26,7 +33,7 @@ def main(stage_only=False):  # 只收集应用代码和依赖，绝不把 runtim
 pyz = PYZ(a.pure)
 gui = EXE(pyz, a.scripts[:-2] + [a.scripts[-2]], [], exclude_binaries=True,
     name='AutoDLWatcher', debug=False, strip=False, upx=False, console=False,
-    contents_directory='_internal')
+    contents_directory='_internal', icon={str(icon_path) if icon_path else None!r})
 worker = EXE(pyz, a.scripts[:-2] + [a.scripts[-1]], [], exclude_binaries=True,
     name='AutoDLWorker', debug=False, strip=False, upx=False, console=True,
     contents_directory='.')
@@ -51,4 +58,6 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage-only", action="store_true", help="仅生成暂存发行包，保留正在运行的版本")
-    main(stage_only=parser.parse_args().stage_only)
+    parser.add_argument("--icon", help="将所选ICO/PNG嵌入GUI的EXE资源；ICO原样保留")
+    args = parser.parse_args()
+    main(stage_only=args.stage_only, icon=args.icon)

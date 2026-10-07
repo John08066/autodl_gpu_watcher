@@ -30,6 +30,7 @@
 
 ## Windows EXE与验证
 
+- 图标验收（2026-10-07，v0.8.9）：窗口/Tk图标、运行中任务栏、Shell快捷方式与EXE资源是不同来源；只修改窗口不能宣称EXE图标变化。ICO原样副本保留全部帧，Windows实际16/32帧通过WM_GETICON及GetIconInfo像素、ShellGetFileInfo和屏幕截图交叉核验；空句柄继续查GCLP_HICONSM/HICON。新进程只读icon.json恢复与热更换均实测通过。定制打包--icon保留3个测试作者帧；默认发行不嵌入个人图标。源码GUI验证mock刷新，未连接平台/SSH；正式用户图片、其它DPI及旧固定入口未实机验收。证据 `runtime/validation/icons-development/`，345项完整回归及8项加强图标检查。
 - 主程序固定在仓库根`AutoDLWatcher.exe`，worker在`_internal/AutoDLWorker.exe`，通过`AUTODL_APP_ROOT`共用外部config/runtime。构建先写`.tools/build/release`后合并，保留会话、配置、偏好和旧发行目录。成品干净包只从未运行的暂存目录取文件。
 - 打包解释器`D:/Dev/Anaconda/envs/autodl-watcher/python.exe`；显式收集Conda `Library/bin`的libssl/libcrypto并设置构建PATH，避免混用DLL。包含Python、Tk和Playwright driver，浏览器使用系统Edge；无外部Python PATH验收。代码`tools/build_exe.py`、`tests/test_package_layout.py`。
 - Windows辅助PowerShell必须使用`SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe`绝对路径。仅给`subprocess.run(env=...)`删PATH不足以复现Windows程序查找故障，须限制父进程PATH或让成品EXE实际继承该环境；窗口出现也不能代替刷新/登录验收。v0.7.0首版曾因交付窗口继承精简PATH触发WinError 2，同版已修复。2026-09-28实际验证精简PATH下刷新、原生登录与同步核验、只读监控及停止；`login.py`、`tests/test_login.py`、`runtime/validation/v0.7.0-path-repair/gui-live-verification.json`。

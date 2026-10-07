@@ -1,10 +1,10 @@
-# AutoDL GPU Watcher v0.8.8
+# AutoDL GPU Watcher v0.8.9
 
 监控 AutoDL 私有云入口空位、物理 GPU 显存和当前实例状态，满足条件后自动开机；另以只读SSH查看自己的训练进度、训练/测试指标和日志错误。
 
 ## 使用
 
-打开项目根目录的 `AutoDLWatcher.exe`。保留同目录的 `_internal/` 和 `config.yaml`；不需要安装 Python，需要系统 Microsoft Edge。迁移到另一台机器时使用干净包 `dist/AutoDLWatcher-v0.8.8.zip`，再自行登录。
+打开项目根目录的 `AutoDLWatcher.exe`。保留同目录的 `_internal/` 和 `config.yaml`；不需要安装 Python，需要系统 Microsoft Edge。迁移到另一台机器时使用干净包 `dist/AutoDLWatcher-v0.8.9.zip`，再自行登录。
 
 1. 启动后自动核验会话。登录失效时点击“登录 / 更新会话”，完成浏览器登录并关闭浏览器，再点击“已登录并关闭浏览器”。同步完成后仍需真实接口核验。
 2. 选择服务器入口，填写本人用户名和采样间隔（默认60秒，平台、显存与占用名单每轮一起刷新），点击“开始监控”。打开程序本身不会启动监控。
@@ -63,6 +63,18 @@ AutoDL 203容器的NVML仍无法对应本容器训练PID，因此GPU关联保持
 ```
 
 JSONL中的epoch按1开始，step为全局步数；每个事件一行并及时flush。通用协议识别 `train/test/progress/completed/error`，`progress`事件可带 `phase: train/test`。未知日志格式仍显示进程和GPU，最近三行原文作为未解释摘要。只有可见进程且有可读输出才能分析；没有输出、无权限或仅二进制事件文件时，本地规则和LLM都无法保证恢复真实训练进度。
+
+### 全局应用图标
+
+标签栏右侧点击“应用图标”，选择ICO或PNG即可保存并设置当前窗口、已有弹窗及后来打开的弹窗；所有服务器页面共用，下次启动自动恢复。支持恢复默认图标，监控运行中也可更换。
+
+- ICO按原文件字节保存，保留全部帧及作者提供的小尺寸设计，不重新编码为单帧。加载时解码各帧并通过Tk `iconphoto(False, *frames)` 显式设置窗口，保留图片对象生命周期。
+- PNG保留透明度和宽高比例，居中透明补边；16、20、24、32、40、48、64、128、256各档直接从原图生成。原图分辨率及帧尺寸显示在设置页，放大不会增加原文件细节。[Pillow ICO说明](https://pillow.readthedocs.io/en/stable/handbook/image-file-formats.html#ico)
+- 窗口标题栏、运行中任务栏、快捷方式和磁盘EXE是不同图标来源。“另存启动快捷方式”生成带当前图标的 `.lnk`；之后更换图标需重新导出。旧固定入口可能使用旧图标，需要重新固定新快捷方式；程序不清除系统图标缓存、不改动已有任务栏固定项。
+- 磁盘EXE图标通过打包参数配置：`python tools/build_exe.py --stage-only --icon "C:/path/icon.ico"`（也支持PNG）。验证暂存文件后关闭旧程序再替换；运行时的图标设置不会改写EXE。未选定正式图标时，发行包保留原来的默认图标。
+- 偏好在 `.ui/icon.json`，图标副本在 `.ui/icons/`，不依赖原始文件一直留在导入位置，不进入干净发行包。旧副本保留供已经导出的快捷方式引用。
+
+图标验证分原件、转换、Tk加载及系统显示四层：345项完整回归及8项加强图标检查通过；独立新进程启动、运行中更换、Windows窗口/快捷方式/定制EXE句柄像素和标题栏/任务栏截图均已检查。当前环境实际选择16px小帧与32px大帧；未对其它显示缩放或用户尚未提供的正式图标作实机显示承诺。`WM_GETICON`为空时需检查窗口类图标，不能直接断言未加载。[Windows官方说明](https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-geticon)
 
 ### 全局 AI 设置与任务专用监控规则
 

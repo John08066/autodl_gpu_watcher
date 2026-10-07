@@ -54,6 +54,16 @@ class GuiWindowTest(unittest.TestCase):
         self.assertIs(self.window.training.ai.service,self.window.training)
         self.assertEqual(button.cget("text"),"全局 AI 设置")
 
+    def test_icon_settings_is_global_and_does_not_overlap_ai_button(self):
+        self.root.deiconify();self.root.update()
+        button=self.window.icon_settings_button
+        ai=self.window.ai_settings_button
+        self.assertIs(button.master,ai.master)
+        self.assertLessEqual(button.winfo_rootx()+button.winfo_width(),ai.winfo_rootx())
+        dialog=self.window.icons.configure();self.root.update()
+        self.assertIn('所有服务器共用',dialog.title())
+        dialog.destroy()
+
     def test_startup_schedules_readonly_session_check(self):
         self.root.update()
         self.refresh_mock.assert_called_once()
