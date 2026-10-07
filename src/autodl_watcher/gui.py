@@ -105,7 +105,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         self._gpu_render_key = None
         self.saved_entry = ""
         self.training = TrainingService(self.events)
-        self.training.ai = AIAssistant(root, self.local / "ai.json")
+        self.training.ai = AIAssistant(root, self.local / "ai.json", self.training)
         self.server_file = self.local / "servers.json"
         self.servers, self.external_panes = [], {}
         self.title_text = tk.StringVar(value="AutoDL 平台")
@@ -162,6 +162,9 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         frame.pack(fill="both", expand=True)
         self.notebook = ttk.Notebook(frame)
         self.notebook.pack(fill="both", expand=True, pady=(3, 0))
+        style.configure("GlobalAI.TButton", padding=(7, 1))
+        self.ai_settings_button = ttk.Button(frame, text="全局 AI 设置", style="GlobalAI.TButton", command=self.training.ai.configure)
+        self.ai_settings_button.place(relx=1, y=0, anchor="ne")  # 全局入口位于标签栏右侧，不挤占监控日志高度。
         self.auto_page = ttk.Frame(self.notebook, padding=6)
         self.notebook.add(self.auto_page, text="AutoDL 平台")
         page = self.auto_page

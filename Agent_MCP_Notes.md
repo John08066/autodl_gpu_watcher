@@ -40,7 +40,7 @@
 
 ## 训练进度与SSH只读采集
 
-- 通用日志与AI边界（2026-10-07）：JSON、Python字典和键值文本保留任意数值指标；阶段不明保持未知并显示原文。tmux进程树/打开的日志用于发现，不证明训练正常；没有输出无法靠LLM补全。AI为手动单请求，独立Windows凭据命名空间 `autodl-watcher/llm/`、本地公开设置 `.ui/ai.json`，不能复用消息萃取密钥或影响PID/错误/电源状态。用户指定本轮仅模拟API验收；311项离线测试及203一次只读采集已通过（PID259659，第10轮/Step16200），4090未联系。证据 `runtime/validation/v086-development/`；真实API待用户配置核验。
+- 通用日志与AI边界（2026-10-07修订）：此前“一次性AI摘要、不驱动卡片”的v0.8.6方案已被用户明确改为任务专用解析规则。全局 `.ui/ai.json`/Windows凭据供全部服务器共用，Flex显式传参；`.ui/training_rules.json`按连接范围和进程启动身份缓存规则及尝试记录，自动模式每任务只尝试一次。仅解释字段路径和受限模板，数值来自新日志；失败回退默认，不能清除错误或执行模型代码。验证：325项离线回归，203一次只读日志回放验证第10轮/Step17700；API仅模拟、4090未联系。证据 `runtime/validation/rules-development/`。全局入口位于标签栏右侧，新增独立工具栏会破坏底部至少六行日志高度，已回归修复。
 
 - P03-T01使用`scripts/train_p03_t01.py`；v0.8.2的固定脚本列表及旧日志协议曾漏报。v0.8.3按`train_*.py`识别同类入口、适配`TRAIN {...}`和`EVALUATED 分支 {...}`，批次追踪JSON不能替代训练事件；旧默认列表仅在内存迁移，自定义范围不放宽。`steps_per_arm`累计计数，Epoch从0开始，`EPOCH_END`不等于训练完成。脚本第203行的`peak_gpu_allocated=torch.cuda.max_memory_allocated()`仅作本人日志峰值，需日志PID匹配，不能当作NVML当前用量。2026-10-03实际只读确认，依据远端`/root/DeepfakeBench-prd-common/scripts/train_p03_t01.py`和本地`runtime/validation/v0.8.3/live-snapshot.json`；代码`training.py`、`remote_probe.py`。
 - v0.8.0用已有SSH别名，`BatchMode=yes`、`ClearAllForwardings=yes`、严格主机校验；通过stdin执行标准库探针，不落远端文件。本人UID的训练根进程按boot_id/PID/start_ticks识别，DataLoader子进程不重复统计，日志从打开的fd关联。读取无关SSH/systemd进程cwd可能PermissionError，不能因此认定训练列表残缺；仅Python进程读取cwd。代码`remote_probe.py`；2026-09-30实际只读验证203-1及4090，证据`runtime/validation/v0.8.0/gui-live-verification.json`。

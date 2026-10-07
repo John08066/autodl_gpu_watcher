@@ -11,10 +11,14 @@ import requests
 from autodl_watcher import ai_credentials
 from autodl_watcher.training_ai import AnalysisError, analyze, decode_result, excerpt, save_settings, settings
 from autodl_watcher.training_ai_ui import AIAssistant, AISettings
+from autodl_watcher.training_ui import TrainingService
+from autodl_watcher.training import TrainingServer
+from test_training import snapshot
+import queue
 
-CONFIG = {"base_url": "https://example.com/v1", "protocol": "responses", "model": "example-model"}
+CONFIG = {"base_url": "https://example.com/v1", "protocol": "responses", "model": "example-model", "service_tier": "flex", "auto_generate": False}
 SOURCE = "Epoch 2 Dice=0.81 custom_quality=4.2"
-RESULT = {"summary": "日志显示第2轮，Dice为0.81。", "metrics": [{"name": "Dice", "value": "0.81", "evidence": "Dice=0.81"}]}
+RESULT = {"name": "Dice规则", "rules": [{"format": "text", "template": "Epoch {epoch:number} Dice={dice:number} custom_quality={quality:number}", "phase": "train", "fields": {"epoch": "epoch"}, "metrics": {"Dice": "dice", "质量": "quality"}, "example": SOURCE}]}
 
 
 def sse(event):
@@ -22,7 +26,7 @@ def sse(event):
 
 
 def completed():
-    return sse({"type": "response.completed", "response": {"status": "completed", "output": [{"content": [{"type": "output_text", "text": json.dumps(RESULT)}]}]}})
+    return sse({"type": "response.completed", "response": {"status": "completed", "service_tier": "flex", "output": [{"content": [{"type": "output_text", "text": json.dumps(RESULT)}]}]}})
 
 
 class AIBackendTest(unittest.TestCase):
@@ -42,7 +46,10 @@ class AIBackendTest(unittest.TestCase):
 
     def test_responses_complete_and_no_redirect_or_store(self):
         result,call=self.call([completed()])
-        self.assertEqual(result['metrics'],RESULT['metrics'])
+        self.assertEqual(result['profile'],RESULT)
+        self.assertEqual(result['service_tier'],'flex')
+        self.assertEqual(call.kwargs['json']['service_tier'],'flex')
+        self.assertEqual(call.kwargs['timeout'],(10,900))
         self.assertFalse(call.kwargs['allow_redirects'])
         self.assertFalse(call.kwargs['json']['store'])
         self.assertTrue(call.kwargs['stream'])
@@ -51,7 +58,7 @@ class AIBackendTest(unittest.TestCase):
     def test_chat_stop_and_done_required(self):
         lines=[sse({'choices':[{'index':0,'delta':{'content':json.dumps(RESULT)},'finish_reason':None}]}),sse({'choices':[{'index':0,'delta':{},'finish_reason':'stop'}]}),b'data: [DONE]']
         result,call=self.call(lines,{**CONFIG,'protocol':'chat'})
-        self.assertEqual(result['summary'],RESULT['summary'])
+        self.assertEqual(result['profile'],RESULT)
         self.assertTrue(call.args[0].endswith('/chat/completions'))
         with self.assertRaisesRegex(AnalysisError,'完成标记'):
             self.call(lines[:-1],{**CONFIG,'protocol':'chat'})
@@ -83,12 +90,17 @@ class AIBackendTest(unittest.TestCase):
             self.assertTrue(ai_credentials._target(CONFIG['base_url']).startswith('autodl-watcher/'))
             self.assertNotEqual(ai_credentials._target(CONFIG['base_url']),ai_credentials._target('https://other.example/v1'))
 
-    def test_unproven_metrics_rejected_and_no_model_state_used(self):
-        with self.assertRaisesRegex(AnalysisError,'原文证据'):
-            decode_result(json.dumps({'summary':'x','metrics':[{'name':'loss','value':'.01','evidence':'loss=.01'}]}),SOURCE)
-        result=decode_result(json.dumps({**RESULT,'status':'completed','power_on':True}),SOURCE)
-        self.assertNotIn('status',result)
-        self.assertNotIn('power_on',result)
+    def test_invalid_profile_rejected_and_no_code_accepted(self):
+        with self.assertRaises(ValueError):
+            decode_result(json.dumps({'name':'x','rules':[]}),SOURCE)
+        with self.assertRaises(ValueError):
+            decode_result(json.dumps({**RESULT,'command':'whoami'}),SOURCE)
+
+    def test_standard_and_unknown_returned_tier(self):
+        result,call=self.call([completed()],{**CONFIG,'service_tier':'default'})
+        self.assertEqual(call.kwargs['json']['service_tier'],'default')
+        self.assertEqual(call.kwargs['timeout'],(10,180))
+        self.assertEqual(result['service_tier'],'flex')  # 返回等级与请求分开记录。
 
     def test_excerpt_is_bounded_and_common_secrets_hidden(self):
         source='a'*13000+'\napi_key="secret123" password=pwd123 Authorization: Bearer bearer123 sk-somethinglong'
@@ -106,7 +118,12 @@ class AIUITest(unittest.TestCase):
         self.path=Path(self.temp.name)/'ai.json'
         self.path.write_text(json.dumps(CONFIG))
         self.root=tk.Tk();self.root.withdraw()
-        self.assistant=AIAssistant(self.root,self.path)
+        self.service=TrainingService(queue.Queue())
+        self.assistant=AIAssistant(self.root,self.path,self.service)
+        self.service.ai=self.assistant
+        self.service.register(TrainingServer("s","s","host"))
+        self.service.states["s"]["snapshot"]=self.service.states["s"]["tracker"].update(snapshot(SOURCE))
+        self.card=self.service.states["s"]["snapshot"]["cards"][0]
 
     def tearDown(self):
         for timer in self.root.tk.call('after','info'):
@@ -125,41 +142,42 @@ class AIUITest(unittest.TestCase):
 
     def test_manual_only_single_request_and_main_thread_result(self):
         started,release=threading.Event(),threading.Event()
-        def response(config,source):
+        def response(config,source,pid):
             started.set();release.wait(3)
-            return {**RESULT,'model':'example-model','analyzed_at':time.time()}
-        card={'name':'solver.py','pid':10,'details':SOURCE,'status':'进程存活'}
+            return {'profile':RESULT,'model':'example-model','analyzed_at':time.time(),'service_tier':'flex'}
+        card=dict(self.card)
         with patch('autodl_watcher.training_ai_ui.analyze',side_effect=response) as api:
-            dialog=self.assistant.explain(card)
+            dialog=self.assistant.explain("s",card)
             self.root.update();api.assert_not_called()
             dialog.start();self.assertTrue(started.wait(1))
-            other=self.assistant.explain(card);other.start()
+            other=self.assistant.explain("s",card);other.start()
             self.assertIn('已有 AI 请求',other.status.cget('text'))
             release.set()
             deadline=time.monotonic()+3
             while str(dialog.send.cget('state'))=='disabled' and time.monotonic()<deadline:
                 self.root.update();time.sleep(.02)
             self.assertIn('Dice',dialog.output.get('1.0','end'))
-            self.assertEqual(card['status'],'进程存活')
+            self.assertEqual(card['status'],self.card['status'])
+            self.assertIn('专用规则',self.service.states['s']['snapshot']['cards'][0]['rule_status'])
             api.assert_called_once()
             dialog.destroy();other.destroy();self.root.update()
 
     def test_close_pending_window_cancels_timer_and_preserves_lock_until_done(self):
         release=threading.Event()
-        def response(config,source):
+        def response(config,source,pid):
             release.wait(3)
             raise AnalysisError('模拟失败')
         with patch('autodl_watcher.training_ai_ui.analyze',side_effect=response):
-            dialog=self.assistant.explain({'name':'solver','pid':10,'details':SOURCE})
+            dialog=self.assistant.explain("s",self.card)
             dialog.start();dialog.destroy()
             self.assertIsNone(dialog.timer)
-            self.assertTrue(self.assistant.lock.locked())
+            self.assertTrue(self.assistant.busy)
             release.set()
             deadline=time.monotonic()+2
-            while self.assistant.lock.locked() and time.monotonic()<deadline:
-                time.sleep(.01)
+            while self.assistant.busy and time.monotonic()<deadline:
+                self.assistant.poll();time.sleep(.01)
             self.root.update()
-            self.assertFalse(self.assistant.lock.locked())
+            self.assertFalse(self.assistant.busy)
 
 
 if __name__=='__main__':

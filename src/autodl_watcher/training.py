@@ -438,8 +438,9 @@ def log_text(log):
 
 
 class TrainingTracker:
-    def __init__(self, server):
+    def __init__(self, server, rule_lookup=None):
         self.server = server
+        self.rule_lookup = rule_lookup
         self.known = {}
         self.references = {}
 
@@ -455,6 +456,33 @@ class TrainingTracker:
             logs = [item for item in task.get("logs", []) if "error" not in item]
             parsed = [(log, parse_progress(log_text(log), snapshot.get("utc_offset", "+0000"), expected_pid=task["pid"])) for log in logs]
             primary, progress = max(parsed, key=lambda pair: (pair[1]["phase"] != "unknown", Path(pair[0]["path"]).name == "training.log", pair[0]["modified_at"])) if parsed else (None, previous.get("progress", parse_progress("")))
+            rule_status = "默认监控"
+            entry = self.rule_lookup(dict(task, log_path=primary["path"] if primary else "")) if self.rule_lookup else None
+            if entry:
+                rule_status = entry.get("message", "默认监控")
+            if entry and entry.get("profile") and (not primary or entry.get("log_path") != primary["path"]):
+                rule_status = "默认监控 · 日志来源已变化，请更新规则"
+            if primary and entry and entry.get("profile") and entry.get("log_path") == primary["path"]:
+                from .training_rules import parse_rules
+                try:
+                    events = parse_rules(entry["profile"], log_text(primary), task["pid"])
+                    if not events:
+                        raise ValueError("当前片段未匹配规则")
+                    adapted = parse_progress("\n".join(json.dumps(event) for event in events), snapshot.get("utc_offset", "+0000"), task["pid"])
+                    if progress["progress_at"] and adapted["progress_at"] and progress["progress_at"] > adapted["progress_at"]:
+                        raise ValueError("最新已识别进度未匹配规则")
+                    for name in ("phase", "epoch", "total_epochs", "raw_epoch", "step", "total_steps", "progress_at"):
+                        if adapted.get(name) is not None:
+                            progress[name] = adapted[name]
+                    for name in ("train", "observations"):
+                        if adapted[name]:
+                            progress[name] = adapted[name]
+                    if adapted["tests"]:
+                        progress["tests"] = adapted["tests"]  # 专用测试命名替代默认命名，避免同组指标重复展示。
+                    progress["error"] = progress["error"] or adapted["error"]
+                    rule_status = "专用规则已启用：" + entry["profile"]["name"]
+                except (ValueError, TypeError, KeyError) as exc:
+                    rule_status = "默认监控 · 专用规则不适用：" + str(exc)
             for log, extra in parsed:
                 if log is not primary:
                     if extra["error"] and log["modified_at"] >= task.get("started_at", 0) and (
@@ -488,7 +516,7 @@ class TrainingTracker:
             else:
                 level, status = "success", "正在测试" if progress["phase"] == "test" else "正在训练"
             card = dict(task, progress=progress, level=level, status=status, marker=marker,
-                        advanced_at=advanced_at, log_path=primary["path"] if primary else "",
+                        advanced_at=advanced_at, rule_status=rule_status, log_path=primary["path"] if primary else "",
                         details=(primary["tail"] if primary.get("gap") else primary["head"] + primary["tail"]) if primary else "")
             if primary:
                 preview = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", card["details"]).replace("\r", "\n")

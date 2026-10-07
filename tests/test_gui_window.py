@@ -46,6 +46,14 @@ class GuiWindowTest(unittest.TestCase):
         self.assertTrue(condition(), "UI 子进程未在期限内完成")
 
 
+    def test_ai_settings_is_global_outside_server_pages(self):
+        self.root.update()
+        button=self.window.ai_settings_button
+        self.assertIs(button.master,self.window.notebook.master)
+        self.assertNotEqual(button.master,self.window.auto_page)
+        self.assertIs(self.window.training.ai.service,self.window.training)
+        self.assertEqual(button.cget("text"),"全局 AI 设置")
+
     def test_startup_schedules_readonly_session_check(self):
         self.root.update()
         self.refresh_mock.assert_called_once()

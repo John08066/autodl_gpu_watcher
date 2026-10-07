@@ -23,9 +23,27 @@ class TrainingService:  # 每台服务器最多一个只读请求；线程只投
             return
         if state:
             state["connection"].close()
-        self.states[server.id] = dict(server=server, tracker=TrainingTracker(server), active=False, busy=False,
+        self.states[server.id] = dict(server=server, tracker=TrainingTracker(server, lambda task: self.rule_entry(server, task)), active=False, busy=False,
                                       generation=(state["generation"] + 1 if state else 0), due=0, interval=60, snapshot=None, pending=None,
                                       connection=TrainingConnection(server), failures=0)
+
+    def rule_entry(self, server, task):
+        if getattr(self, "ai", None):
+            from .training_rules import task_identity
+            identity = task_identity(server, task)
+            entry = self.ai.store.entries.get(identity)
+            if not entry and self.ai.store.error:
+                return {"message": "默认监控 · " + self.ai.store.error}
+            if entry and "正在生成" in entry.get("message", "") and self.ai.busy != identity:
+                return dict(entry, message="默认监控 · 上次规则请求未完成，可手动重试")
+            return entry
+        return None
+
+    def reparse(self, server_id):
+        state = self.states.get(server_id)
+        if state and state.get("snapshot"):
+            old = state["snapshot"]
+            state["snapshot"] = dict(state["tracker"].update(old), received_at=old["received_at"], error=old.get("error", ""))
 
     def start(self, server_id, interval):
         state = self.states[server_id]
@@ -49,6 +67,8 @@ class TrainingService:  # 每台服务器最多一个只读请求；线程只投
         state["connection"].close()
 
     def tick(self):
+        if getattr(self, "ai", None):
+            self.ai.tick()
         now = time.monotonic()
         for server_id, state in self.states.items():
             if state["active"] and not state["busy"] and now >= state["due"]:
@@ -163,8 +183,6 @@ class TrainingPane(ttk.Frame):
         self.stop_button.pack(side="left", padx=4)
         self.configure_button = ttk.Button(bar, text="设置连接", command=configure_server)
         self.configure_button.pack(side="right")
-        if getattr(service, "ai", None):
-            ttk.Button(bar, text="AI 设置", command=service.ai.configure).pack(side="right", padx=4)
         self.summary = ttk.Label(self, text="尚未配置训练连接", wraplength=560)
         self.summary.pack(fill="x", pady=(0, 5))
         if show_gpus:
@@ -230,7 +248,8 @@ class TrainingPane(ttk.Frame):
         expired = bool(snapshot and time.time() - snapshot["received_at"] > max(90, state["interval"] * 2))
         key = (self.server_id, state["active"] if state else False, state["busy"] if state else False,
                snapshot["received_at"] if snapshot else None, expired, state.get("pending") if state else None,
-               state["generation"] if state else None, getattr(self, "show_history", False))
+               state["generation"] if state else None, getattr(self, "show_history", False),
+               self.service.ai.revision if getattr(self.service, "ai", None) else 0)
         if key == self.render_key:
             return
         self.render_key = key
@@ -292,6 +311,7 @@ class TrainingPane(ttk.Frame):
                         + (" · 上次采样" if warning or not state["active"] else ""))
             if card.get("tmux_session"):
                 self._label(frame, f"tmux：{card['tmux_session']}")
+            self._label(frame, card.get("rule_status", "默认监控"), color=COLORS["warning"][1] if "不适用" in card.get("rule_status", "") else "#c0d6cd")
             progress = card["progress"]
             epoch, total = progress.get("epoch"), progress.get("total_epochs")
             raw = f" · 日志Epoch {progress['raw_epoch']}" if progress.get("raw_epoch") is not None else ""
@@ -312,7 +332,7 @@ class TrainingPane(ttk.Frame):
             actions.pack(anchor="e", padx=8, pady=(2, 6))
             ttk.Button(actions, text="训练原日志", command=lambda item=card: self.details(item)).pack(side="right")
             if getattr(self.service, "ai", None):
-                ttk.Button(actions, text="AI 解读", command=lambda item=card: self.service.ai.explain(item)).pack(side="right", padx=4)
+                ttk.Button(actions, text="生成 / 更新监控规则", command=lambda item=card: self.service.ai.explain(self.server_id, item)).pack(side="right", padx=4)
 
         self.content.update_idletasks()
         self.canvas.yview_moveto(position)
