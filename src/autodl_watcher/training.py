@@ -319,7 +319,7 @@ def _generic_event(line, event):
 
 def parse_progress(text, utc_offset="+0000", expected_pid=None):  # DeepfakeBench适配器及通用JSONL事件协议；指标总是携带各自epoch/step。
     result = {"phase": "unknown", "epoch": None, "total_epochs": None, "raw_epoch": None, "step": None,
-              "train": {}, "tests": {}, "observations": {}, "error": "", "completed": False, "progress_at": None}
+              "train": {}, "tests": {}, "observations": {}, "error": "", "completed": False, "progress_at": None, "progress_line": None}
     deepfake = bool(re.search(r"Epoch\[\d+\]|training-metric,|nEpochs:", text))
     last_epoch = re.search(r"\bnEpochs:\s*(\d+)", text)
     start_epoch = re.search(r"\bstart_epoch:\s*(\d+)", text)
@@ -328,7 +328,7 @@ def parse_progress(text, utc_offset="+0000", expected_pid=None):  # DeepfakeBenc
         result["total_epochs"] = int(last_epoch[1]) - first + 1  # 已核验此项目range(start_epoch,nEpochs+1)，包含末轮。
     stamp = None
     event_pid = None
-    for line in text.replace("\r", "\n").splitlines():
+    for index, line in enumerate(text.replace("\r", "\n").splitlines()):
         match = _TIMESTAMP.search(line)
         if match:
             try:
@@ -425,8 +425,10 @@ def parse_progress(text, utc_offset="+0000", expected_pid=None):  # DeepfakeBenc
         if _FATAL.search(line) or re.search(r"(?:training|testing)-(?:loss|metric),\s*\w+:\s*[-+]?(?:nan|inf)\b", line, re.I):
             result.update(error=line.strip()[-500:], completed=False)
             advanced = True
-        if advanced and stamp is not None:
-            result["progress_at"] = stamp
+        if advanced:
+            result["progress_line"] = index
+            if stamp is not None:
+                result["progress_at"] = stamp
     return result
 
 
@@ -465,22 +467,26 @@ class TrainingTracker:
             if primary and entry and entry.get("profile") and entry.get("log_path") == primary["path"]:
                 from .training_rules import parse_rules
                 try:
-                    events = parse_rules(entry["profile"], log_text(primary), task["pid"])
+                    text = log_text(primary)
+                    events = parse_rules(entry["profile"], text, task["pid"], with_lines=True)
                     if not events:
                         raise ValueError("当前片段未匹配规则")
-                    adapted = parse_progress("\n".join(json.dumps(event) for event in events), snapshot.get("utc_offset", "+0000"), task["pid"])
-                    if progress["progress_at"] and adapted["progress_at"] and progress["progress_at"] > adapted["progress_at"]:
-                        raise ValueError("最新已识别进度未匹配规则")
-                    for name in ("phase", "epoch", "total_epochs", "raw_epoch", "step", "total_steps", "progress_at"):
-                        if adapted.get(name) is not None:
-                            progress[name] = adapted[name]
-                    for name in ("train", "observations"):
-                        if adapted[name]:
-                            progress[name] = adapted[name]
-                    if adapted["tests"]:
-                        progress["tests"] = adapted["tests"]  # 专用测试命名替代默认命名，避免同组指标重复展示。
-                    progress["error"] = progress["error"] or adapted["error"]
+                    lines = text.replace("\r", "\n").splitlines()
+                    # 在原记录位置替换提取结果，保留未覆盖阶段及统一的外层时间。
+                    # 同行 JSON time 与日志前缀的微小差异不能使规则失效。
+                    for index, event in events:
+                        stamp = _TIMESTAMP.search(lines[index])
+                        lines[index] = (stamp[1] + " " if stamp else "") + json.dumps(event)
+                    adapted = parse_progress("\n".join(lines), snapshot.get("utc_offset", "+0000"), task["pid"])
+                    adapted["error"] = progress["error"] or adapted["error"]
+                    adapted["completed"] = progress["completed"]
+                    if "peak_memory_bytes" in progress:
+                        adapted["peak_memory_bytes"] = progress["peak_memory_bytes"]
+                    partial = adapted["progress_line"] is not None and adapted["progress_line"] not in {index for index, _ in events}
+                    progress = adapted
                     rule_status = "专用规则已启用：" + entry["profile"]["name"]
+                    if partial:
+                        rule_status += " · 最新未覆盖行使用默认解析"
                 except (ValueError, TypeError, KeyError) as exc:
                     rule_status = "默认监控 · 专用规则不适用：" + str(exc)
             for log, extra in parsed:

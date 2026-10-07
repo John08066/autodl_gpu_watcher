@@ -141,10 +141,10 @@ def validate_profile(value, source, pid=None):
     return value
 
 
-def parse_rules(profile, text, pid):
+def parse_rules(profile, text, pid, *, with_lines=False):
     events = []
     context_pid = None
-    for line in text.splitlines():
+    for index, line in enumerate(text.replace("\r", "\n").splitlines()):
         line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line)
         if len(line) > 16384:
             continue
@@ -159,7 +159,7 @@ def parse_rules(profile, text, pid):
                     context_pid = event["pid"]
                 elif context_pid is not None and context_pid != pid:
                     break
-                events.append(event)
+                events.append((index, event) if with_lines else event)
                 break
     return events
 

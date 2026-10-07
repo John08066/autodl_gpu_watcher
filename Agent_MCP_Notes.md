@@ -40,7 +40,7 @@
 
 ## 训练进度与SSH只读采集
 
-- 通用日志与AI边界（2026-10-07修订）：此前“一次性AI摘要、不驱动卡片”的v0.8.6方案已被用户明确改为任务专用解析规则。全局 `.ui/ai.json`/Windows凭据供全部服务器共用，Flex显式传参；`.ui/training_rules.json`按连接范围和进程启动身份缓存规则及尝试记录，自动模式每任务只尝试一次。仅解释字段路径和受限模板，数值来自新日志；失败回退默认，不能清除错误或执行模型代码。验证：325项离线回归，203一次只读日志回放验证第10轮/Step17700；API仅模拟、4090未联系。证据 `runtime/validation/rules-development/`。全局入口位于标签栏右侧，新增独立工具栏会破坏底部至少六行日志高度，已回归修复。
+- 通用日志与AI边界（2026-10-07，v0.8.8）：全局 `.ui/ai.json`/Windows凭据供全部服务器共用，含Flex、可编辑监控提示词与调用时计价；`.ui/training_rules.json`按连接范围和进程启动身份缓存，自动模式每任务只尝试一次，采样不重复调用AI。仅解释字段路径/受限模板，不能执行模型代码、清除错误或参与开机。确认v0.8.7误判根因：Q10同条日志外层时间比JSON time晚约0.76ms，严格时间比较拒绝有效规则；现按原记录位置应用、未覆盖行默认解析，生成窗口读取主卡片真实状态。`.ui/ai_usage.sqlite3`独立记录返回用量/单价快照，包括规则无效请求；缺失为未知、历史不补造。验证：336项完整回归及收尾13项规则回归；203已有真实样本/用户缓存规则本地回放17700→18100，API仅模拟、本轮无远端连接。证据 `runtime/validation/ai-usage-development/`。全局按钮仍放标签栏右侧，独立工具栏会压缩底部六行日志高度。
 
 - P03-T01使用`scripts/train_p03_t01.py`；v0.8.2的固定脚本列表及旧日志协议曾漏报。v0.8.3按`train_*.py`识别同类入口、适配`TRAIN {...}`和`EVALUATED 分支 {...}`，批次追踪JSON不能替代训练事件；旧默认列表仅在内存迁移，自定义范围不放宽。`steps_per_arm`累计计数，Epoch从0开始，`EPOCH_END`不等于训练完成。脚本第203行的`peak_gpu_allocated=torch.cuda.max_memory_allocated()`仅作本人日志峰值，需日志PID匹配，不能当作NVML当前用量。2026-10-03实际只读确认，依据远端`/root/DeepfakeBench-prd-common/scripts/train_p03_t01.py`和本地`runtime/validation/v0.8.3/live-snapshot.json`；代码`training.py`、`remote_probe.py`。
 - v0.8.0用已有SSH别名，`BatchMode=yes`、`ClearAllForwardings=yes`、严格主机校验；通过stdin执行标准库探针，不落远端文件。本人UID的训练根进程按boot_id/PID/start_ticks识别，DataLoader子进程不重复统计，日志从打开的fd关联。读取无关SSH/systemd进程cwd可能PermissionError，不能因此认定训练列表残缺；仅Python进程读取cwd。代码`remote_probe.py`；2026-09-30实际只读验证203-1及4090，证据`runtime/validation/v0.8.0/gui-live-verification.json`。

@@ -85,7 +85,7 @@ class AIBackendTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, patch('autodl_watcher.training_ai.ai_credentials.save') as save:
             path=Path(folder)/'ai.json'
             save_settings(path,{**CONFIG,'api_key':'not-allowed'},'test-key')
-            self.assertEqual(json.loads(path.read_text()),CONFIG)
+            self.assertEqual(json.loads(path.read_text()),settings(CONFIG))
             save.assert_called_once_with(CONFIG['base_url'],'test-key')
             self.assertTrue(ai_credentials._target(CONFIG['base_url']).startswith('autodl-watcher/'))
             self.assertNotEqual(ai_credentials._target(CONFIG['base_url']),ai_credentials._target('https://other.example/v1'))
@@ -139,6 +139,34 @@ class AIUITest(unittest.TestCase):
             self.assertNotIn('ui-secret',self.path.read_text())
             self.assertIn('未保存密钥',dialog.status.cget('text'))
             save.assert_called_once();network.assert_not_called()
+
+    def test_global_prompt_save_restore_and_usage_page_without_api(self):
+        from autodl_watcher.training_ai import DEFAULT_PROMPT
+        with patch('autodl_watcher.training_ai.ai_credentials.read',return_value=''), patch('autodl_watcher.training_ai.requests.Session') as api:
+            dialog=self.assistant.configure()
+            dialog.prompt.delete('1.0','end');dialog.prompt.insert('1.0','监控所有分支的FID和Dice')
+            dialog.save()
+            self.assertEqual(self.assistant.config['prompt'],'监控所有分支的FID和Dice')
+            dialog.reset_prompt();dialog.save()
+            self.assertEqual(self.assistant.config['prompt'],DEFAULT_PROMPT)
+            dialog.refresh_usage()
+            self.assertIn('累计：0次请求',dialog.usage_text.get('1.0','end'))
+            api.assert_not_called()
+            dialog.destroy()
+
+    def test_generation_window_reports_current_card_fallback_and_later_recovery(self):
+        from autodl_watcher.training_rules import task_identity
+        identity=task_identity(self.service.states['s']['server'],self.card)
+        self.assistant.store.put(identity,{'profile':RESULT,'log_path':self.card['log_path'],'message':'专用规则已生成'})
+        state=self.service.states['s']
+        state['snapshot']=state['tracker'].update(snapshot('a new unrecognized format'))
+        dialog=self.assistant.explain('s',self.card)
+        self.assertIn('当前片段未匹配规则',dialog.output.get('1.0','end'))
+        self.assertNotIn('已用于主卡片',dialog.output.get('1.0','end'))
+        state['snapshot']=state['tracker'].update(snapshot(SOURCE))
+        dialog.after_cancel(dialog.timer);dialog.timer=None;dialog._poll()
+        self.assertIn('专用规则已启用',dialog.output.get('1.0','end'))
+        dialog.destroy()
 
     def test_manual_only_single_request_and_main_thread_result(self):
         started,release=threading.Event(),threading.Event()

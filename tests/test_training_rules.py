@@ -56,6 +56,8 @@ class RuleEngineTest(unittest.TestCase):
         card=tracker.update(snapshot(LINE))['cards'][0]
         self.assertEqual(card['progress']['train']['metrics']['Dice'],.81)
         self.assertIn('专用规则已启用',card['rule_status'])
+        card=tracker.update(snapshot('Epoch 1/20 loss=0.2\n' + LINE))['cards'][0]
+        self.assertNotIn('最新未覆盖行',card['rule_status'])
         later=snapshot(LINE.replace('40','80').replace('0.81','0.92'))
         card=tracker.update(later)['cards'][0]
         self.assertEqual(card['progress']['step'],80)
@@ -74,6 +76,29 @@ class RuleEngineTest(unittest.TestCase):
         tracker=TrainingTracker(TrainingServer('s','s','host'),lambda t:{'profile':profile,'log_path':'/project/training.log'})
         card=tracker.update(snapshot(text))['cards'][0]
         self.assertEqual(list(card['progress']['tests']),['joint'])
+
+    def test_same_record_outer_and_inner_timestamps_do_not_reject_rule(self):
+        line = '2026-10-07T13:04:52.402788+08:00 TRAIN {"status":"training","time":"2026-10-07T13:04:52.402028+08:00","pid":10,"epoch":10,"steps":17700,"loss":0.0916}'
+        profile = {'name':'Q10','rules':[{'format':'json','contains':'TRAIN ', 'phase':'train','fields':{'epoch':'epoch','step':'steps','pid':'pid','time':'time'},'metrics':{'自定义损失':'loss'},'example':line}]}
+        tracker = TrainingTracker(TrainingServer('s','s','host'), lambda t: {'profile':profile,'log_path':'/project/training.log'})
+        card = tracker.update(snapshot(line))['cards'][0]
+        self.assertIn('专用规则已启用', card['rule_status'])
+        self.assertEqual(card['progress']['train']['metrics'], {'自定义损失':.0916})
+        next_line = line.replace('17700','18000').replace('0.0916','0.08')
+        card = tracker.update(snapshot(next_line))['cards'][0]
+        self.assertEqual(card['progress']['step'],18000)
+        self.assertEqual(card['progress']['train']['metrics'], {'自定义损失':.08})
+        # 规则只覆盖TRAIN时，后续测试及未覆盖的新训练格式依然推进，不让旧规则覆盖新进度。
+        evaluation = '\n2026-10-07T13:06:00+08:00 EPOCH_DONE joint 10 18200 source_best 10 val {"auc":0.99}'
+        card = tracker.update(snapshot(next_line + evaluation))['cards'][0]
+        self.assertEqual(card['progress']['phase'],'test')
+        self.assertEqual(card['progress']['step'],18200)
+        self.assertEqual(card['progress']['train']['metrics'], {'自定义损失':.08})
+        self.assertEqual(card['progress']['tests']['joint/validation']['metrics']['auc'],.99)
+        self.assertIn('最新未覆盖行使用默认解析',card['rule_status'])
+        card = tracker.update(snapshot(next_line + '\nEpoch 11/20 step=19000 loss=0.05'))['cards'][0]
+        self.assertEqual(card['progress']['step'],19000)
+        self.assertEqual(card['progress']['train']['metrics']['loss'],.05)
 
     def test_rule_identity_isolated_by_server_and_process_start(self):
         s=TrainingServer('s','s','host')
@@ -121,12 +146,14 @@ class RuleAutomationTest(unittest.TestCase):
             self.ai.tick();self.assertEqual(api.call_count,1)
 
     def test_global_config_applies_to_new_server_but_rules_do_not_cross(self):
+        self.ai.config["prompt"] = "提取新指标FID与所有验证数据集"
         other=TrainingServer('b','4090','other');self.service.register(other)
         state=self.service.states['b'];state['active']=True;state['snapshot']=state['tracker'].update(snapshot(LINE))
         with patch('autodl_watcher.training_ai_ui.analyze',return_value={'profile':PROFILE}) as api:
             self.ai.tick();self.wait();self.ai.tick();self.wait()
             self.assertEqual(api.call_count,2)
             self.assertEqual(api.call_args_list[0].args[0],api.call_args_list[1].args[0])
+            self.assertEqual(api.call_args_list[1].args[0]["prompt"],"提取新指标FID与所有验证数据集")
             self.assertEqual(len(self.ai.store.entries),2)
 
     def test_bad_cache_pauses_auto_and_shows_reason_on_card(self):
