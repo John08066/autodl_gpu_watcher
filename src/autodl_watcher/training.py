@@ -249,18 +249,77 @@ def _structured_event(line):  # 把带前缀JSON日志转成已有事件协议�
     return event
 
 
-def _flat_metrics(values):  # 保留分支名，paired与rolled不合并成一个平均指标。
+def _flat_metrics(values):  # 保留任意指标和嵌套分支名。
     result = {}
     for name, value in (values.items() if isinstance(values, dict) else ()):
-        for branch, number in (value.items() if isinstance(value, dict) else [("", value)]):
-            if isinstance(number, (int, float)) and not isinstance(number, bool):
-                result[f"{name}/{branch}" if branch else str(name)] = number
+        if isinstance(value, dict):
+            result.update({f"{name}/{child}": number for child, number in _flat_metrics(value).items()})
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            result[str(name)] = value
     return result
+
+
+_METADATA = {"epoch", "total_epochs", "raw_epoch", "step", "steps", "global_step", "iteration", "iter", "total_steps", "steps_total", "steps_per_arm",
+             "pid", "time", "timestamp", "elapsed_seconds", "wall_time", "frames_done", "frames_total", "seed", "batch_size", "workers",
+             "peak_gpu_allocated", "elapsed", "max_epochs"}
+
+
+def _generic_event(line, event):
+    if event.get("event") in {"train", "test", "progress", "completed", "error"}:
+        if event["event"] in {"train", "test", "progress"} and "datasets" not in event:
+            metrics = {name: value for name, value in _flat_metrics(event).items()
+                       if name not in _METADATA and not name.startswith("metrics/")}
+            event["metrics"] = {**metrics, **_flat_metrics(event.get("metrics", {}))}
+            if "global_step" in event and "step" not in event:
+                event["step"] = event["global_step"]
+        return event
+    body = line[line.find("{"):] if "{" in line else ""
+    values = event
+    if not values and body:
+        try:
+            values = json.loads(body)
+        except ValueError:
+            try:
+                values = ast.literal_eval(body)
+            except (ValueError, SyntaxError):
+                values = {}
+    if not isinstance(values, dict) or any(key in values for key in ("indexes", "image_sha256", "rng_sha256")):
+        return event
+    structured = bool(values)
+    if not structured:
+        values = {name: float(number) for name, number in re.findall(
+            r"(?<![\w/])([A-Za-z_][\w./@%-]*)\s*[:=]\s*(" + _NUMBER + r"|[-+]?(?:nan|inf))(?=$|[\s,;|\]])", line, re.I)}
+    phase_text = str(values.get("phase", values.get("event", values.get("status", "")))) if structured else line
+    phase = ("test" if re.search(r"\b(?:test(?:ing)?|eval(?:uation|uating)?|valid(?:ation|ating)?|val)\b", phase_text, re.I)
+             else "train" if re.search(r"\btrain(?:ing)?\b", phase_text, re.I) else "unknown")
+    epoch = re.search(r"\bEpoch\s*[:= ]\s*(\d+)(?:\s*/\s*(\d+))?", line, re.I) if not structured else None
+    if epoch:
+        values["epoch"] = int(epoch[1])
+        if epoch[2]:
+            values["total_epochs"] = int(epoch[2])
+        if phase == "unknown":
+            phase = "train"
+    progress = {key: values[key] for key in ("epoch", "total_epochs", "pid", "total_steps") if key in values}
+    for name in ("step", "steps", "global_step", "iteration", "iter"):
+        if name in values:
+            progress["step"] = values[name]
+            break
+    metrics = _flat_metrics(values.get("metrics", {}))
+    metrics.update({name: value for name, value in _flat_metrics(values).items()
+                    if name not in _METADATA and not name.startswith("metrics/")})
+    if not metrics or not (progress or phase != "unknown" or "metrics" in values or "loss" in values or "eval_loss" in values):
+        return event
+    if phase == "unknown" and "loss" in values:
+        phase = "train"
+    if phase == "unknown" and any(name.startswith(("eval_", "val_")) for name in metrics):
+        phase = "test"
+    return {**progress, "event": "progress", "phase": phase, "metrics": metrics,
+            "dataset": str(values.get("dataset", "validation")), "generic": True}
 
 
 def parse_progress(text, utc_offset="+0000", expected_pid=None):  # DeepfakeBench适配器及通用JSONL事件协议；指标总是携带各自epoch/step。
     result = {"phase": "unknown", "epoch": None, "total_epochs": None, "raw_epoch": None, "step": None,
-              "train": {}, "tests": {}, "error": "", "completed": False, "progress_at": None}
+              "train": {}, "tests": {}, "observations": {}, "error": "", "completed": False, "progress_at": None}
     deepfake = bool(re.search(r"Epoch\[\d+\]|training-metric,|nEpochs:", text))
     last_epoch = re.search(r"\bnEpochs:\s*(\d+)", text)
     start_epoch = re.search(r"\bstart_epoch:\s*(\d+)", text)
@@ -278,7 +337,8 @@ def parse_progress(text, utc_offset="+0000", expected_pid=None):  # DeepfakeBenc
             except ValueError:
                 stamp = None
         advanced = False
-        event = _structured_event(line)
+        line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line)
+        event = _generic_event(line, _structured_event(line))
         if "pid" in event:
             event_pid = event["pid"]
         evaluation = re.search(r"\bEPOCH_DONE (\S+) (\d+) (\d+) source_best \d+ val (\{.*\})\s*$", line)
@@ -295,6 +355,8 @@ def parse_progress(text, utc_offset="+0000", expected_pid=None):  # DeepfakeBenc
             phase = event.get("phase", event["event"])
             if phase in {"train", "test"}:
                 result["phase"] = phase
+            elif event.get("generic"):
+                result["phase"] = "unknown"
             for key in ("epoch", "total_epochs", "raw_epoch", "step", "total_steps"):
                 value = event.get(key)
                 if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
@@ -309,8 +371,10 @@ def parse_progress(text, utc_offset="+0000", expected_pid=None):  # DeepfakeBenc
                     summary = {"metrics": metrics, "epoch": result["epoch"], "step": result["step"], "time": stamp}
                     if phase == "test":
                         result["tests"][str(dataset)] = summary
-                    else:
+                    elif phase == "train":
                         result["train"] = summary
+                    else:
+                        result["observations"] = summary
             result["completed"] = event["event"] == "completed"
             result["smoke"] = event.get("smoke", False)
             if event["event"] == "error" or invalid:
@@ -329,7 +393,7 @@ def parse_progress(text, utc_offset="+0000", expected_pid=None):  # DeepfakeBenc
             result.update(raw_epoch=int(epoch[1]), epoch=int(epoch[1]) - first + 1, phase="train", error="", completed=False)
             advanced = True
         elif generic:
-            result.update(epoch=int(generic[1]), total_epochs=int(generic[2]), phase="train", error="", completed=False)
+            result.update(epoch=int(generic[1]), total_epochs=int(generic[2]), phase="test" if event.get("phase") == "test" else "train", error="", completed=False)
             advanced = True
         if "===> Test start!" in line:
             result["phase"] = "test"
@@ -399,6 +463,7 @@ class TrainingTracker:
                     if extra["completed"] and log["modified_at"] >= (primary["modified_at"] if primary else task.get("started_at", 0)):
                         progress["completed"] = True
             indicator = {k: progress[k] for k in ("phase", "epoch", "step", "completed", "error")}
+            indicator["observations"] = {k: v for k, v in progress["observations"].items() if k != "time"}
             indicator["train"] = {k: v for k, v in progress["train"].items() if k != "time"}
             indicator["tests"] = {name: {k: v for k, v in value.items() if k != "time"} for name, value in progress["tests"].items()}
             marker = json.dumps(indicator, sort_keys=True)
@@ -425,6 +490,11 @@ class TrainingTracker:
             card = dict(task, progress=progress, level=level, status=status, marker=marker,
                         advanced_at=advanced_at, log_path=primary["path"] if primary else "",
                         details=(primary["tail"] if primary.get("gap") else primary["head"] + primary["tail"]) if primary else "")
+            if primary:
+                preview = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", card["details"]).replace("\r", "\n")
+                card["preview"] = "\n".join(line[:240] for line in preview.splitlines()[-3:] if line.strip())
+            else:
+                card["preview"] = "未找到可读日志；进程存在不代表训练进展正常。"
             card.pop("logs", None)
             self.known[key] = card
             self.references[key] = {k: task[k] for k in ("key", "pid", "name", "started_at", "gpu_indices", "gpu_memory_mb", "user", "cwd", "tmux_session") if k in task}

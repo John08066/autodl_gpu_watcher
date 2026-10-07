@@ -93,7 +93,7 @@ def task_files(process):
         for fd in (Path("/proc") / str(process["pid"]) / "fd").iterdir():
             try:
                 path = Path(os.readlink(fd))
-                if path.suffix.lower() in {".log", ".out", ".jsonl"} and not path.name.endswith("batch_trace.jsonl") and path.is_file():
+                if (fd.name in {"1", "2"} or path.suffix.lower() in {".log", ".out", ".jsonl", ".txt"}) and not path.name.endswith("batch_trace.jsonl") and path.is_file():
                     paths.add(str(path))
             except OSError:
                 continue
@@ -131,8 +131,8 @@ def discover_evidence(processes, project, panes, gpu_pids):
                 break
             pid = parents[pid]["ppid"]
         item["logs"] = [read_log(path) for path in task_files(item)]
-        evidence = any(re.search(r'(?:\b(?:TRAIN|EVAL|TEST)\s+\{|"event"\s*:\s*"(?:train|test|progress)"|Epoch\[|\bEpoch\s*[:= ]\s*\d+\s*/|training-(?:loss|metric))',
-                                 log.get("head", "") + log.get("tail", "")) for log in item["logs"])
+        evidence = any(re.search(r"(?:\b(?:TRAIN|EVAL|TEST)\s+\{|[\"'](?:event|phase|status)[\"']\s*:\s*[\"'](?:train|test|progress|eval)|Epoch\[|\bEpoch\s*[:= ]\s*\d+|training-(?:loss|metric)|[\"'](?:epoch|global_step)[\"']\s*:\s*\d+)",
+                                 log.get("head", "") + log.get("tail", ""), re.I) for log in item["logs"])
         item["training_candidate"] = bool(item.get("tmux_session") or item["pid"] in gpu_pids or evidence)
 
 

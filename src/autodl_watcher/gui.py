@@ -23,6 +23,7 @@ from .login import LocalStartupError
 from .main import positive_seconds
 from .training import TrainingServer, load_servers, save_servers
 from .training_ui import TrainingPane, TrainingService
+from .training_ai_ui import AIAssistant
 from .session import GPU_PREFIX, REPORT_PREFIX, SESSION_PREFIX, emit_gpu_samples, emit_session
 
 ROOT = (Path(os.environ.get("AUTODL_APP_ROOT", Path(sys.executable).parent)).resolve()
@@ -104,6 +105,7 @@ class WatcherWindow:  # 只负责交互与进程管理，监控业务仍由 main
         self._gpu_render_key = None
         self.saved_entry = ""
         self.training = TrainingService(self.events)
+        self.training.ai = AIAssistant(root, self.local / "ai.json")
         self.server_file = self.local / "servers.json"
         self.servers, self.external_panes = [], {}
         self.title_text = tk.StringVar(value="AutoDL 平台")

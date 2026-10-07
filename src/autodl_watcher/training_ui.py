@@ -99,7 +99,8 @@ def metrics_text(summary):
     parts = []
     for name, value in metrics.items():
         metric, separator, branch = name.partition("/")
-        parts.append(f"{names.get(metric, metric)}{separator}{branch} {value:.4f}")
+        number = f"{value:.4g}" if 0 < abs(value) < 0.0001 else f"{value:.4f}"
+        parts.append(f"{names.get(metric, metric)}{separator}{branch} {number}")
     return " · ".join(parts) or "—"
 
 
@@ -162,6 +163,8 @@ class TrainingPane(ttk.Frame):
         self.stop_button.pack(side="left", padx=4)
         self.configure_button = ttk.Button(bar, text="设置连接", command=configure_server)
         self.configure_button.pack(side="right")
+        if getattr(service, "ai", None):
+            ttk.Button(bar, text="AI 设置", command=service.ai.configure).pack(side="right", padx=4)
         self.summary = ttk.Label(self, text="尚未配置训练连接", wraplength=560)
         self.summary.pack(fill="x", pady=(0, 5))
         if show_gpus:
@@ -299,9 +302,17 @@ class TrainingPane(ttk.Frame):
             self._label(frame, f"训练（第{train.get('epoch') if train.get('epoch') is not None else '—'}轮，Step {train.get('step') if train.get('step') is not None else '—'}）：{metrics_text(train)}")
             for dataset, summary in progress.get("tests", {}).items():
                 self._label(frame, f"测试 {dataset}（第{summary.get('epoch') if summary.get('epoch') is not None else '—'}轮，Step {summary.get('step') if summary.get('step') is not None else '—'}）：{metrics_text(summary)}")
+            if progress.get("observations"):
+                self._label(frame, "指标（阶段未注明）：" + metrics_text(progress["observations"]))
+            if progress.get("phase") == "unknown":
+                self._label(frame, "原文摘要（未解释）：\n" + card.get("preview", "没有可读输出"))
             if progress.get("error"):
                 self._label(frame, progress["error"], color=COLORS["error"][1])
-            ttk.Button(frame, text="训练原日志", command=lambda item=card: self.details(item)).pack(anchor="e", padx=8, pady=(2, 6))
+            actions = ttk.Frame(frame)
+            actions.pack(anchor="e", padx=8, pady=(2, 6))
+            ttk.Button(actions, text="训练原日志", command=lambda item=card: self.details(item)).pack(side="right")
+            if getattr(self.service, "ai", None):
+                ttk.Button(actions, text="AI 解读", command=lambda item=card: self.service.ai.explain(item)).pack(side="right", padx=4)
 
         self.content.update_idletasks()
         self.canvas.yview_moveto(position)

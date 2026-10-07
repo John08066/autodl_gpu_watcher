@@ -1,10 +1,10 @@
-# AutoDL GPU Watcher v0.8.5
+# AutoDL GPU Watcher v0.8.6
 
 监控 AutoDL 私有云入口空位、物理 GPU 显存和当前实例状态，满足条件后自动开机；另以只读SSH查看自己的训练进度、训练/测试指标和日志错误。
 
 ## 使用
 
-打开项目根目录的 `AutoDLWatcher.exe`。保留同目录的 `_internal/` 和 `config.yaml`；不需要安装 Python，需要系统 Microsoft Edge。迁移到另一台机器时使用干净包 `dist/AutoDLWatcher-v0.8.5.zip`，再自行登录。
+打开项目根目录的 `AutoDLWatcher.exe`。保留同目录的 `_internal/` 和 `config.yaml`；不需要安装 Python，需要系统 Microsoft Edge。迁移到另一台机器时使用干净包 `dist/AutoDLWatcher-v0.8.6.zip`，再自行登录。
 
 1. 启动后自动核验会话。登录失效时点击“登录 / 更新会话”，完成浏览器登录并关闭浏览器，再点击“已登录并关闭浏览器”。同步完成后仍需真实接口核验。
 2. 选择服务器入口，填写本人用户名和采样间隔（默认60秒，平台、显存与占用名单每轮一起刷新），点击“开始监控”。打开程序本身不会启动监控。
@@ -51,7 +51,7 @@ GPU黑框按时间追加紧凑表格：GPU、整卡VRAM、利用率、温度、U
 
 AutoDL 203容器的NVML仍无法对应本容器训练PID，因此GPU关联保持待确认。若训练日志中的PID与本任务一致，且上报`peak_gpu_allocated`，卡片可显示“显存峰值 … GiB（日志）”；这是PyTorch峰值分配量，不是当前NVML进程总显存，也不是整卡用量。未提供此字段仍显示无法核验。GPU编号以当前SSH环境为准，不能据此对齐平台INDEX；本版不注入或中断训练。
 
-新版支持`TRAIN {...}`、`TEST/EVAL {...}`、`EVALUATED 分支 {...}`、`TRAINING_COMPLETE {...}`及明确失败事件。嵌套Loss保留分支，测试按“分支/数据集”显示；新协议的`steps_per_arm`按累计步数处理、Epoch从0转换为人类轮次，总轮数未提供则显示“—”。`EPOCH_END`只表示轮次结束，不能证明整次训练完成；`SMOKE_PASS`单独标注冒烟检查完成。日志带时区时优先使用其原始时区。无匹配任务时会提示当前脚本与目录筛选；任意未知日志格式仍需适配或按下列通用协议输出。
+新版支持`TRAIN {...}`、`TEST/EVAL {...}`、`EVALUATED 分支 {...}`、`TRAINING_COMPLETE {...}`及明确失败事件。嵌套Loss保留分支，测试按“分支/数据集”显示；新协议的`steps_per_arm`按累计步数处理、Epoch从0转换为人类轮次，总轮数未提供则显示“—”。`EPOCH_END`只表示轮次结束，不能证明整次训练完成；`SMOKE_PASS`单独标注冒烟检查完成。日志带时区时优先使用其原始时区。无匹配任务时会提示当前脚本与目录筛选；其他格式先尝试通用指标解析；无法解释时显示原文摘要和未知状态，不把进程存在当作训练正常。
 
 其他训练程序可以向**该训练进程保持打开的 `.jsonl` 日志**写入以下事件，无需修改监控器：
 
@@ -62,7 +62,20 @@ AutoDL 203容器的NVML仍无法对应本容器训练PID，因此GPU关联保持
 {"event":"error","message":"CUDA out of memory"}
 ```
 
-JSONL中的epoch按1开始，step为全局步数；每个事件一行并及时flush。通用协议识别 `train/test/progress/completed/error`，`progress`事件可带 `phase: train/test`。未知日志格式仍显示进程和GPU，但进度标为未知；可在 `training.py:parse_progress` 增加相应解析器。
+JSONL中的epoch按1开始，step为全局步数；每个事件一行并及时flush。通用协议识别 `train/test/progress/completed/error`，`progress`事件可带 `phase: train/test`。未知日志格式仍显示进程和GPU，最近三行原文作为未解释摘要。只有可见进程且有可读输出才能分析；没有输出、无权限或仅二进制事件文件时，本地规则和LLM都无法保证恢复真实训练进度。
+
+### 通用指标与可选 AI 解读
+
+通用解析支持 JSON/JSONL、Python 字典（例如 Hugging Face 日志）、`key=value` / `key: value` 和带指标的 Epoch/tqdm 文本。保留自定义指标及嵌套名称，例如 Dice、mAP@50、quality/PSNR；很小的学习率采用科学计数法。阶段未注明的指标单列显示，不猜训练或测试。脚本无需以 train 命名，但仍须符合本人、项目目录及运行证据范围；Jupyter 内核、非 Python 程序或没有可读日志的任务不在通用解析保证范围。打开的 `.txt` 日志和重定向到普通文件的标准输出也可采集；不会递归扫描整个项目。
+
+AI 是可选的手动辅助功能，本地监控不需要 API：
+
+1. 在任一训练页点击“AI 设置”，填写 HTTPS API 基础地址、Responses 或 Chat Completions 协议和模型 ID。密钥独立存入 Windows 凭据管理器的 `autodl-watcher/llm/` 命名空间，按完整基础地址绑定；不会导入消息萃取-MCP的密钥。公开设置位于本机 `.ui/ai.json`，密钥不写入该文件、不进入 Git 或发行包。留空保留已有密钥，保存后清空密钥输入框；“已保存”不代表调用验证成功。
+2. 在任务卡片点击“AI 解读”，查看或删改最近日志片段（最多12000字符）。界面展示目标地址和模型，并遮蔽常见密钥字段；自行确认剩余内容可外发后，点击“发送片段并解析”。这一步才会产生 API 请求及可能的费用；不会随60秒监控自动调用。
+3. 解读使用打开窗口时的配置快照；修改设置后重新打开解读窗口。全应用同一时刻最多一个 AI 请求，不自动重试；关闭解读窗口不会撤回已发送请求。Responses 使用 `store=false`，这不等同于服务商的零保留承诺。
+4. 结果单独显示摘要和指标对应的原文证据，不能修改训练存活、错误颜色或开机决策。证据检查只证明引文存在，不保证模型语义理解正确；缺证据、截断和缺少完成标记的响应不采用。原日志始终可直接查看。
+
+调用实现参考消息萃取-MCP的独立凭据和流式完成检查模式；协议说明见 [Responses 流事件](https://developers.openai.com/api/reference/resources/responses/streaming-events) 与 [Chat Completions 流事件](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)。本轮按用户要求只做模拟 API 验收；真实模型、额度与接口兼容性需配置后手动验证。
 
 ### SSH连接复用与接入防护
 
