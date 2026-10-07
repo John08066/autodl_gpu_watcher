@@ -1,8 +1,10 @@
 from __future__ import annotations  # Telemetry API 采集器 — 通过 HTTP GET 请求自建 API 获取物理 GPU 显存快照。
 
 import logging
+import math
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import requests
@@ -57,10 +59,18 @@ def filter_samples_to_platform_candidates(
     no_slot = tuple(sorted(visible - candidates))  # 区分平台可见但没空位，与平台根本不可见这两种排除原因。
     unauthorized = tuple(sorted({sample.host for sample in samples if sample.host not in visible}))
     return accepted, no_slot, unauthorized
+
+
+class TelemetryUnavailable(RuntimeError):
+    """GPU HTTP 快照不可用或处于退避期，不能用于开机判断。"""
+
+
 class TelemetryApiCollector:  # Telemetry API 采集器 — 通过 HTTP GET 拉取物理 GPU 实时数据。
 
     def __init__(self, config: TelemetryConfig) -> None:  # 初始化 Telemetry API 采集器和可复用的 HTTP 会话。
         self.config = config
+        self._failed_rounds = 0
+        self._retry_at = 0.0
         self._session = requests.Session()  # 复用 HTTP 连接；默认仍遵循此进程的代理环境。
         self._session.headers.update(
             {
@@ -70,53 +80,69 @@ class TelemetryApiCollector:  # Telemetry API 采集器 — 通过 HTTP GET 拉�
             }
         )
 
+    def close(self) -> None:
+        self._session.close()
+
     @staticmethod
-    def _is_retryable(exc: requests.RequestException) -> bool:  # 判断一次 HTTP 失败是否属于适合立即重试的瞬时故障。
+    def _retry_after(response: requests.Response | None) -> float:
+        value = response.headers.get("Retry-After") if response is not None else None
+        if not isinstance(value, str):
+            return 0.0
+        if value.strip().isdigit():
+            return float(value.strip())
+        try:
+            return max(0.0, (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+
+    @staticmethod
+    def _is_retryable(exc: Exception) -> bool:
         if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
             return True
-        if isinstance(exc, requests.HTTPError) and exc.response is not None:
-            status = int(exc.response.status_code)
-            return status == 429 or status >= 500  # 限流和服务端故障可重试，其他 HTTP 错误交回主循环处理。
-        return False
+        return (isinstance(exc, requests.HTTPError) and exc.response is not None
+                and exc.response.status_code >= 500)
 
-    def collect(self) -> list[GpuSample]:  # 拉取 Telemetry GPU 快照，并对瞬时网络故障进行有限重试。
-        last_error: requests.RequestException | None = None
-
-        for attempt in range(1, self.config.max_attempts + 1):
+    def collect(self) -> list[GpuSample]:
+        remaining = self._retry_at - time.monotonic()
+        if remaining > 0:
+            raise TelemetryUnavailable(
+                f"Telemetry HTTP 冷却中，至少 {math.ceil(remaining)} 秒后重试；本轮未发送请求")
+        attempts = min(self.config.max_attempts, 2)
+        for attempt in range(1, attempts + 1):
+            response = None
             try:
-                response = self._session.get(
-                    self.config.endpoint,
-                    params={"_t": int(time.time() * 1000)},  # 时间戳参数防止缓存
-                    timeout=self.config.timeout_seconds,
-                )
-                response.raise_for_status()  # 先检查 HTTP 状态，再解析 JSON，避免把错误页当作空快照。
-                samples = parse_telemetry_payload( response.json(), only_online=self.config.only_online, )
-                if attempt > 1:
-                    _LOGGER.info(
-                        "telemetry recovered attempt=%d/%d endpoint=%s",
-                        attempt,
-                        self.config.max_attempts,
+                try:
+                    response = self._session.get(
                         self.config.endpoint,
+                        params={"_t": int(time.time() * 1000)},
+                        timeout=self.config.timeout_seconds,
                     )
+                    response.raise_for_status()
+                    samples = parse_telemetry_payload(response.json(), only_online=self.config.only_online)
+                finally:
+                    if response is not None:
+                        response.close()
+                if attempt > 1 or self._failed_rounds:
+                    _LOGGER.info("telemetry recovered attempt=%d/%d failed_rounds=%d",
+                                 attempt, attempts, self._failed_rounds)
+                self._failed_rounds = 0
+                self._retry_at = 0.0
                 return samples
-            except requests.RequestException as exc:
-                last_error = exc
-                can_retry = (
-                    attempt < self.config.max_attempts and self._is_retryable(exc)
-                )
-                if not can_retry:  # 次数耗尽或错误不可重试时抛出，不能返回伪造的空闲结果。
-                    raise
-
-                _LOGGER.warning(
-                    "telemetry transient failure; retrying attempt=%d/%d delay=%.1fs error=%s",
-                    attempt,
-                    self.config.max_attempts,
-                    self.config.retry_delay_seconds,
-                    exc,
-                )
-                if self.config.retry_delay_seconds > 0:
-                    time.sleep(self.config.retry_delay_seconds)
-
-        if last_error is not None:  # 理论上循环只会通过 return 或 raise 离开；保留防御式分支。
-            raise last_error
-        raise RuntimeError("telemetry collection ended without response")
+            except (requests.RequestException, ValueError) as exc:
+                retry_after = self._retry_after(response)
+                if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+                    # 仅清除此采集器的连接池；Session仍可重用，不影响SSH或平台会话。
+                    self._session.close()
+                if attempt < attempts and self._is_retryable(exc) and not retry_after:
+                    _LOGGER.warning("telemetry transient failure; retrying attempt=%d/%d delay=%.1fs error=%s",
+                                    attempt, attempts, self.config.retry_delay_seconds, exc)
+                    if self.config.retry_delay_seconds > 0:
+                        time.sleep(self.config.retry_delay_seconds)
+                    continue
+                self._failed_rounds += 1
+                delay = max(min(60 * 2 ** min(self._failed_rounds - 1, 3), 300), retry_after)
+                self._retry_at = time.monotonic() + delay
+                status = f"HTTP {response.status_code}：{exc}" if response is not None else str(exc)
+                raise TelemetryUnavailable(
+                    f"Telemetry HTTP 采集失败（本轮 {attempt} 次请求，连续 {self._failed_rounds} 轮失败；"
+                    f"至少 {math.ceil(delay)} 秒后重试）：{status}") from exc

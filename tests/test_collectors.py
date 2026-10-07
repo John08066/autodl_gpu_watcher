@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, Mock, patch
 import requests
 from datetime import datetime
 
+from autodl_watcher.collectors.telemetry import TelemetryUnavailable
 from autodl_watcher.collectors.platform import (
     OccupancySnapshotMismatchError,
     PlatformAuthenticationError,
@@ -168,7 +169,7 @@ class TelemetryRetryTest(unittest.TestCase):  # Telemetry 瞬时故障重试逻�
             requests.ReadTimeout("second"),
         ]
 
-        with self.assertRaisesRegex(requests.ReadTimeout, "second"):
+        with self.assertRaisesRegex(TelemetryUnavailable, "second"):
             collector.collect()
 
         self.assertEqual(collector._session.get.call_count, 2)
@@ -184,7 +185,7 @@ class TelemetryRetryTest(unittest.TestCase):  # Telemetry 瞬时故障重试逻�
         response.raise_for_status.side_effect = http_error
         collector._session.get.return_value = response
 
-        with self.assertRaises(requests.HTTPError):
+        with self.assertRaisesRegex(TelemetryUnavailable, "HTTP 400"):
             collector.collect()
 
         collector._session.get.assert_called_once()

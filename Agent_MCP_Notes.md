@@ -23,6 +23,7 @@
 
 ## 登录和网络故障
 
+- Telemetry `RemoteDisconnected`不代表登录失效或SSH断连。2026-10-07实测日志15:03—15:09连续6轮失败后15:09:57恢复；本机自有连接快照无积压，无429证据，断连源未确认。v0.8.10模拟回归：每次采集最多2次GET，连续失败60/120/240/300秒退避，429不立即重试并遵守Retry-After；冷却不请求，失败不评估/开机，成功复用健康连接，退出关闭Session。requests默认非stream响应会消费响应体，旧代码未显式close本身不能证明泄漏。当前环境不能证明GUI历史路由，trust_env=False不能绕过TUN。证据 `runtime/validation/telemetry-recovery/诊断报告.md`、351项离线回归；代码 `collectors/telemetry.py`、`main.py`。
 - `Network.getResponseBody: No resource with given identifier found`是浏览器响应体丢失；捕获请求上下文后用新API响应恢复，只有限重试只读查询，不重发电源POST。v0.6.9模拟故障配合真实只读恢复验证；`runtime/validation/v0.6.9/response-recovery.json`。
 - 登录页、HTTP401/403或业务响应明确登录超时才是失效证据。HTTP200也可能返回“登陆超时，请重新登录”；旧版漏判曾每30秒重试298次，2026-09-27至28实际日志已确认。v0.7.0在machine/list和通用API响应识别该业务错误，GUI模式退出并恢复登录入口；`tests/test_v070.py`模拟验证。未知业务错误、超时、429、5xx不统一当登录过期。
 - 登录资料同步后还要用真实接口核验；会话有效只针对检查时刻。GUI管道错误仍须处理任务退出，不得在旧后台退出前并发使用同一profile。

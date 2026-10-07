@@ -25,6 +25,7 @@ from .collectors import (
     TelemetryApiCollector,
     filter_samples_to_platform_candidates,
 )
+from .collectors.telemetry import TelemetryUnavailable
 from .config import AutoStartTarget, load_config
 from .evaluator import AvailabilityEvaluator, sample_meets_capacity
 from .login import LocalStartupError, interactive_login
@@ -436,7 +437,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
         "Telemetry容错：单次超时 "
         f"{config.telemetry.timeout_seconds} 秒；瞬时失败后等待 "
         f"{config.telemetry.retry_delay_seconds:g} 秒重试；"
-        f"每轮最多 {config.telemetry.max_attempts} 次请求。"
+        f"每次采集最多 {min(config.telemetry.max_attempts, 2)} 次请求；连续失败退避60/120/240/300秒，限流遵循Retry-After。"
     )
     if config.platform.autodl_direct:
         print( "AutoDL网络：watcher 控制面直连，绕过系统代理；" "Telemetry 仍可使用本机 HTTP_PROXY。" )
@@ -865,6 +866,11 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                 print(_red_terminal_text(f"[{datetime.now():%H:%M:%S}] 监控{monitor_entry} | 本地启动失败 | 动作：监控已停止：{exc}"), flush=True)
                 logger.error("local startup failed: %s", exc)
                 raise SystemExit(5) from None  # 缺少系统组件须先修复，持续重试没有作用。
+            except TelemetryUnavailable as exc:
+                if args.ui:
+                    emit_gpu_samples([], [], config.monitor.stale_after_seconds, str(exc))
+                print(_red_terminal_text(f"[{datetime.now():%H:%M:%S}] 监控{monitor_entry} | {exc} | 动作：跳过开机，等待重试"), flush=True)
+                logger.warning("telemetry unavailable: %s", exc)
             except PlatformTransientError as exc:
                 if args.ui:
                     emit_gpu_samples([], [], config.monitor.stale_after_seconds, "本轮采集不可用")
@@ -903,6 +909,7 @@ def run_monitor(config, args, config_path, parser):  # 独立监控入口，保�
                               "capacity_fingerprint": capacity_fingerprint,
                               "evaluator": evaluator.export_state()})
         finally:
+            telemetry_collector.close()
             platform_collector.close()
             for handler in list(logger.handlers):
                 handler.close()

@@ -655,7 +655,7 @@ def discover():  # 子进程模式：采集结果编码为一行 JSON，供父�
                 emit_gpu_samples([], hosts, config.monitor.stale_after_seconds, "GPU 数据采集失败；可重试刷新")
                 print("GPU 数据采集失败，平台登录会话已核验有效。", flush=True)
             finally:
-                telemetry._session.close()  # 一次性刷新不保留HTTP连接；图表失败不误报登录过期。
+                telemetry.close()  # 一次性刷新不保留HTTP连接；图表失败不误报登录过期。
 
     except Exception as exc:
         if isinstance(exc, LocalStartupError):

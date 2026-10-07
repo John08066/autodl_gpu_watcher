@@ -126,7 +126,7 @@ class GuiOptionsTest(unittest.TestCase):
         self.assertEqual(gpu["samples"], [])
         self.assertIn("失败", gpu["error"])
         telemetry.return_value.collect.assert_called_once()
-        telemetry.return_value._session.close.assert_called_once()
+        telemetry.return_value.close.assert_called_once()
 
     def test_gpu_message_includes_visible_full_host_but_excludes_other_hosts(self):
         from datetime import datetime
