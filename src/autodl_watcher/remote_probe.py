@@ -24,16 +24,33 @@ def read_process(path, boot_id, boot_time, ticks):  # /proc字段按进程启动
             "args": args, "cwd": os.readlink(path / "cwd") if args and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(args[0]).name) else "", "process_state": fields[0]}
 
 
-def training_roots(processes, script_names, project):  # 仅识别Python训练入口，排除timeout包装和同一训练树的DataLoader子进程。
+def python_entry(args):
+    if not args or not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(args[0]).name):
+        return ""
+    index = 1
+    while index < len(args):
+        arg = args[index]
+        if arg in {"-c", "-"}:
+            return ""
+        if arg == "-m":
+            return args[index + 1] if index + 1 < len(args) else ""
+        if arg in {"-W", "-X"}:
+            index += 2
+        elif arg.startswith("-"):
+            index += 1
+        else:
+            return arg
+    return ""
+
+
+def training_roots(processes, script_names, project):  # 默认结合运行证据；自定义脚本范围仍严格匹配。
+    automatic = set(script_names) == {"train.py", "trainer.py", "train_*.py"}
     candidates = {}
     for item in processes:
-        args = item["args"]
-        if not args or not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(args[0]).name):
+        entry = python_entry(item["args"])
+        if not entry:
             continue
-        script_index = next((i for i, arg in enumerate(args[1:], 1) if arg.endswith(".py")), None)
-        if script_index is None or any(arg in {"-c", "-m"} for arg in args[1:script_index]):
-            continue  # 模块启动器、内联命令不因参数中出现训练文件名就被计为训练主进程。
-        if not any(fnmatchcase(Path(args[script_index]).name, pattern) for pattern in script_names):
+        if not any(fnmatchcase(Path(entry).name, pattern) for pattern in script_names) and not (automatic and item.get("training_candidate")):
             continue
         if project and not (item["cwd"] == project.rstrip("/") or item["cwd"].startswith(project.rstrip("/") + "/")):
             continue
@@ -76,13 +93,47 @@ def task_files(process):
         for fd in (Path("/proc") / str(process["pid"]) / "fd").iterdir():
             try:
                 path = Path(os.readlink(fd))
-                if path.suffix.lower() in {".log", ".out", ".jsonl"} and path.is_file():
+                if path.suffix.lower() in {".log", ".out", ".jsonl"} and not path.name.endswith("batch_trace.jsonl") and path.is_file():
                     paths.add(str(path))
             except OSError:
                 continue
     except OSError:
         pass
     return sorted(paths, key=lambda name: (Path(name).name != "training.log", name))[:4]
+
+
+def tmux_panes():
+    try:
+        result = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}"],
+                                capture_output=True, text=True, timeout=3)
+        return {int(pid): name for line in result.stdout.splitlines()
+                for pid, separator, name in [line.partition("\t")] if separator and pid.isdigit()}
+    except (OSError, subprocess.TimeoutExpired):
+        return {}  # tmux是辅助关联；缺少tmux不阻断普通训练采集。
+
+
+def discover_evidence(processes, project, panes, gpu_pids):
+    parents = {item["pid"]: item for item in processes}
+    for item in processes:
+        entry = python_entry(item["args"])
+        if not entry or any(name in entry for name in ("ipykernel", "jupyter", "tensorboard", "multiprocessing")):
+            continue
+        if project and not (item["cwd"] == project.rstrip("/") or item["cwd"].startswith(project.rstrip("/") + "/")):
+            continue
+        parent = parents.get(item["ppid"])
+        if parent and parent["args"] == item["args"]:
+            continue  # DataLoader继承相同命令和日志，无需重复读取。
+        pid, visited = item["pid"], set()
+        while pid in parents and pid not in visited:
+            visited.add(pid)
+            if pid in panes:
+                item["tmux_session"] = panes[pid]
+                break
+            pid = parents[pid]["ppid"]
+        item["logs"] = [read_log(path) for path in task_files(item)]
+        evidence = any(re.search(r'(?:\b(?:TRAIN|EVAL|TEST)\s+\{|"event"\s*:\s*"(?:train|test|progress)"|Epoch\[|\bEpoch\s*[:= ]\s*\d+\s*/|training-(?:loss|metric))',
+                                 log.get("head", "") + log.get("tail", "")) for log in item["logs"])
+        item["training_candidate"] = bool(item.get("tmux_session") or item["pid"] in gpu_pids or evidence)
 
 
 def query_gpu():
@@ -155,7 +206,6 @@ def collect(request):  # 整次远端请求仅扫描本人进程和已关联日�
             restricted += 1
         except (OSError, ValueError, IndexError):
             continue
-    roots = training_roots(processes, request.get("scripts", ["train.py", "trainer.py", "train_*.py"]), request.get("project", ""))
     gpus, apps, gpu_error = query_gpu()
     container = Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
     try:
@@ -163,6 +213,9 @@ def collect(request):  # 整次远端请求仅扫描本人进程和已关联日�
     except OSError:
         container = True  # 无法核验命名空间时不猜GPU进程归属。
     process_rows = public_gpu_processes(gpus, apps, container)
+    discover_evidence(processes, request.get("project", ""), tmux_panes(),
+                      {row["pid"] for row in process_rows if row["own"]} if not container else set())
+    roots = training_roots(processes, request.get("scripts", ["train.py", "trainer.py", "train_*.py"]), request.get("project", ""))
     tasks = []
     for item in roots[:32]:
         try:
@@ -183,9 +236,10 @@ def collect(request):  # 整次远端请求仅扫描本人进程和已关联日�
                     return arg.split("=", 1)[1]
             return ""
         detector = option("--detector_path")
-        item.update(name=option("--task_target") or Path(detector).stem or next((Path(arg).name for arg in args[1:] if arg.endswith(".py")), "训练进程"),
+        item.update(name=option("--task_target") or Path(detector).stem or Path(python_entry(args)).name or "训练进程",
                     config=detector, alive=True, user=pwd.getpwuid(os.getuid()).pw_name)
-        item["logs"] = [read_log(path) for path in task_files(item)]
+        if "logs" not in item:
+            item["logs"] = [read_log(path) for path in task_files(item)]
         matched = [app for app in process_rows if not container and app["pid"] == item["pid"] and app["own"]
                    and app.get("start_ticks") == item["start_ticks"] and app["gpu_index"] is not None]
         item["gpu_indices"] = sorted({app["gpu_index"] for app in matched})
@@ -194,10 +248,11 @@ def collect(request):  # 整次远端请求仅扫描本人进程和已关联日�
         tasks.append(item)
     keys = {item["key"] for item in tasks}
     scan_ok = restricted == 0 and len(roots) <= 32
+    live_keys = {item["key"] for item in processes}
     if scan_ok:
         for previous in request.get("previous", [])[:32]:
             if previous["key"] not in keys:
-                tasks.append(dict(previous, alive=False, gpu_memory_mb=None, gpu_memory_by_device=[], logs=[read_log(path) for path in previous.get("log_paths", [])[:4]]))
+                tasks.append(dict(previous, alive=previous["key"] in live_keys, gpu_memory_mb=None, gpu_memory_by_device=[], logs=[read_log(path) for path in previous.get("log_paths", [])[:4]]))
     return {"observed_at": time.time(), "tasks": tasks, "gpus": gpus, "gpu_error": gpu_error,
             "gpu_processes": process_rows, "scan_ok": scan_ok, "utc_offset": time.strftime("%z"), "container": container, "user": pwd.getpwuid(os.getuid()).pw_name}
 

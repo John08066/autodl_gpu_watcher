@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone, timedelta
 import json
@@ -232,6 +233,10 @@ def _structured_event(line):  # 把带前缀JSON日志转成已有事件协议�
         event["event"] = {"TRAIN": "train", "TEST": "test", "EVAL": "test", "TRAINING_STARTED": "train",
                           "TRAINING_COMPLETE": "completed", "SMOKE_PASS": "completed", "TRAINING_FAILED": "error", "ERROR": "error"}[kind]
         event["smoke"] = kind == "SMOKE_PASS"
+        if "steps" in event and "step" not in event:
+            event["step"] = event["steps"]
+        if "steps_total" in event:
+            event["total_steps"] = event["steps_total"]
         if "steps_per_arm" in event:
             event["step"] = event["steps_per_arm"]
             raw = event.get("epoch")
@@ -263,6 +268,7 @@ def parse_progress(text, utc_offset="+0000", expected_pid=None):  # DeepfakeBenc
     if deepfake and last_epoch:
         result["total_epochs"] = int(last_epoch[1]) - first + 1  # 已核验此项目range(start_epoch,nEpochs+1)，包含末轮。
     stamp = None
+    event_pid = None
     for line in text.replace("\r", "\n").splitlines():
         match = _TIMESTAMP.search(line)
         if match:
@@ -273,13 +279,23 @@ def parse_progress(text, utc_offset="+0000", expected_pid=None):  # DeepfakeBenc
                 stamp = None
         advanced = False
         event = _structured_event(line)
+        if "pid" in event:
+            event_pid = event["pid"]
+        evaluation = re.search(r"\bEPOCH_DONE (\S+) (\d+) (\d+) source_best \d+ val (\{.*\})\s*$", line)
+        if evaluation and (expected_pid is None or event_pid == expected_pid):
+            try:
+                values = ast.literal_eval(evaluation[4])
+            except (ValueError, SyntaxError):
+                values = {}
+            event = {"event": "test", "epoch": int(evaluation[2]), "step": int(evaluation[3]),
+                     "dataset": evaluation[1] + "/validation", "metrics": values}
         if expected_pid is not None and event.get("pid", expected_pid) != expected_pid:
             continue  # 合并日志中的其他PID不能提供本任务进度或显存。
         if event.get("event") in {"train", "test", "progress", "completed", "error"}:
             phase = event.get("phase", event["event"])
             if phase in {"train", "test"}:
                 result["phase"] = phase
-            for key in ("epoch", "total_epochs", "raw_epoch", "step"):
+            for key in ("epoch", "total_epochs", "raw_epoch", "step", "total_steps"):
                 value = event.get(key)
                 if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
                     result[key] = value
@@ -375,10 +391,7 @@ class TrainingTracker:
             logs = [item for item in task.get("logs", []) if "error" not in item]
             parsed = [(log, parse_progress(log_text(log), snapshot.get("utc_offset", "+0000"), expected_pid=task["pid"])) for log in logs]
             primary, progress = max(parsed, key=lambda pair: (pair[1]["phase"] != "unknown", Path(pair[0]["path"]).name == "training.log", pair[0]["modified_at"])) if parsed else (None, previous.get("progress", parse_progress("")))
-            details = []
             for log, extra in parsed:
-                text = log_text(log)
-                details.extend([log["path"], *text.splitlines()[-12:]])
                 if log is not primary:
                     if extra["error"] and log["modified_at"] >= task.get("started_at", 0) and (
                             extra["progress_at"] is None or extra["progress_at"] >= task.get("started_at", 0) - 1):
@@ -410,10 +423,11 @@ class TrainingTracker:
             else:
                 level, status = "success", "正在测试" if progress["phase"] == "test" else "正在训练"
             card = dict(task, progress=progress, level=level, status=status, marker=marker,
-                        advanced_at=advanced_at, details="\n".join(details)[-12000:])
+                        advanced_at=advanced_at, log_path=primary["path"] if primary else "",
+                        details=(primary["tail"] if primary.get("gap") else primary["head"] + primary["tail"]) if primary else "")
             card.pop("logs", None)
             self.known[key] = card
-            self.references[key] = {k: task[k] for k in ("key", "pid", "name", "started_at", "gpu_indices", "gpu_memory_mb", "user", "cwd") if k in task}
+            self.references[key] = {k: task[k] for k in ("key", "pid", "name", "started_at", "gpu_indices", "gpu_memory_mb", "user", "cwd", "tmux_session") if k in task}
             self.references[key]["log_paths"] = [log["path"] for log in task.get("logs", [])]
             cards.append(card)
         if not snapshot["scan_ok"]:
@@ -421,5 +435,11 @@ class TrainingTracker:
             cards.extend(dict(card, level="error" if card["level"] == "error" else "warning",
                               status=card["status"] if card["level"] == "error" else "进程列表不完整 · 状态待确认")
                          for key, card in self.known.items() if key not in existing)
+        for card in cards:
+            card["history"] = bool(not card.get("alive") and card.get("log_path") and any(
+                other.get("alive") and other.get("log_path") == card["log_path"]
+                and other.get("started_at", 0) > card.get("started_at", 0) for other in cards))
+            if card["history"]:
+                card["status"] = "历史运行 · " + card["status"]
         return dict(snapshot, cards=sorted(cards, key=lambda card: (not card.get("alive", False), -card.get("started_at", 0))),
                     received_at=time.time(), error="" if snapshot["scan_ok"] else "进程列表读取不完整")

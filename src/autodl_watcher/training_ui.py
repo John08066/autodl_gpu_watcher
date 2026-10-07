@@ -227,7 +227,7 @@ class TrainingPane(ttk.Frame):
         expired = bool(snapshot and time.time() - snapshot["received_at"] > max(90, state["interval"] * 2))
         key = (self.server_id, state["active"] if state else False, state["busy"] if state else False,
                snapshot["received_at"] if snapshot else None, expired, state.get("pending") if state else None,
-               state["generation"] if state else None)
+               state["generation"] if state else None, getattr(self, "show_history", False))
         if key == self.render_key:
             return
         self.render_key = key
@@ -270,7 +270,15 @@ class TrainingPane(ttk.Frame):
             self._label(frame, "无法确认训练状态" if warning else "无匹配训练进程" if snapshot and state["active"] else "等待训练采集", bold=True)
             if snapshot and state["active"] and not warning:
                 self._label(frame, f"脚本匹配：{state['server'].scripts} · 目录：{state['server'].project or '当前SSH用户'}；可在设置连接中修改。")
+        history_count = sum(bool(card.get("history")) for card in cards)
+        if history_count:
+            def toggle_history():
+                self.show_history = not getattr(self, "show_history", False)
+                self.render()
+            ttk.Button(self.content, text=("收起" if getattr(self, "show_history", False) else "查看") + f"历史运行（{history_count}）", command=toggle_history).pack(anchor="e", padx=6)
         for card in cards:
+            if card.get("history") and not getattr(self, "show_history", False):
+                continue
             level = "error" if card["level"] == "error" else "warning" if warning or not state["active"] else card["level"]
             frame = self._card(level)
             when = datetime.fromtimestamp(card["advanced_at"]).strftime("%m-%d %H:%M:%S")
@@ -279,19 +287,21 @@ class TrainingPane(ttk.Frame):
             gpu = ",".join(f"#{index}" for index in card.get("gpu_indices", [])) or "待确认"
             self._label(frame, f"PID {card['pid']} · 用户 {card.get('user', '—')} · GPU {gpu} · {task_memory(card)}"
                         + (" · 上次采样" if warning or not state["active"] else ""))
+            if card.get("tmux_session"):
+                self._label(frame, f"tmux：{card['tmux_session']}")
             progress = card["progress"]
             epoch, total = progress.get("epoch"), progress.get("total_epochs")
             raw = f" · 日志Epoch {progress['raw_epoch']}" if progress.get("raw_epoch") is not None else ""
-            self._label(frame, f"轮次 {epoch if epoch is not None else '—'}/{total if total is not None else '—'}{raw} · 全局Step {progress.get('step') if progress.get('step') is not None else '—'}")
+            self._label(frame, f"轮次 {epoch if epoch is not None else '—'}/{total if total is not None else '—'}{raw} · 全局Step {progress.get('step') if progress.get('step') is not None else '—'}" + (f"/{progress['total_steps']}" if progress.get('total_steps') else ""))
             if epoch is not None and total and total > 0:
                 ttk.Progressbar(frame, maximum=total, value=total if progress.get("completed") else min(total, max(0, epoch - 1)), style="Error.Horizontal.TProgressbar" if level == "error" else "Memory.Horizontal.TProgressbar").pack(fill="x", padx=8, pady=3)  # 条形仅表示此前已完成轮次，不猜当前轮内进度。
             train = progress.get("train", {})
-            self._label(frame, f"训练（第{train.get('epoch', '—')}轮，Step {train.get('step', '—')}）：{metrics_text(train)}")
+            self._label(frame, f"训练（第{train.get('epoch') if train.get('epoch') is not None else '—'}轮，Step {train.get('step') if train.get('step') is not None else '—'}）：{metrics_text(train)}")
             for dataset, summary in progress.get("tests", {}).items():
-                self._label(frame, f"测试 {dataset}（第{summary.get('epoch', '—')}轮，Step {summary.get('step', '—')}）：{metrics_text(summary)}")
+                self._label(frame, f"测试 {dataset}（第{summary.get('epoch') if summary.get('epoch') is not None else '—'}轮，Step {summary.get('step') if summary.get('step') is not None else '—'}）：{metrics_text(summary)}")
             if progress.get("error"):
                 self._label(frame, progress["error"], color=COLORS["error"][1])
-            ttk.Button(frame, text="日志详情", command=lambda item=card: self.details(item)).pack(anchor="e", padx=8, pady=(2, 6))
+            ttk.Button(frame, text="训练原日志", command=lambda item=card: self.details(item)).pack(anchor="e", padx=8, pady=(2, 6))
 
         self.content.update_idletasks()
         self.canvas.yview_moveto(position)
@@ -309,9 +319,15 @@ class TrainingPane(ttk.Frame):
 
     def details(self, card):
         window = tk.Toplevel(self)
-        window.title(f"{card['name']} · 只读日志详情")
+        window.title(f"{card['name']} · PID {card['pid']} · 训练原日志")
         window.geometry("780x440")
-        text = ScrolledText(window, wrap="word", font=("Microsoft YaHei UI", 9))
+        ttk.Label(window, text=card.get("log_path") or "未找到训练日志", wraplength=740).pack(anchor="w", padx=8, pady=4)
+        ttk.Label(window, text="最近采样的原文片段；长日志显示末尾64 KiB，可横向滚动。").pack(anchor="w", padx=8)
+        horizontal = ttk.Scrollbar(window, orient="horizontal")
+        horizontal.pack(side="bottom", fill="x")
+        text = ScrolledText(window, wrap="none", font=("Consolas", 10), xscrollcommand=horizontal.set)
+        horizontal.configure(command=text.xview)
         text.pack(fill="both", expand=True)
         text.insert("end", card.get("details") or "没有可读取的日志")
+        text.see("end")
         text.configure(state="disabled")
