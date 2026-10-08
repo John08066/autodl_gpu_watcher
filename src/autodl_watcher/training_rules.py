@@ -112,6 +112,8 @@ def validate_profile(value, source, pid=None):
     if not isinstance(value, dict) or set(value) - {"name", "rules"} or not isinstance(value.get("name"), str):
         raise RuleError("规则须包含名称和 rules，不能包含代码或命令")
     rules = value.get("rules")
+    if rules == []:
+        raise RuleError("AI返回空规则，未生成可用监控规则；继续默认监控，未自动重试")
     if not isinstance(rules, list) or not 1 <= len(rules) <= 8:
         raise RuleError("规则数量须为1到8条")
     for rule in rules:

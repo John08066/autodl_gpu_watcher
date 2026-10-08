@@ -1,10 +1,10 @@
-# AutoDL GPU Watcher v0.8.10
+# AutoDL GPU Watcher v0.8.11
 
 监控 AutoDL 私有云入口空位、物理 GPU 显存和当前实例状态，满足条件后自动开机；另以只读SSH查看自己的训练进度、训练/测试指标和日志错误。
 
 ## 使用
 
-打开项目根目录的 `AutoDLWatcher.exe`。保留同目录的 `_internal/` 和 `config.yaml`；不需要安装 Python，需要系统 Microsoft Edge。迁移到另一台机器时使用干净包 `dist/AutoDLWatcher-v0.8.10.zip`，再自行登录。
+打开项目根目录的 `AutoDLWatcher.exe`。保留同目录的 `_internal/` 和 `config.yaml`；不需要安装 Python，需要系统 Microsoft Edge。迁移到另一台机器时使用干净包 `dist/AutoDLWatcher-v0.8.11.zip`，再自行登录。
 
 1. 启动后自动核验会话。登录失效时点击“登录 / 更新会话”，完成浏览器登录并关闭浏览器，再点击“已登录并关闭浏览器”。同步完成后仍需真实接口核验。
 2. 选择服务器入口，填写本人用户名和采样间隔（默认60秒，平台、显存与占用名单每轮一起刷新），点击“开始监控”。打开程序本身不会启动监控。

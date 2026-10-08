@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 import requests
 from . import ai_credentials
-from .training_rules import validate_profile
+from .training_rules import dictionary, validate_profile
 from .training_ai_usage import pricing_settings, tokens, estimate
 
 DEFAULTS = {"base_url": "https://api.openai.com/v1", "protocol": "responses", "model": "", "service_tier": "flex"}
@@ -147,10 +147,19 @@ def _stream(response, protocol, seconds=180, metadata=None):
 
 def analyze(config, source, pid=None):
     config = settings(config)  # 每次请求使用启动时的配置快照。
+    source = excerpt(source)
+    log_pids = set()
+    for line in source.splitlines():
+        start = line.find("{")
+        record = dictionary(line[start:]) if start >= 0 else None
+        if record and isinstance(record.get("pid"), int):
+            log_pids.add(record["pid"])
+    if pid is not None and log_pids and pid not in log_pids:
+        raise AnalysisError(f"日志PID与所选任务PID {pid} 不一致；请刷新训练任务后重试，未发送AI请求")
     key = ai_credentials.read(config["base_url"])
     if not key:
         raise AnalysisError("此 API 地址尚未保存密钥，请先打开 AI 设置")
-    source = excerpt(source).replace(key, "[已隐藏]")
+    source = source.replace(key, "[已隐藏]")
     if not source.strip():
         raise AnalysisError("没有可发送的日志片段")
     messages = [{"role": "system", "content": config["prompt"] + "\n\n" + PROMPT + (f"\n本任务PID={pid}，排除其他PID记录。" if pid is not None else "")}, {"role": "user", "content": source}]

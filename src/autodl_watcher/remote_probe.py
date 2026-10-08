@@ -56,13 +56,25 @@ def training_roots(processes, script_names, project):  # 默认结合运行证�
             continue
         candidates[item["pid"]] = item
     parents = {item["pid"]: item["ppid"] for item in processes}
-    result = []
+    workers, launchers, ancestors = set(), set(), {}
     for pid, item in candidates.items():
         parent, visited = item["ppid"], {pid}
-        while parent in parents and parent not in visited and parent not in candidates:
+        ancestors[pid] = []
+        while parent in parents and parent not in visited:
             visited.add(parent)
+            if parent in candidates:
+                ancestor = candidates[parent]
+                if python_entry(ancestor["args"]) == python_entry(item["args"]):
+                    workers.add(pid)  # 同一训练入口派生的DataLoader仍只显示一次。
+                    break
+                ancestors[pid].append(parent)
+                if not ancestor.get("gpu_candidate"):
+                    launchers.add(parent)  # 不同入口的真实训练子进程不能被启动脚本遮蔽。
             parent = parents[parent]
-        if parent not in candidates:
+    result = []
+    for pid, item in candidates.items():
+        if pid not in workers | launchers:
+            item["launcher_keys"] = [candidates[parent]["key"] for parent in ancestors[pid] if parent in launchers]
             result.append(item)
     return result
 
@@ -133,7 +145,8 @@ def discover_evidence(processes, project, panes, gpu_pids):
         item["logs"] = [read_log(path) for path in task_files(item)]
         evidence = any(re.search(r"(?:\b(?:TRAIN|EVAL|TEST)\s+\{|[\"'](?:event|phase|status)[\"']\s*:\s*[\"'](?:train|test|progress|eval)|Epoch\[|\bEpoch\s*[:= ]\s*\d+|training-(?:loss|metric)|[\"'](?:epoch|global_step)[\"']\s*:\s*\d+)",
                                  log.get("head", "") + log.get("tail", ""), re.I) for log in item["logs"])
-        item["training_candidate"] = bool(item.get("tmux_session") or item["pid"] in gpu_pids or evidence)
+        item["gpu_candidate"] = item["pid"] in gpu_pids
+        item["training_candidate"] = bool(item.get("tmux_session") or item["gpu_candidate"] or evidence)
 
 
 def query_gpu():
@@ -247,11 +260,12 @@ def collect(request):  # 整次远端请求仅扫描本人进程和已关联日�
         item["gpu_memory_by_device"] = [{"gpu_index": app["gpu_index"], "memory_mb": app["memory_used"]} for app in matched]
         tasks.append(item)
     keys = {item["key"] for item in tasks}
+    launcher_keys = {key for item in tasks for key in item.get("launcher_keys", [])}
     scan_ok = restricted == 0 and len(roots) <= 32
     live_keys = {item["key"] for item in processes}
     if scan_ok:
         for previous in request.get("previous", [])[:32]:
-            if previous["key"] not in keys:
+            if previous["key"] not in keys | launcher_keys:
                 tasks.append(dict(previous, alive=previous["key"] in live_keys, gpu_memory_mb=None, gpu_memory_by_device=[], logs=[read_log(path) for path in previous.get("log_paths", [])[:4]]))
     return {"observed_at": time.time(), "tasks": tasks, "gpus": gpus, "gpu_error": gpu_error,
             "gpu_processes": process_rows, "scan_ok": scan_ok, "utc_offset": time.strftime("%z"), "container": container, "user": pwd.getpwuid(os.getuid()).pw_name}
